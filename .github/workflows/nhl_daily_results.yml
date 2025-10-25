@@ -1,17 +1,20 @@
-name: NHL daily results to Telegram (sports.ru)
+name: NHL daily results to Telegram
 
 on:
   schedule:
-    # GitHub Actions использует UTC. Ниже — 05:45 UTC, что соответствует 06:45 Europe/London,
-    # как правило уже после последнего матча в Северной Америке.
-    - cron: "45 5 * * *"
+    - cron: "35 5 * * *"   # 06:35 Europe/London
   workflow_dispatch:
+
+permissions:
+  contents: write  # нужно, чтобы пушить изменения кэша
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -20,11 +23,27 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4
 
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python nhl_daily_results_bot.py
+
+      - name: Update RU name cache from sports.ru
+        run: |
+          python update_ru_cache.py
+
+      - name: Commit cache changes (if any)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain -- ru_map.json ru_pending.json)" ]; then
+            git add ru_map.json ru_pending.json
+            git commit -m "chore(cache): update RU name map"
+            git push
+          else
+            echo "No cache changes to commit."
+          fi
