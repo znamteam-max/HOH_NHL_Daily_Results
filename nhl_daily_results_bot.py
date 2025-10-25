@@ -5,11 +5,12 @@
 NHL Daily Results → Telegram
 
 • Голы/ассисты — api-web.nhle.com (официальный play-by-play)
-• Имена — «И. Фамилия» по sports.ru:
-    1) прямой доступ к /hockey/person/{slug}/
-    2) поиск на sports.ru
-    3) фоллбэк: транслитерация + справочник исключений под sports.ru
+• Имена — «И. Фамилия» как на sports.ru:
+    1) прямой slug профиля /hockey/person|player/{slug}/
+    2) поиск по sports.ru
+    3) фоллбэк: словарь исключений под стиль sports.ru + кириллица в инициале
 • Время голов — MM.SS по абсолютной шкале матча (напр., 1.15, 21.45, 45.59, 68.15)
+• Разделы внутри матча — курсивом: «1-й период», «Овертайм №1», «Буллиты»
 """
 
 import os
@@ -36,7 +37,7 @@ API_NHL = "https://api-web.nhle.com/v1"
 SPORTS_RU_HOST    = "https://www.sports.ru"
 SPORTS_RU_PERSON  = SPORTS_RU_HOST + "/hockey/person/"
 SPORTS_RU_PLAYER  = SPORTS_RU_HOST + "/hockey/player/"
-SPORTS_RU_SEARCH  = SPORTS_RU_HOST + "/search/?q="  # серверный HTML есть
+SPORTS_RU_SEARCH  = SPORTS_RU_HOST + "/search/?q="
 
 RU_MONTHS = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
@@ -80,7 +81,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/2.5 (+api-web.nhle.com; sports.ru resolver)",
+        "User-Agent": "NHL-DailyResultsBot/2.7 (+api-web.nhle.com; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -90,7 +91,6 @@ S = make_session()
 # -------------------- Дата игрового дня --------------------
 
 def pick_report_date() -> date:
-    # если в Нью-Йорке раньше 07:00 — считаем, что игровой день ещё «вчера»
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 7 else now_et.date()
 
@@ -123,6 +123,14 @@ def fmt_mm_ss(total_seconds: int) -> str:
     mm = total_seconds // 60
     ss = total_seconds % 60
     return f"{mm}.{ss:02d}"
+
+def period_heading(period_index: int) -> str:
+    if period_index <= 3:
+        return f"<i>{period_index}-й период</i>"
+    if period_index == 5:
+        return "<i>Буллиты</i>"
+    # 4 и больше — овертаймы
+    return f"<i>Овертайм №{period_index - 3}</i>"
 
 # -------------------- Расписание/финалы --------------------
 
@@ -194,8 +202,8 @@ def fetch_games_for_date(day: date) -> list[dict]:
 
 # -------------------- BOX + PBP --------------------
 
-_en_name_cache: dict[int, tuple[str, str]] = {}  # playerId -> (first,last)
-_display_cache: dict[int, str] = {}              # playerId -> "C. McDavid" и т.п.
+_en_name_cache: dict[int, tuple[str, str]] = {}   # playerId -> (first,last)
+_display_cache: dict[int, str]           = {}     # playerId -> "C. McDavid" и т.п.
 
 def _extract_names_from_player_obj(p: dict) -> tuple[str, str, str]:
     first = ""; last = ""; display = ""
@@ -208,12 +216,9 @@ def _extract_names_from_player_obj(p: dict) -> tuple[str, str, str]:
 
     for key in ("firstInitialLastName", "playerName", "name", "playerNameWithNumber", "fullName"):
         val = p.get(key)
-        if isinstance(val, dict):
-            val = val.get("default") or ""
-        if val and not display:
-            display = str(val).strip()
+        if isinstance(val, dict): val = val.get("default") or ""
+        if val and not display: display = str(val).strip()
 
-    # если first/last пусты, попробуем выдернуть из display
     if (not first or not last) and display:
         disp = display.replace("#", " ").strip()
         parts = [x for x in re.split(r"\s+", disp) if x and x != "-"]
@@ -233,8 +238,7 @@ def fetch_box_map(game_id: int) -> dict[int, dict]:
         for group in ("forwards", "defense", "goalies"):
             for p in team_block.get(group, []) or []:
                 pid = p.get("playerId")
-                if not pid:
-                    continue
+                if not pid: continue
                 pid = int(pid)
                 f, l, d = _extract_names_from_player_obj(p)
                 out[pid] = {"firstName": f, "lastName": l}
@@ -319,7 +323,7 @@ def fetch_goals(game_id: int) -> list[dict]:
 _ru_name_cache: dict[str, str] = {}   # "Connor McDavid" -> "К. Макдэвид"
 _slug_cache   : dict[str, str] = {}   # "Connor McDavid" -> "/hockey/person/connor-mcdavid/"
 
-# популярные исключения под стиль sports.ru (фамилии)
+# исключения для фамилий (как пишет sports.ru)
 EXCEPT_LAST = {
     "Nylander": "Нюландер",
     "Ekman-Larsson": "Экман-Ларссон",
@@ -348,31 +352,40 @@ EXCEPT_LAST = {
     "Lapierre": "Лапьер",
     "McMichael": "Макмайкл",
     "Strome": "Строум",
-    "Sourdif": "Сурдиф",
     "Leonard": "Леонард",
     "Thompson": "Томпсон",
-    "Mateychuk": "Матейчук",
-    "Monahan": "Монахан",
-    "Frank": "Фрэнк",
-    "Protas": "Протас",
     "Matthews": "Мэттьюс",
     "Tavares": "Таварес",
     "Power": "Пауэр",
     "Joshua": "Джошуа",
     "Connor": "Коннор",
-    "Backlund": "Баклунд",
-    "Honzek": "Гонзек",
+    "Byram": "Байрэм",
+    "Benson": "Бенсон",
+    "Krebs": "Кребс",
+    "Carlo": "Карло",
+    "Tuch": "Так",
+    "McLeod": "Маклауд",
+    "Eklund": "Эклунд",
+    "Celebrini": "Селебрини",
+    "Mercer": "Мерсер",
+    "Voronkov": "Воронков",
+    "Wilson": "Уилсон",
+    "Ovechkin": "Овечкин",
+    "Stanley": "Стэнли",
+    "Frank": "Фрэнк",
+    "Ekholm": "Экхольм",
+    "Nurse": "Нерс",
+    "Nugent-Hopkins": "Нюджент-Хопкинс",
+    "Bouchard": "Бушар",
 }
 
-# грубая транслитерация имени → русская первая буква (для инициалов в фоллбэке)
 FIRST_INITIAL_MAP = {
     "a":"А","b":"Б","c":"К","d":"Д","e":"Э","f":"Ф","g":"Г","h":"Х","i":"И","j":"Д",
     "k":"К","l":"Л","m":"М","n":"Н","o":"О","p":"П","q":"К","r":"Р","s":"С","t":"Т",
-    "u":"У","v":"В","w":"В","x":"Кс","y":"Й","z":"З"
+    "u":"У","v":"В","w":"В","x":"К","y":"Й","z":"З"
 }
 
 def _slugify_eng_name(first: str, last: str) -> str:
-    # connor mcdavid -> connor-mcdavid
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
     base = "".join(ch for ch in base if not unicodedata.combining(ch))
@@ -385,7 +398,7 @@ def _sportsru_try_profile_by_slug(first: str, last: str) -> str | None:
     for root in (SPORTS_RU_PERSON, SPORTS_RU_PLAYER):
         url = root + slug + "/"
         r = S.get(url, timeout=15)
-        if r.status_code == 200 and "hockey/person" in r.url or "hockey/player" in r.url:
+        if r.status_code == 200 and ("/hockey/person/" in r.url or "/hockey/player/" in r.url):
             return url
     return None
 
@@ -414,7 +427,6 @@ def _sportsru_search_initial_surname(first: str, last: str) -> str | None:
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        # ищем первую ссылку на профиль игрока
         link = soup.select_one('a[href*="/hockey/person/"]') or soup.select_one('a[href*="/hockey/player/"]')
         if not link or not link.get("href"):
             return None
@@ -427,17 +439,9 @@ def _sportsru_search_initial_surname(first: str, last: str) -> str | None:
     return None
 
 def _fallback_translit_initial_surname(first: str, last: str) -> str:
-    # спец-исключения на фамилии под стиль sports.ru
-    ru_last = EXCEPT_LAST.get(last, None)
-    if not ru_last:
-        # простая транслитерация фамилии: заменим дефисы на дефисы и оставим латиницу как есть,
-        # чтобы не исказить редкие фамилии: в итогах важнее корректность, чем «плохой» перевод
-        ru_last = last
-
-    # русская первая буква имени (грубо)
-    ini_src = (first or "A")[:1].lower()
+    ru_last = EXCEPT_LAST.get(last, last or "")
+    ini_src = (first or last or "A")[:1].lower()
     ru_ini = FIRST_INITIAL_MAP.get(ini_src, ini_src.upper())
-    # если получилось «Кс» (X) — оставим «К.», чтобы сохранить формат
     if len(ru_ini) > 1:
         ru_ini = ru_ini[0]
     return f"{ru_ini}. {ru_last}"
@@ -452,7 +456,6 @@ def ru_initial_surname_by_en(first: str, last: str, display: str | None = None) 
     if key in _ru_name_cache:
         return _ru_name_cache[key]
 
-    # 1) прямой slug
     if first and last:
         url = _sportsru_try_profile_by_slug(first, last)
         if url:
@@ -462,28 +465,23 @@ def ru_initial_surname_by_en(first: str, last: str, display: str | None = None) 
                 _slug_cache[key] = url
                 return res
 
-    # 2) поиск
     if first and last:
         res = _sportsru_search_initial_surname(first, last)
         if res:
             _ru_name_cache[key] = res
             return res
 
-    # 3) фоллбэк: если есть красивый латинский вариант — сначала попробуем добыть first/last из него
-    if display and not (first and last):
+    if display and not last:
         disp = display.replace("#", " ").strip()
         parts = [x for x in re.split(r"\s+", disp) if x and x != "-"]
         if len(parts) >= 2:
-            first = first or parts[0].replace(".", "")
-            last  = last  or parts[-1]
+            last = parts[-1]
 
-    # 4) окончательный фоллбэк — транслитерация + исключения
-    fallback = _fallback_translit_initial_surname(first or "", last or (display or ""))
+    fallback = _fallback_translit_initial_surname(first, last)
     _ru_name_cache[key] = fallback
     return fallback
 
 def resolve_player_ru_initial(pid: int, boxmap: dict, players_involved: list) -> str:
-    # 1) boxscore
     if pid and pid in boxmap:
         f = boxmap[pid].get("firstName", "")
         l = boxmap[pid].get("lastName", "")
@@ -491,14 +489,12 @@ def resolve_player_ru_initial(pid: int, boxmap: dict, players_involved: list) ->
         if f or l or disp:
             return ru_initial_surname_by_en(f, l, disp)
 
-    # 2) playersInvolved
     for p in (players_involved or []):
         if p.get("playerId") == pid:
             f, l, d = _extract_names_from_player_obj(p)
             if f or l or d:
                 return ru_initial_surname_by_en(f, l, d)
 
-    # 3) landing
     f, l = fetch_player_en_name(pid)
     if f or l:
         return ru_initial_surname_by_en(f, l)
@@ -528,7 +524,14 @@ def build_game_block(game: dict) -> str:
     elif last_pt == "SO": suffix = " (Б)"
 
     lines = []
+    current_period = None
+
     for g in goals:
+        # вставляем заголовок периода при первом голе периода
+        if g["period"] != current_period:
+            current_period = g["period"]
+            lines.append(period_heading(current_period))
+
         scorer = resolve_player_ru_initial(g["scorerId"], box, g.get("playersInvolved"))
         a1 = resolve_player_ru_initial(g["a1"], box, g.get("playersInvolved")) if g.get("a1") else None
         a2 = resolve_player_ru_initial(g["a2"], box, g.get("playersInvolved")) if g.get("a2") else None
@@ -539,7 +542,6 @@ def build_game_block(game: dict) -> str:
         ast_txt = f" ({', '.join(assists)})" if assists else ""
 
         t_abs = fmt_mm_ss(g["totsec"])
-        # гарантируем пробел в «J. Kulich» и пр.
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
@@ -595,6 +597,7 @@ def tg_send(text: str):
         resp = S.post(url, json={
             "chat_id": CHAT_ID,
             "text": part,
+            "parse_mode": "HTML",              # чтобы <i>курсив</i> работал в заголовках периодов
             "disable_web_page_preview": True,
         }, timeout=25)
         if resp.status_code != 200:
