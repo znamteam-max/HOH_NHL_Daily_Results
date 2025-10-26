@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/{name-surname}
+NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/{first-last}
 
-• NHL JSON:
+• Данные НХЛ:
   - Schedule/Score:   https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
                       (fallback: /v1/score, /v1/scoreboard)
   - Play-by-Play:     https://api-web.nhle.com/v1/gamecenter/{gameId}/play-by-play
@@ -12,20 +12,23 @@ NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/
   - Player landing:   https://api-web.nhle.com/v1/player/{playerId}/landing
 
 • Русские имена:
-  - Строго через sports.ru: https://www.sports.ru/hockey/person/{first-last}/
-  - Парсим ru-имя из og:title / h1 / title.
-  - Кэш: ru_names_sportsru.json — { "<id>": {"ru_first":"Леон","ru_last":"Драйзайтль","url":"..."} }
-  - Если не найдено — показываем латиницей «F. Lastname» и добавляем в ru_pending_sportsru.json.
-  - НИКАКОГО транслита и других источников.
+  - Строго sports.ru: https://www.sports.ru/hockey/person/{first-last}/
+  - Приоритетно читаем <h1 class="titleH1">…</h1>, затем h1, затем og:title/title.
+  - Если ИМЕНИ НА КИРИЛЛИЦЕ нет — считаем НЕ НАЙДЕНО: пост не отправляем, скрипт падает с ошибкой.
+  - Кэш удачных:  ru_names_sportsru.json  → { "<id>": {"ru_first","ru_last","url"} }
+  - Список проблемных: ru_pending_sportsru.json → [{id, first, last, tried_slugs[]}]
 
-• Формат времени голов: ММ.СС от начала матча (ОТ → 60+, SO → 65.00).
-• Буллиты: печатаем только «Победный буллит» (одна строка — автор решающего).
+• Время голов: ММ.СС от старта матча (ОТ → 60+, SO → 65.00).
+• Буллиты: только «Победный буллит».
+
+Требования:
+  requests==2.32.3
+  beautifulsoup4==4.12.3
 """
 
 import os, sys, re, json, time, unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -41,12 +44,14 @@ API = "https://api-web.nhle.com/v1"
 # -------------- HTTP -----------------
 def make_session():
     s = requests.Session()
-    retries = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
-                    status_forcelist=[429,500,502,503,504],
-                    allowed_methods=["GET","POST"], raise_on_status=False)
+    retries = Retry(
+        total=6, connect=6, read=6, backoff_factor=0.7,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET","POST"], raise_on_status=False
+    )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/sportsru-only/1.0",
+        "User-Agent": "NHL-DailyResultsBot/sportsru-h1-only/1.2",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -68,10 +73,10 @@ def log(*a): print(*a, file=sys.stderr)
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 
-def ru_date(d: date) -> str:
-    return f"{d.day} {RU_MONTHS[d.month]}"
+def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 
 def pick_report_date() -> date:
+    # Ориентируемся на ET (игры заканчиваются поздно)
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 7 else now_et.date()
 
@@ -199,23 +204,22 @@ def fetch_player_en_name(pid: int) -> tuple[str,str]:
     _en_name_cache[pid] = (fn, ln)
     return fn, ln
 
-# --------- sports.ru name lookup ---------
+# --------- sports.ru lookup (STRICT) ---------
 RU_CACHE_PATH   = "ru_names_sportsru.json"     # id -> {ru_first, ru_last, url}
-RU_PENDING_PATH = "ru_pending_sportsru.json"   # [{"id","first","last"}]
+RU_PENDING_PATH = "ru_pending_sportsru.json"   # [{"id","first","last","tried_slugs":[]}]
 
 RU_CACHE: dict[str, dict] = {}
 RU_PENDING: list[dict] = []
+RU_MISSES: list[dict] = []          # для итоговой ошибки
 _session_pending_ids: set[int] = set()
-_attempted_slugs: set[str] = set()  # чтобы не дергать один и тот же slug по многу раз в один запуск
+_attempted_slugs: set[str] = set()
 
 SPORTS_ROOT = "https://www.sports.ru/hockey/person/"
 
 def _norm_ascii(s: str) -> str:
-    """ASCII-очистка: убрать диакритики, всё в нижний регистр, только [a-z0-9-]."""
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
-    # апострофы и точки → убрать; остальные пробелы/слэши → дефис
     s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
     s = re.sub(r"[^a-z0-9\- ]+", " ", s)
     s = re.sub(r"\s+", "-", s).strip("-")
@@ -227,38 +231,24 @@ def _slug_variants(first: str, last: str) -> list[str]:
     l = _norm_ascii(last)
     cand = []
     if f and l:
-        cand.append(f"{f}-{l}")        # leon-draisaitl
-        if "-" in l:
-            cand.append(f"{f}-{l.replace('-', '')}")  # leon-draisaitl → leon-draisaitl (без дефиса)
-        if "-" in f:
-            cand.append(f"{f.replace('-', '')}-{l}")
-    # иногда встречается форма без имени — мало вероятно, но пусть будет третьим вариантом
+        cand.append(f"{f}-{l}")              # leon-draisaitl
+        if "-" in l: cand.append(f"{f}-{l.replace('-', '')}")   # nugent-hopkins → nugenthopkins
+        if "-" in f: cand.append(f"{f.replace('-', '')}-{l}")
     if l:
-        cand.append(l)  # draisaitl
-    # уникализировать, сохранить порядок
-    seen=set(); out=[]
+        cand.append(l)                        # просто фамилия
+    # уникализировать
+    out, seen = [], set()
     for c in cand:
         if c and c not in seen:
             out.append(c); seen.add(c)
     return out
 
-def _load_json(path: str, default):
-    if not os.path.exists(path): return default
-    try:
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: return default
-
-def _save_json(path: str, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
 def _has_cyrillic(s: str) -> bool:
     return bool(re.search(r"[А-Яа-яЁё]", s or ""))
 
-def _extract_ru_from_text(t: str) -> tuple[str,str] | None:
+def _extract_ru_pair_from_text(t: str) -> tuple[str,str] | None:
     if not t: return None
-    # отрезать хвосты — «— новости», «- статистика», скобки и т.п.
+    # оставить только человеко-понятную часть
     t = re.split(r"\s[–—\-|]\s", t)[0]
     t = re.sub(r"\(.*?\)", "", t)
     t = " ".join(t.split()).strip()
@@ -268,7 +258,7 @@ def _extract_ru_from_text(t: str) -> tuple[str,str] | None:
     return None
 
 def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
-    """Возвращает (ru_first, ru_last, url) или None."""
+    """Возвращает (ru_first, ru_last, url) либо None. Требуется КИРИЛЛИЦА."""
     if not slug or slug in _attempted_slugs:
         return None
     _attempted_slugs.add(slug)
@@ -280,62 +270,71 @@ def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
         return None
     if r.status_code != 200:
         return None
+
     soup = BeautifulSoup(r.text, "html.parser")
-    # приоритет: og:title → h1 → title → h2
-    og = soup.find("meta", attrs={"property":"og:title"})
-    if og and og.get("content"):
-        got = _extract_ru_from_text(og["content"])
-        if got:
-            rf, rl = got
+
+    # 1) строго h1.titleH1
+    h1t = soup.select_one("h1.titleH1")
+    if h1t:
+        txt = h1t.get_text(" ", strip=True)
+        pair = _extract_ru_pair_from_text(txt)
+        if pair and _has_cyrillic(" ".join(pair)):
+            rf, rl = pair
             return rf, rl, r.url
+
+    # 2) fallback: h1 (но всё равно требуем кириллицу)
     h1 = soup.find("h1")
     if h1:
-        got = _extract_ru_from_text(h1.get_text(" ", strip=True))
-        if got:
-            rf, rl = got
+        txt = h1.get_text(" ", strip=True)
+        pair = _extract_ru_pair_from_text(txt)
+        if pair and _has_cyrillic(" ".join(pair)):
+            rf, rl = pair
             return rf, rl, r.url
+
+    # 3) fallback: og:title / title (с проверкой кириллицы)
+    og = soup.find("meta", attrs={"property":"og:title"})
+    if og and og.get("content"):
+        pair = _extract_ru_pair_from_text(og["content"])
+        if pair and _has_cyrillic(" ".join(pair)):
+            rf, rl = pair
+            return rf, rl, r.url
+
     title = soup.find("title")
     if title:
-        got = _extract_ru_from_text(title.get_text(" ", strip=True))
-        if got:
-            rf, rl = got
+        pair = _extract_ru_pair_from_text(title.get_text(" ", strip=True))
+        if pair and _has_cyrillic(" ".join(pair)):
+            rf, rl = pair
             return rf, rl, r.url
-    h2 = soup.find("h2")
-    if h2:
-        got = _extract_ru_from_text(h2.get_text(" ", strip=True))
-        if got:
-            rf, rl = got
-            return rf, rl, r.url
+
     return None
 
-def _queue_pending(pid: int, first: str, last: str):
-    if not pid or pid in _session_pending_ids: return
-    for it in RU_PENDING:
-        if it.get("id") == pid: return
-    RU_PENDING.append({"id": pid, "first": first or "", "last": last or ""})
+def _queue_pending(pid: int, first: str, last: str, tried: list[str]):
+    if not pid: return
+    if pid in _session_pending_ids: return
+    RU_PENDING.append({"id": pid, "first": first or "", "last": last or "", "tried_slugs": tried})
+    RU_MISSES.append({"id": pid, "first": first or "", "last": last or "", "tried_slugs": tried})
     _session_pending_ids.add(pid)
 
 def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str | None) -> str:
-    # 0) кэш
+    """Возвращает «И. Фамилия» ТОЛЬКО если найдена кириллица на sports.ru.
+       Если нет — добавляет в pending/misses и возвращает спец-маркер (не латиницу)."""
     cached = RU_CACHE.get(str(pid))
     if cached:
-        ini = (cached.get("ru_first","")[:1] or en_first[:1] or "?")
-        return f"{ini}. {cached.get('ru_last','')}".strip()
+        ini = (cached.get("ru_first","")[:1] or "?")
+        return f"{ini}. {cached.get('ru_last','')}"
 
-    # 1) пробуем slug-варианты
-    for slug in _slug_variants(en_first, en_last):
+    tried = _slug_variants(en_first, en_last)
+    for slug in tried:
         got = _sportsru_fetch_ru_name_by_slug(slug)
         if got:
             ru_first, ru_last, url = got
             RU_CACHE[str(pid)] = {"ru_first": ru_first, "ru_last": ru_last, "url": url}
-            ini = (ru_first[:1] or en_first[:1] or "?")
-            return f"{ini}. {ru_last}".strip()
+            ini = (ru_first[:1] or "?")
+            return f"{ini}. {ru_last}"
 
-    # 2) не нашли — латиница, в pending
-    _queue_pending(pid, en_first, en_last)
-    ini = (en_first[:1] or "?").upper()
-    last = en_last or (display or "")
-    return f"{ini}. {last}".strip()
+    # не нашли кириллицу — фиксируем и возвращаем маркер (для видимости в отладочном тексте)
+    _queue_pending(pid, en_first, en_last, tried)
+    return "[имя не найдено]"
 
 # ------------- PBP (goals) -------------
 def fetch_goals(game_id: int) -> list[dict]:
@@ -454,7 +453,7 @@ def build_game_block(game: dict) -> str:
         ss = g["totsec"] % 60
         t_abs = f"{mm}.{ss:02d}"
 
-        # пробел после «И.»
+        # отделяем инициал от фамилии пробелом
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
@@ -533,10 +532,22 @@ def tg_send(text: str):
             raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
         time.sleep(0.25)
 
+# ------------- I/O helpers ------------
+def _load_json(path: str, default):
+    if not os.path.exists(path): return default
+    try:
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
+
+def _save_json(path: str, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 # ---------------- Main ----------------
 if __name__ == "__main__":
     try:
-        # load caches
+        # загрузка кэшей
         cached = _load_json(RU_CACHE_PATH, {})
         if isinstance(cached, dict): RU_CACHE.update(cached)
         pend = _load_json(RU_PENDING_PATH, [])
@@ -544,12 +555,28 @@ if __name__ == "__main__":
 
         d = pick_report_date()
         text = build_post(d)
+
+        # если есть хотя бы один игрок без кириллицы — падаем с ошибкой и ничего не отправляем
+        if RU_MISSES:
+            _save_json(RU_CACHE_PATH, RU_CACHE)
+            _save_json(RU_PENDING_PATH, RU_PENDING)
+            sample = "\n".join(
+                f"- id={m['id']} | {m['first']} {m['last']} | tried: {', '.join(m.get('tried_slugs', [])[:4])}"
+                for m in RU_MISSES[:15]
+            )
+            raise RuntimeError(
+                "Не удалось получить имена на кириллице для некоторых игроков sports.ru.\n"
+                "Список (первые):\n" + sample +
+                ("\n… (см. ru_pending_sportsru.json)" if len(RU_MISSES) > 15 else "")
+            )
+
+        # всё хорошо — отправляем
         tg_send(text)
 
         _save_json(RU_CACHE_PATH, RU_CACHE)
         _save_json(RU_PENDING_PATH, RU_PENDING)
 
-        print(f"OK — sports.ru RU names cached: {len(RU_CACHE)}, pending: {len(RU_PENDING)}")
+        print(f"OK — RU names cached: {len(RU_CACHE)}, pending: {len(RU_PENDING)}")
     except Exception as e:
         print("ERROR:", repr(e), file=sys.stderr)
         sys.exit(1)
