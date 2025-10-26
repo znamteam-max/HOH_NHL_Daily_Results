@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL Daily Results → Telegram (RU) — Google CSE names (no translit, with page fetch)
+NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/{name-surname}
 
 • NHL JSON:
   - Schedule/Score:   https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
@@ -11,14 +11,15 @@ NHL Daily Results → Telegram (RU) — Google CSE names (no translit, with page
   - Boxscore:         https://api-web.nhle.com/v1/gamecenter/{gameId}/boxscore
   - Player landing:   https://api-web.nhle.com/v1/player/{playerId}/landing
 
-• Names in RU:
-  - Only via Google Programmable Search (Custom Search JSON API).
-  - Domain priority: sports.ru > championat.com > ru.wikipedia.org > others.
-  - If result title has no Cyrillic, we fetch the page and parse og:title/title/h1/h2.
-  - Cache OK hits in ru_names_google.json; misses in ru_pending_google.json.
-  - NO transliteration at all.
+• Русские имена:
+  - Строго через sports.ru: https://www.sports.ru/hockey/person/{first-last}/
+  - Парсим ru-имя из og:title / h1 / title.
+  - Кэш: ru_names_sportsru.json — { "<id>": {"ru_first":"Леон","ru_last":"Драйзайтль","url":"..."} }
+  - Если не найдено — показываем латиницей «F. Lastname» и добавляем в ru_pending_sportsru.json.
+  - НИКАКОГО транслита и других источников.
 
-• Shootout: only “Победный буллит” (one winning attempt).
+• Формат времени голов: ММ.СС от начала матча (ОТ → 60+, SO → 65.00).
+• Буллиты: печатаем только «Победный буллит» (одна строка — автор решающего).
 """
 
 import os, sys, re, json, time, unicodedata
@@ -35,11 +36,7 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "").strip()  # Programmable Search (cx)
-
 API = "https://api-web.nhle.com/v1"
-GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 
 # -------------- HTTP -----------------
 def make_session():
@@ -49,15 +46,15 @@ def make_session():
                     allowed_methods=["GET","POST"], raise_on_status=False)
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/GoogleCSE-Names/1.1",
+        "User-Agent": "NHL-DailyResultsBot/sportsru-only/1.0",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
 
 S = make_session()
 
-def _get_json(url: str, params: dict | None = None) -> dict:
-    r = S.get(url, params=params, timeout=25)
+def _get_json(url: str) -> dict:
+    r = S.get(url, timeout=25)
     if r.status_code != 200:
         return {}
     try:
@@ -202,21 +199,48 @@ def fetch_player_en_name(pid: int) -> tuple[str,str]:
     _en_name_cache[pid] = (fn, ln)
     return fn, ln
 
-# --------- Google CSE + fetch page ----------
-RU_CACHE_PATH   = "ru_names_google.json"      # id -> {ru_first, ru_last, url}
-RU_PENDING_PATH = "ru_pending_google.json"    # [{id, first, last}]
+# --------- sports.ru name lookup ---------
+RU_CACHE_PATH   = "ru_names_sportsru.json"     # id -> {ru_first, ru_last, url}
+RU_PENDING_PATH = "ru_pending_sportsru.json"   # [{"id","first","last"}]
 
 RU_CACHE: dict[str, dict] = {}
 RU_PENDING: list[dict] = []
 _session_pending_ids: set[int] = set()
+_attempted_slugs: set[str] = set()  # чтобы не дергать один и тот же slug по многу раз в один запуск
 
-DOMAIN_PRIORITY = {
-    "sports.ru": 100,
-    "www.sports.ru": 100,
-    "championat.com": 90,
-    "www.championat.com": 90,
-    "ru.wikipedia.org": 80,
-}
+SPORTS_ROOT = "https://www.sports.ru/hockey/person/"
+
+def _norm_ascii(s: str) -> str:
+    """ASCII-очистка: убрать диакритики, всё в нижний регистр, только [a-z0-9-]."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    # апострофы и точки → убрать; остальные пробелы/слэши → дефис
+    s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
+    s = re.sub(r"[^a-z0-9\- ]+", " ", s)
+    s = re.sub(r"\s+", "-", s).strip("-")
+    s = re.sub(r"-{2,}", "-", s)
+    return s
+
+def _slug_variants(first: str, last: str) -> list[str]:
+    f = _norm_ascii(first)
+    l = _norm_ascii(last)
+    cand = []
+    if f and l:
+        cand.append(f"{f}-{l}")        # leon-draisaitl
+        if "-" in l:
+            cand.append(f"{f}-{l.replace('-', '')}")  # leon-draisaitl → leon-draisaitl (без дефиса)
+        if "-" in f:
+            cand.append(f"{f.replace('-', '')}-{l}")
+    # иногда встречается форма без имени — мало вероятно, но пусть будет третьим вариантом
+    if l:
+        cand.append(l)  # draisaitl
+    # уникализировать, сохранить порядок
+    seen=set(); out=[]
+    for c in cand:
+        if c and c not in seen:
+            out.append(c); seen.add(c)
+    return out
 
 def _load_json(path: str, default):
     if not os.path.exists(path): return default
@@ -232,113 +256,83 @@ def _save_json(path: str, data):
 def _has_cyrillic(s: str) -> bool:
     return bool(re.search(r"[А-Яа-яЁё]", s or ""))
 
-def _extract_ru_pair_from_text(t: str) -> tuple[str,str] | None:
+def _extract_ru_from_text(t: str) -> tuple[str,str] | None:
     if not t: return None
-    # обрежем хвосты "— Википедия", " - новости", скобки и лишнее
+    # отрезать хвосты — «— новости», «- статистика», скобки и т.п.
     t = re.split(r"\s[–—\-|]\s", t)[0]
     t = re.sub(r"\(.*?\)", "", t)
     t = " ".join(t.split()).strip()
-    # слова кириллицей/дефис
     words = [w for w in t.split() if re.match(r"^[А-ЯЁ][а-яё\-]+$", w)]
     if len(words) >= 2:
         return words[0], words[-1]
     return None
 
-def _fetch_page_ru_name(url: str) -> tuple[str,str] | None:
+def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
+    """Возвращает (ru_first, ru_last, url) или None."""
+    if not slug or slug in _attempted_slugs:
+        return None
+    _attempted_slugs.add(slug)
+
+    url = SPORTS_ROOT + slug + "/"
     try:
-        r = S.get(url, timeout=20)
-        if r.status_code != 200: return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        # приоритет: og:title → h1 → title → h2
-        og = soup.find("meta", attrs={"property":"og:title"})
-        if og and og.get("content"):
-            got = _extract_ru_pair_from_text(og["content"])
-            if got: return got
-        h1 = soup.find("h1")
-        if h1:
-            got = _extract_ru_pair_from_text(h1.get_text(" ", strip=True))
-            if got: return got
-        title = soup.find("title")
-        if title:
-            got = _extract_ru_pair_from_text(title.get_text(" ", strip=True))
-            if got: return got
-        h2 = soup.find("h2")
-        if h2:
-            got = _extract_ru_pair_from_text(h2.get_text(" ", strip=True))
-            if got: return got
+        r = S.get(url, timeout=20, allow_redirects=True)
     except Exception:
         return None
-    return None
-
-def google_cse_search(en_first: str, en_last: str, num: int = 8) -> list[dict]:
-    if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
-        log("[Google CSE] Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")
-        return []
-    q = f'"{en_first} {en_last}" хоккей'
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": q,
-        "num": max(1, min(10, num)),
-        "hl": "ru",
-        "safe": "off",
-    }
-    r = S.get(GOOGLE_ENDPOINT, params=params, timeout=25)
     if r.status_code != 200:
-        log("[Google CSE error]", r.status_code, r.text[:200])
-        return []
-    j = r.json()
-    return j.get("items") or []
-
-def google_find_ru_name(en_first: str, en_last: str) -> dict | None:
-    items = google_cse_search(en_first, en_last, num=8)
-    if not items: return None
-
-    # сортировка по домену
-    def score(it):
-        host = urlparse(it.get("link","")).netloc.lower()
-        return -DOMAIN_PRIORITY.get(host, 0)
-    items.sort(key=score)
-
-    # пробуем каждый результат: сначала title, потом открываем страницу
-    for it in items:
-        title = it.get("title","") or ""
-        link  = it.get("link","") or ""
-        # 1) прям из заголовка
-        pair = _extract_ru_pair_from_text(title)
-        if pair:
-            ru_first, ru_last = pair
-            return {"ru_first": ru_first, "ru_last": ru_last, "url": link}
-        # 2) открываем страницу
-        got = _fetch_page_ru_name(link)
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+    # приоритет: og:title → h1 → title → h2
+    og = soup.find("meta", attrs={"property":"og:title"})
+    if og and og.get("content"):
+        got = _extract_ru_from_text(og["content"])
         if got:
-            ru_first, ru_last = got
-            return {"ru_first": ru_first, "ru_last": ru_last, "url": link}
+            rf, rl = got
+            return rf, rl, r.url
+    h1 = soup.find("h1")
+    if h1:
+        got = _extract_ru_from_text(h1.get_text(" ", strip=True))
+        if got:
+            rf, rl = got
+            return rf, rl, r.url
+    title = soup.find("title")
+    if title:
+        got = _extract_ru_from_text(title.get_text(" ", strip=True))
+        if got:
+            rf, rl = got
+            return rf, rl, r.url
+    h2 = soup.find("h2")
+    if h2:
+        got = _extract_ru_from_text(h2.get_text(" ", strip=True))
+        if got:
+            rf, rl = got
+            return rf, rl, r.url
     return None
 
-def queue_pending(pid: int, first: str, last: str):
+def _queue_pending(pid: int, first: str, last: str):
     if not pid or pid in _session_pending_ids: return
     for it in RU_PENDING:
         if it.get("id") == pid: return
     RU_PENDING.append({"id": pid, "first": first or "", "last": last or ""})
     _session_pending_ids.add(pid)
 
-def ru_initial_from_google(pid: int, en_first: str, en_last: str, display: str | None) -> str:
-    # 0) cache
-    got = RU_CACHE.get(str(pid))
-    if got:
-        ini = (got.get("ru_first","")[:1] or en_first[:1] or "?")
-        return f"{ini}. {got.get('ru_last','')}".strip()
+def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str | None) -> str:
+    # 0) кэш
+    cached = RU_CACHE.get(str(pid))
+    if cached:
+        ini = (cached.get("ru_first","")[:1] or en_first[:1] or "?")
+        return f"{ini}. {cached.get('ru_last','')}".strip()
 
-    # 1) find via Google
-    res = google_find_ru_name(en_first, en_last)
-    if res:
-        RU_CACHE[str(pid)] = res
-        ini = (res["ru_first"][:1] or en_first[:1] or "?")
-        return f"{ini}. {res['ru_last']}".strip()
+    # 1) пробуем slug-варианты
+    for slug in _slug_variants(en_first, en_last):
+        got = _sportsru_fetch_ru_name_by_slug(slug)
+        if got:
+            ru_first, ru_last, url = got
+            RU_CACHE[str(pid)] = {"ru_first": ru_first, "ru_last": ru_last, "url": url}
+            ini = (ru_first[:1] or en_first[:1] or "?")
+            return f"{ini}. {ru_last}".strip()
 
-    # 2) miss → Latin (no translit), remember pending
-    queue_pending(pid, en_first, en_last)
+    # 2) не нашли — латиница, в pending
+    _queue_pending(pid, en_first, en_last)
     ini = (en_first[:1] or "?").upper()
     last = en_last or (display or "")
     return f"{ini}. {last}".strip()
@@ -405,13 +399,13 @@ def resolve_player_display(pid: int, boxmap: dict, players_involved: list) -> st
     if pid and pid in boxmap:
         f = boxmap[pid].get("firstName",""); l = boxmap[pid].get("lastName","")
         d = _display_cache.get(pid)
-        return ru_initial_from_google(pid, f, l, d)
+        return ru_initial_from_sportsru(pid, f, l, d)
     for p in (players_involved or []):
         if p.get("playerId") == pid:
             f,l,d = _extract_names_from_player_obj(p)
-            return ru_initial_from_google(pid, f, l, d)
+            return ru_initial_from_sportsru(pid, f, l, d)
     f,l = fetch_player_en_name(pid)
-    return ru_initial_from_google(pid, f, l, None)
+    return ru_initial_from_sportsru(pid, f, l, None)
 
 # ------------- Game block ---------------
 def build_game_block(game: dict) -> str:
@@ -460,6 +454,7 @@ def build_game_block(game: dict) -> str:
         ss = g["totsec"] % 60
         t_abs = f"{mm}.{ss:02d}"
 
+        # пробел после «И.»
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
@@ -541,11 +536,11 @@ def tg_send(text: str):
 # ---------------- Main ----------------
 if __name__ == "__main__":
     try:
-        # caches
-        loaded_cache = _load_json(RU_CACHE_PATH, {})
-        if isinstance(loaded_cache, dict): RU_CACHE.update(loaded_cache)
-        loaded_pending = _load_json(RU_PENDING_PATH, [])
-        if isinstance(loaded_pending, list): RU_PENDING.extend(loaded_pending)
+        # load caches
+        cached = _load_json(RU_CACHE_PATH, {})
+        if isinstance(cached, dict): RU_CACHE.update(cached)
+        pend = _load_json(RU_PENDING_PATH, [])
+        if isinstance(pend, list): RU_PENDING.extend(pend)
 
         d = pick_report_date()
         text = build_post(d)
@@ -554,9 +549,7 @@ if __name__ == "__main__":
         _save_json(RU_CACHE_PATH, RU_CACHE)
         _save_json(RU_PENDING_PATH, RU_PENDING)
 
-        # немножко диагностики в логи Actions
-        found = sum(1 for v in RU_CACHE.values() if _has_cyrillic(v.get("ru_last","")))
-        print(f"OK — RU names cached: {found}, pending: {len(RU_PENDING)}")
+        print(f"OK — sports.ru RU names cached: {len(RU_CACHE)}, pending: {len(RU_PENDING)}")
     except Exception as e:
         print("ERROR:", repr(e), file=sys.stderr)
         sys.exit(1)
