@@ -51,7 +51,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/sportsru-h1-only/1.2",
+        "User-Agent": "NHL-DailyResultsBot/sportsru-h1-only/1.3",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -76,7 +76,6 @@ RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля"
 def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 
 def pick_report_date() -> date:
-    # Ориентируемся на ET (игры заканчиваются поздно)
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 7 else now_et.date()
 
@@ -195,7 +194,9 @@ def fetch_box_map(game_id: int) -> dict[int, dict]:
     return out
 
 def fetch_player_en_name(pid: int) -> tuple[str,str]:
-    if pid in _en_name_cache: return _en_name_cache[pid]
+    if pid in _en_name_cache:
+        fn, ln = _en_name_cache[pid]
+        return (fn or "").strip(), (ln or "").strip()
     j = _get_json(f"{API}/player/{pid}/landing") or {}
     fn, ln = j.get("firstName"), j.get("lastName")
     if isinstance(fn, dict): fn = fn.get("default") or ""
@@ -204,13 +205,30 @@ def fetch_player_en_name(pid: int) -> tuple[str,str]:
     _en_name_cache[pid] = (fn, ln)
     return fn, ln
 
+# ---- НОВОЕ: обязателен полный first (не инициала) ----
+def ensure_full_en_name(pid: int, first: str, last: str) -> tuple[str,str]:
+    """
+    Если первое имя похоже на инициал (одна буква/с точкой), дотягиваем
+    полную версию из /player/{id}/landing. Аналогично, если фамилии нет.
+    """
+    need = False
+    if not first or len(first) <= 2 or re.fullmatch(r"[A-Za-z]\.?", first or ""):
+        need = True
+    if not last:
+        need = True
+    if need:
+        f2, l2 = fetch_player_en_name(pid)
+        first = f2 or first
+        last  = l2 or last
+    return (first or "").strip(), (last or "").strip()
+
 # --------- sports.ru lookup (STRICT) ---------
 RU_CACHE_PATH   = "ru_names_sportsru.json"     # id -> {ru_first, ru_last, url}
 RU_PENDING_PATH = "ru_pending_sportsru.json"   # [{"id","first","last","tried_slugs":[]}]
 
 RU_CACHE: dict[str, dict] = {}
 RU_PENDING: list[dict] = []
-RU_MISSES: list[dict] = []          # для итоговой ошибки
+RU_MISSES: list[dict] = []
 _session_pending_ids: set[int] = set()
 _attempted_slugs: set[str] = set()
 
@@ -236,7 +254,6 @@ def _slug_variants(first: str, last: str) -> list[str]:
         if "-" in f: cand.append(f"{f.replace('-', '')}-{l}")
     if l:
         cand.append(l)                        # просто фамилия
-    # уникализировать
     out, seen = [], set()
     for c in cand:
         if c and c not in seen:
@@ -248,7 +265,6 @@ def _has_cyrillic(s: str) -> bool:
 
 def _extract_ru_pair_from_text(t: str) -> tuple[str,str] | None:
     if not t: return None
-    # оставить только человеко-понятную часть
     t = re.split(r"\s[–—\-|]\s", t)[0]
     t = re.sub(r"\(.*?\)", "", t)
     t = " ".join(t.split()).strip()
@@ -258,7 +274,6 @@ def _extract_ru_pair_from_text(t: str) -> tuple[str,str] | None:
     return None
 
 def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
-    """Возвращает (ru_first, ru_last, url) либо None. Требуется КИРИЛЛИЦА."""
     if not slug or slug in _attempted_slugs:
         return None
     _attempted_slugs.add(slug)
@@ -273,7 +288,6 @@ def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 1) строго h1.titleH1
     h1t = soup.select_one("h1.titleH1")
     if h1t:
         txt = h1t.get_text(" ", strip=True)
@@ -282,16 +296,14 @@ def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
             rf, rl = pair
             return rf, rl, r.url
 
-    # 2) fallback: h1 (но всё равно требуем кириллицу)
     h1 = soup.find("h1")
     if h1:
         txt = h1.get_text(" ", strip=True)
         pair = _extract_ru_pair_from_text(txt)
-        if pair and _has_cyrillic(" ".join(pair)):
+        if pair and _has_cyrилlic(" ".join(pair)):
             rf, rl = pair
             return rf, rl, r.url
 
-    # 3) fallback: og:title / title (с проверкой кириллицы)
     og = soup.find("meta", attrs={"property":"og:title"})
     if og and og.get("content"):
         pair = _extract_ru_pair_from_text(og["content"])
@@ -302,26 +314,31 @@ def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
     title = soup.find("title")
     if title:
         pair = _extract_ru_pair_from_text(title.get_text(" ", strip=True))
-        if pair and _has_cyrillic(" ".join(pair)):
+        if pair and _has_cyrилlic(" ".join(pair)):
             rf, rl = pair
             return rf, rl, r.url
 
     return None
 
 def _queue_pending(pid: int, first: str, last: str, tried: list[str]):
-    if not pid: return
-    if pid in _session_pending_ids: return
+    if not pid or pid in _session_pending_ids:
+        return
     RU_PENDING.append({"id": pid, "first": first or "", "last": last or "", "tried_slugs": tried})
     RU_MISSES.append({"id": pid, "first": first or "", "last": last or "", "tried_slugs": tried})
     _session_pending_ids.add(pid)
 
 def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str | None) -> str:
-    """Возвращает «И. Фамилия» ТОЛЬКО если найдена кириллица на sports.ru.
-       Если нет — добавляет в pending/misses и возвращает спец-маркер (не латиницу)."""
+    """
+    Возвращает «И. Фамилия» ТОЛЬКО если найдена кириллица на sports.ru.
+    Если нет — добавляет в pending/misses и возвращает спец-маркер.
+    """
     cached = RU_CACHE.get(str(pid))
     if cached:
         ini = (cached.get("ru_first","")[:1] or "?")
         return f"{ini}. {cached.get('ru_last','')}"
+
+    # НОВОЕ: перед построением slug гарантируем, что first — полное имя, а не инициала
+    en_first, en_last = ensure_full_en_name(pid, en_first, en_last)
 
     tried = _slug_variants(en_first, en_last)
     for slug in tried:
@@ -332,7 +349,6 @@ def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str
             ini = (ru_first[:1] or "?")
             return f"{ini}. {ru_last}"
 
-    # не нашли кириллицу — фиксируем и возвращаем маркер (для видимости в отладочном тексте)
     _queue_pending(pid, en_first, en_last, tried)
     return "[имя не найдено]"
 
@@ -395,15 +411,22 @@ def fetch_goals(game_id: int) -> list[dict]:
 
 # -------- name resolver per event -------
 def resolve_player_display(pid: int, boxmap: dict, players_involved: list) -> str:
+    # сначала пробуем boxscore
     if pid and pid in boxmap:
         f = boxmap[pid].get("firstName",""); l = boxmap[pid].get("lastName","")
         d = _display_cache.get(pid)
+        # НОВОЕ: добираем полное имя (если вдруг в boxscore тоже инициалы)
+        f, l = ensure_full_en_name(pid, f, l)
         return ru_initial_from_sportsru(pid, f, l, d)
+    # затем playersInvolved
     for p in (players_involved or []):
         if p.get("playerId") == pid:
             f,l,d = _extract_names_from_player_obj(p)
+            f, l = ensure_full_en_name(pid, f, l)
             return ru_initial_from_sportsru(pid, f, l, d)
+    # последний шанс — landing
     f,l = fetch_player_en_name(pid)
+    f, l = ensure_full_en_name(pid, f, l)
     return ru_initial_from_sportsru(pid, f, l, None)
 
 # ------------- Game block ---------------
@@ -453,7 +476,6 @@ def build_game_block(game: dict) -> str:
         ss = g["totsec"] % 60
         t_abs = f"{mm}.{ss:02d}"
 
-        # отделяем инициал от фамилии пробелом
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
@@ -545,6 +567,9 @@ def _save_json(path: str, data):
     os.replace(tmp, path)
 
 # ---------------- Main ----------------
+RU_CACHE_PATH   = "ru_names_sportsru.json"
+RU_PENDING_PATH = "ru_pending_sportsru.json"
+
 if __name__ == "__main__":
     try:
         # загрузка кэшей
@@ -556,7 +581,7 @@ if __name__ == "__main__":
         d = pick_report_date()
         text = build_post(d)
 
-        # если есть хотя бы один игрок без кириллицы — падаем с ошибкой и ничего не отправляем
+        # если есть хотя бы один игрок без кириллицы — падаем и ничего не отправляем
         if RU_MISSES:
             _save_json(RU_CACHE_PATH, RU_CACHE)
             _save_json(RU_PENDING_PATH, RU_PENDING)
