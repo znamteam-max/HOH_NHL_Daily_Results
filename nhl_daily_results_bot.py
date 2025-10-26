@@ -2,29 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL Daily Results → Telegram (RU)
+NHL Daily Results → Telegram (RU) — Google CSE names only (no translit)
 
-⚙️ Источники NHL:
-  - Расписание/счёт:   https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
-                       (fallback: /v1/score, /v1/scoreboard)
-  - Play-by-Play:      https://api-web.nhle.com/v1/gamecenter/{gameId}/play-by-play
-  - Boxscore:          https://api-web.nhle.com/v1/gamecenter/{gameId}/boxscore
-  - Карточка игрока:   https://api-web.nhle.com/v1/player/{playerId}/landing
+Делает пост по итогам игрового дня НХЛ:
+• Источники NHL (официальные JSON, без html-скрейпинга):
+  - Schedule/Score:   https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
+                      (fallback: /v1/score, /v1/scoreboard)
+  - Play-by-Play:     https://api-web.nhle.com/v1/gamecenter/{gameId}/play-by-play
+  - Boxscore:         https://api-web.nhle.com/v1/gamecenter/{gameId}/boxscore
+  - Player landing:   https://api-web.nhle.com/v1/player/{playerId}/landing
 
-📝 Русские фамилии (строго без транслитерации):
-  1) sports.ru  (профиль → h1/h2) → «Имя Фамилия»
-  2) championat.com (профиль → h1/og:title) → «Имя Фамилия»
-  - В оба случая берём фамилию = последнее слово, имя = первое слово.
-  - Каждый успешный матчинг пишем в ru_surnames_sources.json:
-        { "<id>": {"ru_last":"...", "ru_first":"...", "source":"sports.ru|championat", "url":"..."} }
-  - Если не нашли на обоих сайтах: НЕ используем транслит, показываем латиницей «F. Lastname»,
-    и добавляем в ru_pending.json (для ручной доразметки).
+• Имена игроков:
+  - Строго без транслитерации.
+  - Ищем русскую версию через Google Custom Search JSON API (Programmable Search).
+  - Приоритет результатов: sports.ru, championat.com, ru.wikipedia.org, затем прочее.
+  - Из заголовка результата извлекаем «Имя Фамилия» на кириллице (берём 1-е и последнее слово).
+  - Кэш: ru_names_google.json — id → {ru_first, ru_last, url}.
+  - Не нашли: оставляем латиницу «F. Lastname» и пишем в ru_pending_google.json.
 
-📬 Формат поста:
-  - Заголовок: «🗓 Регулярный чемпионат НХЛ • {дата} • {N матчей}»
-  - Блок матча: 2 строки со счётом; у ОТ/Б добавляется «(ОТ)» или «(Б)»
-  - События: периоды/овертаймы, «MM.SS И. Фамилия (ассисты)»
-  - Буллиты: только «Победный буллит» — один решающий бросок.
+• Буллиты: выводим только «Победный буллит» (одна строка, автор решающего броска).
+• Время голов: абсолютное «ММ.СС» от начала матча (включая ОТ → 60+ мин, SO → 65.00).
 """
 
 import os
@@ -35,28 +32,32 @@ import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
 
-# --------- ENV ---------
+# ------------ ENV ----------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "").strip()  # Programmable Search Engine cx
+
 API = "https://api-web.nhle.com/v1"
 
-# --------- HTTP ---------
+# ------------ HTTP ---------------
 def make_session():
     s = requests.Session()
-    retries = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
-                    status_forcelist=[429,500,502,503,504],
-                    allowed_methods=["GET","POST"], raise_on_status=False)
+    retries = Retry(
+        total=6, connect=6, read=6, backoff_factor=0.6,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET","POST"], raise_on_status=False
+    )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/1.4 (sports.ru + championat names, no translit)",
+        "User-Agent": "NHL-DailyResultsBot/GoogleCSE-Names/1.0",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -74,16 +75,18 @@ def _get_json(url: str) -> dict:
 
 def log(*a): print(*a, file=sys.stderr)
 
-# --------- Dates ---------
+# ------------ Dates --------------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+
 def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 
 def pick_report_date() -> date:
+    # ориентируемся на ET (в НХЛ игры заканчиваются поздно)
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 7 else now_et.date()
 
-# --------- Teams ---------
+# ------------ Teams -------------
 TEAM_RU = {
     "ANA": ("Анахайм","🦆"), "ARI": ("Аризона","🤠"), "BOS": ("Бостон","🐻"), "BUF": ("Баффало","🦬"),
     "CGY": ("Калгари","🔥"), "CAR": ("Каролина","🌪️"), "COL": ("Колорадо","⛰️"), "CBJ": ("Коламбус","💣"),
@@ -98,7 +101,7 @@ TEAM_RU = {
 def team_ru_and_emoji(abbr: str) -> tuple[str,str]:
     return TEAM_RU.get((abbr or "").upper(), ((abbr or "").upper(),"🏒"))
 
-# --------- Time helpers ---------
+# --------- Time helpers ----------
 def parse_time_to_sec_in_period(t: str) -> int:
     try:
         m, s = str(t).split(":")
@@ -129,7 +132,7 @@ def period_heading(idx: int) -> str:
     if idx == 5: return "<i>Победный буллит</i>"
     return f"<i>Овертайм №{idx-3}</i>"
 
-# --------- Schedule / Finals ---------
+# ---------- Schedule -------------
 def fetch_games_for_date(day: date) -> list[dict]:
     out = []
     def eat(bucket_games):
@@ -158,7 +161,7 @@ def fetch_games_for_date(day: date) -> list[dict]:
         j = _get_json(f"{API}/scoreboard/{day.isoformat()}"); eat(j.get("games") or [])
     return out
 
-# --------- Boxscore players ---------
+# ---------- Boxscore -------------
 _en_name_cache: dict[int, tuple[str,str]] = {}
 _display_cache: dict[int, str] = {}
 
@@ -207,19 +210,13 @@ def fetch_player_en_name(pid: int) -> tuple[str,str]:
     _en_name_cache[pid] = (fn, ln)
     return fn, ln
 
-# --------- RU surname from sports.ru / championat ---------
-SPORTS_RU = "https://www.sports.ru"
-SRU_PERSON = SPORTS_RU + "/hockey/person/"
-SRU_PLAYER = SPORTS_RU + "/hockey/player/"
-SRU_SEARCH = SPORTS_RU + "/search/?q="
+# ---------- Google CSE (no translit) ----------
+GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 
-CHAMPIONAT = "https://www.championat.com"
-CH_SEARCH  = CHAMPIONAT + "/search/?q="
+RU_CACHE_PATH   = "ru_names_google.json"      # id -> {ru_first, ru_last, url}
+RU_PENDING_PATH = "ru_pending_google.json"    # [{id, first, last}]
 
-RU_SOURCES_PATH = "ru_surnames_sources.json"   # id -> {ru_last, ru_first, source, url}
-RU_PENDING_PATH = "ru_pending.json"             # [{"id", "first", "last"}]
-
-RU_SOURCES: dict[str, dict] = {}  # кэш успешных (только источники)
+RU_CACHE: dict[str, dict] = {}
 RU_PENDING: list[dict] = []
 _session_pending_ids: set[int] = set()
 
@@ -234,103 +231,61 @@ def _save_json(path: str, data):
     with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def _slugify(first: str, last: str) -> str:
-    base = f"{first} {last}".strip()
-    base = unicodedata.normalize("NFKD", base)
-    base = "".join(ch for ch in base if not unicodedata.combining(ch))
-    base = base.lower().strip()
-    base = re.sub(r"[^a-z0-9]+","-", base).strip("-")
-    return base
-
-def _text_has_cyrillic(s: str) -> bool:
+def _has_cyrillic(s: str) -> bool:
     return bool(re.search(r"[А-Яа-яЁё]", s or ""))
 
-def _extract_ru_first_last(full: str) -> tuple[str,str] | None:
-    # берём первое и последнее слова как имя/фамилия
-    if not full: return None
-    full = " ".join(full.replace("—"," ").replace("-", "-").split())
-    parts = [p for p in re.split(r"\s+", full) if p]
-    if len(parts) < 2: return None
-    ru_first = parts[0]
-    ru_last  = parts[-1]
-    if not _text_has_cyrillic(ru_last):
-        return None
-    return ru_first, ru_last
-
-# ---- sports.ru ----
-def sru_try_profile(first: str, last: str) -> str | None:
-    slug = _slugify(first, last)
-    for root in (SRU_PERSON, SRU_PLAYER):
-        url = root + slug + "/"
-        r = S.get(url, timeout=15)
-        if r.status_code == 200 and ("/hockey/person/" in r.url or "/hockey/player/" in r.url):
-            return url
+def _extract_ru_first_last_from_title(title: str) -> tuple[str,str] | None:
+    if not title: return None
+    t = title
+    # отрежем хвосты типа "— статистика, новости", " - Википедия" и т.п.
+    t = re.split(r"\s[–—\-|]\s", t)[0]
+    t = re.sub(r"\(.*?\)", "", t)  # скобки
+    t = " ".join(t.split()).strip()
+    # берём только слова кириллицей
+    words = [w for w in t.split() if re.match(r"^[А-ЯЁ][а-яё\-]+$", w)]
+    if len(words) >= 2:
+        return words[0], words[-1]
     return None
 
-def sru_from_profile(url: str) -> tuple[str,str] | None:
-    r = S.get(url, timeout=20)
-    if r.status_code != 200: return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    h = soup.find(["h1","h2"])
-    title = h.get_text(" ", strip=True) if h else ""
-    if not title:
-        # иногда фамилия в <title>
-        t = soup.find("title")
-        title = t.get_text(" ", strip=True) if t else ""
-    if not title: return None
-    return _extract_ru_first_last(title)
+def google_cse_search(query: str, num: int = 5) -> list[dict]:
+    if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
+        return []
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "num": max(1, min(10, num)),
+        "hl": "ru",
+        "lr": "lang_ru",
+        "safe": "off",
+    }
+    r = S.get(GOOGLE_ENDPOINT, params=params, timeout=25)
+    if r.status_code != 200:
+        log("[Google CSE error]", r.status_code, r.text[:200])
+        return []
+    j = r.json()
+    return j.get("items") or []
 
-def sru_search(first: str, last: str) -> tuple[str,str,str] | None:
-    q = quote_plus(f"{first} {last}".strip())
-    r = S.get(SRU_SEARCH + q, timeout=20)
-    if r.status_code != 200: return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    a = soup.select_one('a[href*="/hockey/person/"]') or soup.select_one('a[href*="/hockey/player/"]')
-    if not a or not a.get("href"): return None
-    href = a["href"]
-    if href.startswith("/"): href = SPORTS_RU + href
-    full = sru_from_profile(href)
-    if full:
-        ru_first, ru_last = full
-        return ru_first, ru_last, href
+def google_find_ru_name(en_first: str, en_last: str) -> dict | None:
+    # набор запросов с приоритетом доменов
+    queries = [
+        f'"{en_first} {en_last}" хоккей site:sports.ru',
+        f'"{en_first} {en_last}" хоккей site:championat.com',
+        f'"{en_first} {en_last}" сайт:ru.wikipedia.org',  # иногда полезно, оставим как альтернативу
+        f'"{en_first} {en_last}" хоккей',
+    ]
+    for q in queries:
+        items = google_cse_search(q, num=5)
+        for it in items:
+            title = it.get("title", "")
+            link  = it.get("link", "")
+            pair = _extract_ru_first_last_from_title(title)
+            if pair:
+                ru_first, ru_last = pair
+                if _has_cyrillic(ru_first) and _has_cyrillic(ru_last):
+                    return {"ru_first": ru_first, "ru_last": ru_last, "url": link}
     return None
 
-# ---- championat.com ----
-def ch_search(first: str, last: str) -> tuple[str,str,str] | None:
-    # Простой поиск; берём первую подходящую ссылку на спортсмена
-    q = quote_plus(f"{first} {last}".strip())
-    r = S.get(CH_SEARCH + q, timeout=20)
-    if r.status_code != 200: return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    # ищем ссылки на страницы спортсменов
-    cand = None
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("/"): href = CHAMPIONAT + href
-        host = urlparse(href).netloc
-        if "championat.com" not in host: continue
-        # фильтры по URL для игроков
-        if any(seg in href for seg in ["/sportsman/", "/hockey/", "/player", "/players"]):
-            cand = href
-            break
-    if not cand: return None
-    # открываем и парсим h1/og:title
-    r2 = S.get(cand, timeout=20)
-    if r2.status_code != 200: return None
-    soup2 = BeautifulSoup(r2.text, "html.parser")
-    title = ""
-    h1 = soup2.find("h1")
-    if h1: title = h1.get_text(" ", strip=True)
-    if not title:
-        og = soup2.find("meta", attrs={"property":"og:title"})
-        if og and og.get("content"): title = og["content"].strip()
-    if not title: return None
-    got = _extract_ru_first_last(title)
-    if not got: return None
-    ru_first, ru_last = got
-    return ru_first, ru_last, cand
-
-# --------- Resolver (no translit) ---------
 def queue_pending(pid: int, first: str, last: str):
     if not pid or pid in _session_pending_ids: return
     for it in RU_PENDING:
@@ -338,46 +293,27 @@ def queue_pending(pid: int, first: str, last: str):
     RU_PENDING.append({"id": pid, "first": first or "", "last": last or ""})
     _session_pending_ids.add(pid)
 
-def ru_initial_surname(pid: int, en_first: str, en_last: str, display: str | None) -> str:
-    # 0) кэш источников
-    got = RU_SOURCES.get(str(pid))
+def ru_initial_from_google(pid: int, en_first: str, en_last: str, display: str | None) -> str:
+    # 0) кэш
+    got = RU_CACHE.get(str(pid))
     if got:
-        ru_first = got.get("ru_first") or ""
-        ru_last  = got.get("ru_last") or ""
-        ini = (ru_first[:1] or en_first[:1] or "?")
-        return f"{ini}. {ru_last}".strip()
+        ini = (got.get("ru_first","")[:1] or en_first[:1] or "?")
+        return f"{ini}. {got.get('ru_last','')}".strip()
 
-    # 1) sports.ru (slug → профиль)
-    if en_first and en_last:
-        prof = sru_try_profile(en_first, en_last)
-        if prof:
-            pair = sru_from_profile(prof)
-            if pair:
-                ru_first, ru_last = pair
-                RU_SOURCES[str(pid)] = {"ru_first":ru_first, "ru_last":ru_last, "source":"sports.ru", "url":prof}
-                return f"{ru_first[:1]}. {ru_last}"
+    # 1) запрос к Google
+    res = google_find_ru_name(en_first, en_last)
+    if res:
+        RU_CACHE[str(pid)] = res
+        ini = (res["ru_first"][:1] or en_first[:1] or "?")
+        return f"{ini}. {res['ru_last']}".strip()
 
-    # 2) sports.ru (поиск)
-    if en_first and en_last:
-        got = sru_search(en_first, en_last)
-        if got:
-            ru_first, ru_last, url = got
-            RU_SOURCES[str(pid)] = {"ru_first":ru_first, "ru_last":ru_last, "source":"sports.ru", "url":url}
-            return f"{ru_first[:1]}. {ru_last}"
-
-    # 3) championat.com (поиск → профиль)
-    got = ch_search(en_first, en_last)
-    if got:
-        ru_first, ru_last, url = got
-        RU_SOURCES[str(pid)] = {"ru_first":ru_first, "ru_last":ru_last, "source":"championat", "url":url}
-        return f"{ru_first[:1]}. {ru_last}"
-
-    # 4) not found → латиница (без транслита), добавляем в pending
+    # 2) не нашли — латиница, в pending
     queue_pending(pid, en_first, en_last)
     ini = (en_first[:1] or "?").upper()
-    return f"{ini}. {en_last or (display or '')}".strip()
+    last = en_last or (display or "")
+    return f"{ini}. {last}".strip()
 
-# --------- PBP: goals ---------
+# --------- PBP: goals -----------
 def fetch_goals(game_id: int) -> list[dict]:
     data = _get_json(f"{API}/gamecenter/{game_id}/play-by-play") or {}
     plays = data.get("plays", []) or []
@@ -419,22 +355,23 @@ def fetch_goals(game_id: int) -> list[dict]:
     out.sort(key=lambda x: (x["period"], x["sec"]))
     return out
 
-# --------- Game block ---------
+# ------ Name resolver per event ------
 def resolve_player_display(pid: int, boxmap: dict, players_involved: list) -> str:
-    # 1) из boxscore
+    # 1) boxscore
     if pid and pid in boxmap:
         f = boxmap[pid].get("firstName",""); l = boxmap[pid].get("lastName","")
         d = _display_cache.get(pid)
-        return ru_initial_surname(pid, f, l, d)
+        return ru_initial_from_google(pid, f, l, d)
     # 2) из самого события
     for p in (players_involved or []):
         if p.get("playerId") == pid:
             f,l,d = _extract_names_from_player_obj(p)
-            return ru_initial_surname(pid, f, l, d)
+            return ru_initial_from_google(pid, f, l, d)
     # 3) landing
     f,l = fetch_player_en_name(pid)
-    return ru_initial_surname(pid, f, l, None)
+    return ru_initial_from_google(pid, f, l, None)
 
+# ---------- Game block ------------
 def build_game_block(game: dict) -> str:
     gid = game["gameId"]
     home_ab, away_ab = game["homeAbbrev"], game["awayAbbrev"]
@@ -459,7 +396,7 @@ def build_game_block(game: dict) -> str:
     lines = []
     current_period = None
 
-    # обычные голы (1–3 периоды, ОТ)
+    # обычные голы (1–3 периоды и ОТ)
     for g in reg_goals:
         if g["period"] != current_period:
             current_period = g["period"]
@@ -476,13 +413,13 @@ def build_game_block(game: dict) -> str:
         ast_txt = f" ({', '.join(assists)})" if assists else ""
 
         t_abs = fmt_mm_ss(g["totsec"])
-        # пробел после «И.»
+        # красивый пробел после «И.»
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
         lines.append(f"{g['home']}:{g['away']} – {t_abs} {scorer}{ast_txt}")
 
-    # победный буллит — только один бросок
+    # Победный буллит (один бросок)
     if so_goals:
         winner_team_id = (game["homeId"] if hs > as_ else game["awayId"] if as_ > hs else None)
         winning_shot = None
@@ -503,10 +440,10 @@ def build_game_block(game: dict) -> str:
 
     return head + "\n".join(lines)
 
-# --------- Full post ---------
+# --------- Full post --------------
 def build_post(day: date) -> str:
     games = fetch_games_for_date(day)
-    # если пусто — чекнут предыдущие дни
+    # если пусто — попробуем предыдущие дни
     for shift in (1,2):
         if games: break
         d2 = day - timedelta(days=shift)
@@ -535,7 +472,7 @@ def build_post(day: date) -> str:
         if i < len(games): blocks.append("")
     return title + "\n".join(blocks).strip()
 
-# --------- Telegram ---------
+# --------- Telegram ---------------
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
@@ -553,25 +490,27 @@ def tg_send(text: str):
                               "disable_web_page_preview": True}, timeout=25)
         if r.status_code != 200:
             raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
-        time.sleep(0.3)
+        time.sleep(0.25)
 
-# --------- Main ---------
+# --------------- Main --------------
 if __name__ == "__main__":
     try:
         # загрузим кэши
-        loaded_sources = _load_json(RU_SOURCES_PATH, {})
-        if isinstance(loaded_sources, dict): RU_SOURCES.update(loaded_sources)
-
+        loaded_cache = _load_json(RU_CACHE_PATH, {})
+        if isinstance(loaded_cache, dict):
+            RU_CACHE.update(loaded_cache)
         loaded_pending = _load_json(RU_PENDING_PATH, [])
-        if isinstance(loaded_pending, list): RU_PENDING.extend(loaded_pending)
+        if isinstance(loaded_pending, list):
+            RU_PENDING.extend(loaded_pending)
 
         d = pick_report_date()
         text = build_post(d)
         tg_send(text)
 
-        # сохранить только при изменениях
-        _save_json(RU_SOURCES_PATH, RU_SOURCES)
+        # сохраняем изменения
+        _save_json(RU_CACHE_PATH, RU_CACHE)
         _save_json(RU_PENDING_PATH, RU_PENDING)
+
         print("OK")
     except Exception as e:
         print("ERROR:", repr(e), file=sys.stderr)
