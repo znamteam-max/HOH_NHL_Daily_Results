@@ -4,7 +4,7 @@
 """
 NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/{first-last}
 
-• Данные НХЛ:
+• NHL JSON:
   - Schedule/Score:   https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
                       (fallback: /v1/score, /v1/scoreboard)
   - Play-by-Play:     https://api-web.nhle.com/v1/gamecenter/{gameId}/play-by-play
@@ -13,10 +13,10 @@ NHL Daily Results → Telegram (RU) — names only from sports.ru/hockey/person/
 
 • Русские имена:
   - Строго sports.ru: https://www.sports.ru/hockey/person/{first-last}/
-  - Приоритетно читаем <h1 class="titleH1">…</h1>, затем h1, затем og:title/title.
-  - Если ИМЕНИ НА КИРИЛЛИЦЕ нет — считаем НЕ НАЙДЕНО: пост не отправляем, скрипт падает с ошибкой.
+  - Приоритет: <h1 class="titleH1"> → <h1> → og:title → <title>, только если есть кириллица.
+  - НЕТ кириллицы → считаем НЕ НАЙДЕНО, падаем с ошибкой, пост не отправляем.
   - Кэш удачных:  ru_names_sportsru.json  → { "<id>": {"ru_first","ru_last","url"} }
-  - Список проблемных: ru_pending_sportsru.json → [{id, first, last, tried_slugs[]}]
+  - Проблемные:   ru_pending_sportsru.json → [{id, first, last, tried_slugs[]}]
 
 • Время голов: ММ.СС от старта матча (ОТ → 60+, SO → 65.00).
 • Буллиты: только «Победный буллит».
@@ -51,7 +51,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-DailyResultsBot/sportsru-h1-only/1.3",
+        "User-Agent": "NHL-DailyResultsBot/sportsru-h1-only/1.4",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -95,35 +95,12 @@ def team_ru_and_emoji(abbr: str) -> tuple[str,str]:
     return TEAM_RU.get((abbr or "").upper(), ((abbr or "").upper(),"🏒"))
 
 # ------------- Time helpers ---------
-def parse_time_to_sec_in_period(t: str) -> int:
-    try:
-        m, s = str(t).split(":")
-        return int(m)*60 + int(s)
-    except Exception:
-        return 0
-
-def period_to_index(period_type: str, number: int) -> int:
-    pt = (period_type or "").upper()
-    if pt == "OT": return 4
-    if pt == "SO": return 5
-    return max(1, int(number or 1))
-
 def abs_seconds(period_index: int, sec_in_period: int) -> int:
     if period_index == 5:   # SO
         return 65*60 + (sec_in_period or 0)
     if period_index >= 4:   # OT
         return 60*60 + (sec_in_period or 0)
     return (period_index - 1)*20*60 + (sec_in_period or 0)
-
-def fmt_mm_ss(total_seconds: int) -> str:
-    mm = total_seconds // 60
-    ss = total_seconds % 60
-    return f"{mm}.{ss:02d}"
-
-def period_heading(idx: int) -> str:
-    if idx <= 3: return f"<i>{idx}-й период</i>"
-    if idx == 5: return "<i>Победный буллит</i>"
-    return f"<i>Овертайм №{idx-3}</i>"
 
 # ------------- Schedule -------------
 def fetch_games_for_date(day: date) -> list[dict]:
@@ -193,23 +170,32 @@ def fetch_box_map(game_id: int) -> dict[int, dict]:
     eat(stats.get("awayTeam",{}) or {})
     return out
 
-def fetch_player_en_name(pid: int) -> tuple[str,str]:
-    if pid in _en_name_cache:
-        fn, ln = _en_name_cache[pid]
-        return (fn or "").strip(), (ln or "").strip()
+# ---- Player landing helpers ----
+def fetch_player_en_name_force(pid: int) -> tuple[str,str]:
+    """Игнорирует кэш и тянет полное имя из landing."""
     j = _get_json(f"{API}/player/{pid}/landing") or {}
     fn, ln = j.get("firstName"), j.get("lastName")
     if isinstance(fn, dict): fn = fn.get("default") or ""
     if isinstance(ln, dict): ln = ln.get("default") or ""
     fn, ln = (fn or "").strip(), (ln or "").strip()
-    _en_name_cache[pid] = (fn, ln)
+    # обновим кэш нормальным именем
+    if fn or ln:
+        _en_name_cache[pid] = (fn, ln)
     return fn, ln
 
-# ---- НОВОЕ: обязателен полный first (не инициала) ----
+def fetch_player_en_name(pid: int) -> tuple[str,str]:
+    """Обычная версия, использует кэш; если в кэше инициала — дёргает force."""
+    if pid in _en_name_cache:
+        fn, ln = _en_name_cache[pid]
+        if (not fn) or len(fn) <= 2 or re.fullmatch(r"[A-Za-z]\.?", fn or ""):
+            return fetch_player_en_name_force(pid)
+        return (fn or "").strip(), (ln or "").strip()
+    return fetch_player_en_name_force(pid)
+
 def ensure_full_en_name(pid: int, first: str, last: str) -> tuple[str,str]:
     """
-    Если первое имя похоже на инициал (одна буква/с точкой), дотягиваем
-    полную версию из /player/{id}/landing. Аналогично, если фамилии нет.
+    Если first похож на инициалу (1–2 символа) либо пуст, или last пуст —
+    принудительно тянем landing, игнорируя кэш-инициалы.
     """
     need = False
     if not first or len(first) <= 2 or re.fullmatch(r"[A-Za-z]\.?", first or ""):
@@ -217,7 +203,7 @@ def ensure_full_en_name(pid: int, first: str, last: str) -> tuple[str,str]:
     if not last:
         need = True
     if need:
-        f2, l2 = fetch_player_en_name(pid)
+        f2, l2 = fetch_player_en_name_force(pid)
         first = f2 or first
         last  = l2 or last
     return (first or "").strip(), (last or "").strip()
@@ -239,8 +225,8 @@ def _norm_ascii(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
-    s = re.sub(r"[^a-z0-9\- ]+", " ", s)
-    s = re.sub(r"\s+", "-", s).strip("-")
+    s = re.sub(r"[^a-z0-9\\- ]+", " ", s)
+    s = re.sub(r"\\s+", "-", s).strip("-")
     s = re.sub(r"-{2,}", "-", s)
     return s
 
@@ -249,11 +235,11 @@ def _slug_variants(first: str, last: str) -> list[str]:
     l = _norm_ascii(last)
     cand = []
     if f and l:
-        cand.append(f"{f}-{l}")              # leon-draisaitl
-        if "-" in l: cand.append(f"{f}-{l.replace('-', '')}")   # nugent-hopkins → nugenthopkins
+        cand.append(f"{f}-{l}")                     # leon-draisaitl
+        if "-" in l: cand.append(f"{f}-{l.replace('-', '')}")   # nugent-hopkins -> nugenthopkins
         if "-" in f: cand.append(f"{f.replace('-', '')}-{l}")
     if l:
-        cand.append(l)                        # просто фамилия
+        cand.append(l)                              # просто фамилия
     out, seen = [], set()
     for c in cand:
         if c and c not in seen:
@@ -265,10 +251,10 @@ def _has_cyrillic(s: str) -> bool:
 
 def _extract_ru_pair_from_text(t: str) -> tuple[str,str] | None:
     if not t: return None
-    t = re.split(r"\s[–—\-|]\s", t)[0]
-    t = re.sub(r"\(.*?\)", "", t)
+    t = re.split(r"\\s[–—\\-|]\\s", t)[0]
+    t = re.sub(r"\\(.*?\\)", "", t)
     t = " ".join(t.split()).strip()
-    words = [w for w in t.split() if re.match(r"^[А-ЯЁ][а-яё\-]+$", w)]
+    words = [w for w in t.split() if re.match(r"^[А-ЯЁ][а-яё\\-]+$", w)]
     if len(words) >= 2:
         return words[0], words[-1]
     return None
@@ -300,7 +286,7 @@ def _sportsru_fetch_ru_name_by_slug(slug: str) -> tuple[str,str,str] | None:
     if h1:
         txt = h1.get_text(" ", strip=True)
         pair = _extract_ru_pair_from_text(txt)
-        if pair and _has_cyrилlic(" ".join(pair)):
+        if pair and _has_cyrillic(" ".join(pair)):
             rf, rl = pair
             return rf, rl, r.url
 
@@ -337,7 +323,7 @@ def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str
         ini = (cached.get("ru_first","")[:1] or "?")
         return f"{ini}. {cached.get('ru_last','')}"
 
-    # НОВОЕ: перед построением slug гарантируем, что first — полное имя, а не инициала
+    # ВАЖНО: гарантируем полные имена перед построением слуга (игнорируем кэш-инициалы)
     en_first, en_last = ensure_full_en_name(pid, en_first, en_last)
 
     tried = _slug_variants(en_first, en_last)
@@ -352,7 +338,7 @@ def ru_initial_from_sportsru(pid: int, en_first: str, en_last: str, display: str
     _queue_pending(pid, en_first, en_last, tried)
     return "[имя не найдено]"
 
-# ------------- PBP (goals) -------------
+# ------------- Play-by-play (goals) -------------
 def fetch_goals(game_id: int) -> list[dict]:
     data = _get_json(f"{API}/gamecenter/{game_id}/play-by-play") or {}
     plays = data.get("plays", []) or []
@@ -362,31 +348,29 @@ def fetch_goals(game_id: int) -> list[dict]:
             continue
         det = ev.get("details", {}) or {}
         pd  = ev.get("periodDescriptor", {}) or {}
+
         time_in = str(ev.get("timeInPeriod") or det.get("timeInPeriod") or "0:00")
         try:
             m, s = time_in.split(":"); sec_in = int(m)*60 + int(s)
         except Exception:
             sec_in = 0
+
         pt = (pd.get("periodType") or "").upper()
         num = pd.get("number") or 1
         if pt == "OT": pidx = 4
         elif pt == "SO": pidx = 5
         else: pidx = max(1, int(num))
-        if pidx == 5:
-            totsec = 65*60 + sec_in
-        elif pidx >= 4:
-            totsec = 60*60 + sec_in
-        else:
-            totsec = (pidx - 1)*20*60 + sec_in
+
+        if pidx == 5:      totsec = 65*60 + sec_in
+        elif pidx >= 4:    totsec = 60*60 + sec_in
+        else:              totsec = (pidx - 1)*20*60 + sec_in
 
         sid = det.get("scoringPlayerId")
         a1  = det.get("assist1PlayerId") or det.get("secondaryAssistPlayerId")
         a2  = det.get("assist2PlayerId") or det.get("tertiaryAssistPlayerId")
         team_id = det.get("eventOwnerTeamId") or ev.get("teamId") or det.get("teamId")
-        try:
-            team_id = int(team_id) if team_id is not None else None
-        except Exception:
-            team_id = None
+        try: team_id = int(team_id) if team_id is not None else None
+        except Exception: team_id = None
 
         players = ev.get("playersInvolved") or []
         if (not sid) and players:
@@ -411,22 +395,20 @@ def fetch_goals(game_id: int) -> list[dict]:
 
 # -------- name resolver per event -------
 def resolve_player_display(pid: int, boxmap: dict, players_involved: list) -> str:
-    # сначала пробуем boxscore
+    # 1) boxscore
     if pid and pid in boxmap:
         f = boxmap[pid].get("firstName",""); l = boxmap[pid].get("lastName","")
         d = _display_cache.get(pid)
-        # НОВОЕ: добираем полное имя (если вдруг в boxscore тоже инициалы)
-        f, l = ensure_full_en_name(pid, f, l)
+        f, l = ensure_full_en_name(pid, f, l)  # ← гарантируем полные имена
         return ru_initial_from_sportsru(pid, f, l, d)
-    # затем playersInvolved
+    # 2) playersInvolved
     for p in (players_involved or []):
         if p.get("playerId") == pid:
             f,l,d = _extract_names_from_player_obj(p)
             f, l = ensure_full_en_name(pid, f, l)
             return ru_initial_from_sportsru(pid, f, l, d)
-    # последний шанс — landing
-    f,l = fetch_player_en_name(pid)
-    f, l = ensure_full_en_name(pid, f, l)
+    # 3) landing напрямую
+    f,l = fetch_player_en_name_force(pid)  # ← сразу force, чтобы точно не инициалы
     return ru_initial_from_sportsru(pid, f, l, None)
 
 # ------------- Game block ---------------
@@ -476,6 +458,7 @@ def build_game_block(game: dict) -> str:
         ss = g["totsec"] % 60
         t_abs = f"{mm}.{ss:02d}"
 
+        # аккуратный пробел после «И.»
         scorer = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", scorer)
         ast_txt = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", ast_txt)
 
@@ -587,12 +570,12 @@ if __name__ == "__main__":
             _save_json(RU_PENDING_PATH, RU_PENDING)
             sample = "\n".join(
                 f"- id={m['id']} | {m['first']} {m['last']} | tried: {', '.join(m.get('tried_slugs', [])[:4])}"
-                for m in RU_MISSES[:15]
+                for m in RU_MISSES[:20]
             )
             raise RuntimeError(
                 "Не удалось получить имена на кириллице для некоторых игроков sports.ru.\n"
                 "Список (первые):\n" + sample +
-                ("\n… (см. ru_pending_sportsru.json)" if len(RU_MISSES) > 15 else "")
+                ("\n… (см. ru_pending_sportsru.json)" if len(RU_MISSES) > 20 else "")
             )
 
         # всё хорошо — отправляем
