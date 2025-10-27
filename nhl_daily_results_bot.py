@@ -32,8 +32,8 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TZ_OUTPUT = "Europe/Helsinki"
 
 STRICT_RU = True  # если не нашли кириллицу на sports.ru — падать
-RU_CACHE_FILE   = "ru_names_sportsru.json"
-RU_PENDING_FILE = "ru_pending_sportsru.json"
+RU_CACHE_FILE   = "ru_names_sportsru.json"     # {playerId: "И. Фамилия"}
+RU_PENDING_FILE = "ru_pending_sportsru.json"   # {playerId: ["slug1","slug2",...]}
 
 REQUEST_JITTER = (0.4, 0.9)
 API = "https://api-web.nhle.com/v1"
@@ -93,12 +93,10 @@ def to_text(v) -> str:
                 inner = val.get("default")
                 if isinstance(inner, str) and inner.strip():
                     return inner.strip()
-        # склеим все строковые значения
         parts = [x for x in v.values() if isinstance(x, str)]
         if parts:
             return " ".join(parts).strip()
         return ""
-    # список имён → склеить
     if isinstance(v, list):
         return " ".join(to_text(x) for x in v if x).strip()
     return str(v)
@@ -113,7 +111,6 @@ def ru_date(d: dt.date) -> str:
 
 def pick_report_date() -> dt.date:
     now = dt.datetime.now(ZoneInfo(TZ_OUTPUT))
-    # Нам нужна дата по Хельсинки за «вчера», чтобы все матчи уже точно завершились
     return (now - dt.timedelta(days=1)).date()
 
 # ───────── Игры дня
@@ -141,6 +138,16 @@ def abs_time_mmss(period_num: int, time_in_period: str, ptype: str) -> str:
     if period_num >= 4:
         return f"{60 + mm}.{ss:02d}"
     return f"{(period_num-1)*20 + mm}.{ss:02d}"
+
+# ───────── Player EN name by id (landing)
+def fetch_player_en_name_by_id(pid: int) -> str:
+    """Всегда пытаемся вернуть 'First Last' из /player/{id}/landing."""
+    if not pid:
+        return ""
+    j = get_json(f"{API}/player/{pid}/landing")
+    fn = to_text((j.get("firstName") or {}))
+    ln = to_text((j.get("lastName")  or {}))
+    return f"{fn} {ln}".strip()
 
 # ───────── Boxscore: roster (id -> "First Last")
 def fetch_box_roster_names(game_id: int) -> dict[int, str]:
@@ -271,7 +278,6 @@ def fetch_goals_fallback_landing(game_id: int):
             time_in = to_text(ev.get("timeInPeriod") or "0:00")
             scorer = to_text(ev.get("scorer"))
             assists_names = ev.get("assists") or []
-            # assists может быть списком строк/словари
             assists = []
             for a in assists_names:
                 assists.append((None, to_text(a)))
@@ -328,7 +334,6 @@ def slugify_en(full_en: str) -> list[str]:
     cands = [slug]
     if len(parts) >= 2:
         cands.append(parts[-1])  # только фамилия
-    # уникализируем
     out, seen = [], set()
     for c in cands:
         c = _norm_ascii(c)
@@ -350,7 +355,6 @@ def sportsru_fetch_ru_initial(full_en: str):
             if not h1:
                 continue
             ru_full = to_text(h1.get_text(strip=True))
-            # проверим наличие кириллицы
             if not re.search(r"[А-Яа-яЁё]", ru_full):
                 continue
             parts = ru_full.split()
@@ -364,6 +368,7 @@ def sportsru_fetch_ru_initial(full_en: str):
     return None, candidates
 
 def to_ru_initial(player_id: int | None, full_en: str) -> str | None:
+    """Вернёт «И. Фамилия» или None. Кэшируем по playerId."""
     if not full_en:
         return None
     pid = str(player_id) if player_id is not None else None
@@ -412,37 +417,43 @@ def build_game_block(g: dict) -> str:
         home_line = f"<b>{home_line}</b>"
     else:
         away_line = f"<b>{away_line}</b>"
-
     parts = [f"{home_line}\n{away_line}\n"]
 
     if not goals and not shootout:
         raise RuntimeError("Нет событий матча (play-by-play пуст)")
 
-    # билд имя EN → EN full (по roster), затем → RU (sports.ru)
+    # билд имя EN → EN full (по roster/raw/landing), затем → RU (sports.ru)
     def normalize_full_en(pid, raw):
-        raw = to_text(raw)
-        if pid and pid in roster:
+        raw = to_text(raw).strip()
+        # 1) по id в ростере
+        if pid and pid in roster and roster[pid]:
             return roster[pid]
+        # 2) если в raw уже что-то есть — отдадим
         if raw:
-            # сопоставим по фамилии, если pid None
-            last = raw.split()[-1].lower()
-            for rid, full in roster.items():
-                if full.lower().split()[-1] == last:
-                    return full
-        return raw
+            return raw
+        # 3) как крайняя мера — дернуть landing по id
+        if pid:
+            name = fetch_player_en_name_by_id(int(pid))
+            if name:
+                return name
+        return raw  # пусто
 
-    # собираем по периодам
     goals_by_p = {}
     for r in goals:
         goals_by_p.setdefault(r["period"], []).append(r)
 
-    ru_missing = []  # [(pid, "First Last"), ...]
+    # собираем «пропущенных» без дублей
+    ru_missing = {}  # key -> en_full; key='pid' или 'noid|Name'
 
     def ru_name(pid, en_full) -> str | None:
+        if not en_full and pid:
+            en_full = fetch_player_en_name_by_id(int(pid)) or ""
         ru = to_ru_initial(pid, en_full)
         if ru:
             return ru
-        ru_missing.append((pid, en_full))
+        key = str(pid) if pid else f"noid|{en_full}"
+        if key not in ru_missing:
+            ru_missing[key] = en_full
         return None
 
     for p in sorted(goals_by_p.keys()):
@@ -452,31 +463,30 @@ def build_game_block(g: dict) -> str:
             parts.append(f"<i>Овертайм №{p-3}</i>")
         for r in goals_by_p[p]:
             en_scorer = normalize_full_en(r.get("scorerId"), r.get("scorer"))
-            ru_scorer = ru_name(r.get("scorerId"), en_scorer) or en_scorer  # временно подставим EN — потом упадём
+            ru_scorer = ru_name(r.get("scorerId"), en_scorer) or en_scorer or "—"
 
             ass_ru = []
             for aid, aname in (r.get("assists") or []):
                 en_a = normalize_full_en(aid, aname)
-                rux = ru_name(aid, en_a) or en_a
+                rux = ru_name(aid, en_a) or en_a or "—"
                 ass_ru.append(rux)
 
             t_abs = to_text(r.get("abs_time")) or to_text(r.get("time")) or ""
-            ass_txt = f" ({', '.join(escape(x) for x in ass_ru if x)})" if ass_ru else ""
+            ass_txt = f" ({', '.join(escape(x) for x in ass_ru if x and x != '—')})" if ass_ru else ""
             parts.append(f"{escape(t_abs)} {escape(ru_scorer)}{ass_txt}")
 
     # Победный буллит
     if shootout:
         parts.append("<i>Победный буллит</i>")
         en_w = normalize_full_en(shootout.get("scorerId"), shootout.get("scorer"))
-        ru_w = ru_name(shootout.get("scorerId"), en_w) or en_w
+        ru_w = ru_name(shootout.get("scorerId"), en_w) or en_w or "—"
         parts.append(f"65.00 {escape(ru_w)}")
 
     if STRICT_RU and ru_missing:
-        # сохраняем кэши/пенд и падаем
         save_json(RU_CACHE_FILE, RU_MAP)
         save_json(RU_PENDING_FILE, RU_PENDING)
         preview = "\n".join(
-            f"- id={pid} | {name}" for pid, name in ru_missing[:20]
+            f"- id={k} | {v}" for k, v in list(ru_missing.items())[:20]
         )
         raise RuntimeError(
             "Не удалось получить имена на кириллице для некоторых игроков sports.ru.\n"
@@ -488,8 +498,9 @@ def build_game_block(g: dict) -> str:
 # ───────── Пост
 def build_post(day: dt.date) -> str:
     games = fetch_games_for_date(day)
-    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(day)} • {len(games)} " + \
-            ("матч" if len(games)==1 else "матча" if len(games)%10 in (2,3,4) and not 12<=len(games)%100<=14 else "матчей")
+    n = len(games)
+    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(day)} • {n} " + \
+            ("матч" if n==1 else "матча" if n%10 in (2,3,4) and not 12<=n%100<=14 else "матчей")
     head = f"{title}\n\nРезультаты надёжно спрятаны 👇\n\n——————————————————\n\n"
 
     if not games:
@@ -530,7 +541,6 @@ if __name__ == "__main__":
     try:
         day = pick_report_date()
         text = build_post(day)
-        # сохраняем кэш имён
         save_json(RU_CACHE_FILE, RU_MAP)
         save_json(RU_PENDING_FILE, RU_PENDING)
         tg_send(text)
