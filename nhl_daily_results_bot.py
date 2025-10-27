@@ -9,7 +9,7 @@ NHL Daily Results -> Telegram (RU)
     2) /v1/wsc/play-by-play/{gameId}
     3) /v1/gamecenter/{gameId}/landing  (summary/scoring/byPeriod)
 - Имёны игроков: строго со sports.ru/hockey/person/<slug>/ из <h1 class="titleH1">.
-  Нет кириллицы -> считаем НЕ НАЙДЕНО и падаем.
+  Нет кириллицы -> считаем НЕ НАЙДЕНО и падаем (STRICT_RU=True).
 - Печать по периодам, время голов — абсолютное (MM.SS от старта матча).
 - Серия буллитов: печатаем только «Победный буллит».
 
@@ -313,39 +313,67 @@ def save_json(path, data):
 RU_MAP     = load_json(RU_CACHE_FILE, {})
 RU_PENDING = load_json(RU_PENDING_FILE, {})
 
+# Сид-словарь ручных исправлений (минимально и адресно)
+RU_SEED = {
+    # Victor Hedman
+    "8475167": "В. Хедман",
+}
+RU_MAP.update({k: v for k, v in RU_SEED.items() if k not in RU_MAP})
+
 def _norm_ascii(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
-    s = re.sub(r"[^a-z0-9\- ]+", " ", s)   # ← фикс: дефис только один раз экранируем
-    s = re.sub(r"\s+", "-", s)             # ← фикс: \s, а не \\s
+    s = re.sub(r"[^a-z0-9\- ]+", " ", s)
+    s = re.sub(r"\s+", "-", s)
     s = re.sub(r"-{2,}", "-", s)
     return s.strip("-")
 
 def slugify_en(full_en: str) -> list[str]:
-    """Возвращает список кандидатов slug: ['first-last', 'last']"""
-    name = re.sub(r"[^A-Za-z\-\s']", " ", full_en).strip()  # ← фикс
-    name = re.sub(r"\s+", " ", name)                        # ← фикс
+    """Возвращает список кандидатов slug: ['first-last', 'last', 'first-last-1', ...]"""
+    name = re.sub(r"[^A-Za-z\-\s']", " ", full_en).strip()
+    name = re.sub(r"\s+", " ", name)
     parts = name.lower().split()
     if not parts:
         return []
-    slug = "-".join(parts)
-    cands = [slug]
+    slug_main = "-".join(parts)
+
+    # Альтернативы имени (минимальный набор для типичных случаев)
+    first_alt_map = {
+        "victor": "viktor",
+    }
+    alts = []
+    if len(parts) >= 2:
+        first, last = parts[0], parts[-1]
+        if first in first_alt_map:
+            alts.append(f"{first_alt_map[first]}-{last}")
+
+    cands = [slug_main]
     if len(parts) >= 2:
         cands.append(parts[-1])  # только фамилия
-    out, seen = [], set()
+    cands += alts
+
+    # Добавим суффиксы -1/-2/-3 для каждого варианта
+    with_suffix = []
     for c in cands:
-        c = _norm_ascii(c)
-        if c and c not in seen:
-            out.append(c); seen.add(c)
+        with_suffix.extend([c, f"{c}-1", f"{c}-2", f"{c}-3"])
+
+    # нормализуем и уникализируем
+    out, seen = [], set()
+    for c in with_suffix:
+        cc = _norm_ascii(c)
+        if cc and cc not in seen:
+            out.append(cc); seen.add(cc)
     return out
 
 def sportsru_fetch_ru_initial(full_en: str):
     """Ищем страницу игрока на sports.ru и берём <h1 class="titleH1"> «Имя Фамилия» -> «И. Фамилия»."""
     candidates = slugify_en(full_en)
+    tried = []
     for slug in candidates:
         url = f"{SPORTS_ROOT}{slug}/"
+        tried.append(slug)
         try:
             r = S.get(url, timeout=20)
             if r.status_code != 200:
@@ -365,7 +393,7 @@ def sportsru_fetch_ru_initial(full_en: str):
             return ru_full
         except Exception as e:
             print(f"[WARN] sports.ru {url}: {e}", file=sys.stderr)
-    return None, candidates
+    return (None, tried)
 
 def to_ru_initial(player_id: int | None, full_en: str) -> str | None:
     """Вернёт «И. Фамилия» или None. Кэшируем по playerId."""
@@ -376,11 +404,11 @@ def to_ru_initial(player_id: int | None, full_en: str) -> str | None:
         return v
     ru = sportsru_fetch_ru_initial(full_en)
     if isinstance(ru, tuple):
-        # не нашли
-        _, cands = ru
+        # не нашли — сохраним все попытки
+        _, tried = ru
         if pid:
             RU_PENDING.setdefault(pid, [])
-            for sl in cands:
+            for sl in tried:
                 if sl not in RU_PENDING[pid]:
                     RU_PENDING[pid].append(sl)
         return None
