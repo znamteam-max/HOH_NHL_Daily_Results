@@ -2,30 +2,34 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL → Telegram (RU): время и события из NHL, имена с sports.ru (поиск через Календарь)
+NHL → Telegram (RU): время и события из NHL, имена со sports.ru (поиск через Календарь + запасной поиск)
 
 Логика:
-1) Берём окно игрового дня по МСК:
+1) Окно игрового дня по МСК:
    - все матчи REPORT_DATE,
    - и матчи REPORT_DATE-1, начавшиеся >= 15:00 МСК.
 2) Для каждого матча:
-   - тянем play-by-play из api-web.nhle.com (период, timeInPeriod, счёт после гола, итоговый счёт, ОТ/Б).
-   - находим этот же матч на sports.ru:
-       СНАЧАЛА — через календарь турнира https://www.sports.ru/hockey/tournament/nhl/calendar/
-       (ищем строку, где home/away совпадают и дата/время совпадают);
-       если не нашлось — пробуем общий поиск sports.ru.
-   - со страницы матча sports.ru берём список голов, строим карту:
-       key = (period, "MM:SS") → value = (Автор_«И. Фамилия», [ассистенты_«И. Фамилия»])
-   - склеиваем с NHL по ключу (period,timeInPeriod). Если не нашли — скрипт падает (чтобы не просочился английский).
-   - буллиты: берём только «Победный буллит».
-3) Печать: жирным победитель, по периодам, время в абсолюте (mm.ss), только победный буллит.
+   - play-by-play из api-web.nhle.com (период, timeInPeriod, счёт после гола, итоговый счёт, ОТ/Б).
+   - матч на sports.ru:
+       СНАЧАЛА — в календаре https://www.sports.ru/hockey/tournament/nhl/calendar/
+       (совпадение по командам и дате, время — по наименьшей разнице; допускается неточное совпадение минут),
+       ЕСЛИ НЕТ — общий поиск sports.ru.
+   - со страницы матча sports.ru берём список голов; строим карту:
+       key = (period, "MM:SS") → value = (Автор_«И. Фамилия», [ассистенты_«И. Фамилия»]).
+   - склеиваем с NHL по ключу (period,timeInPeriod). Если не нашли — падаем (чтобы не просочился английский).
+   - буллиты: только «Победный буллит».
+3) Вывод: жирным победитель, по периодам, время в абсолюте (mm.ss), победный буллит.
 
 ENV:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   REPORT_DATE=YYYY-MM-DD (опционально, МСК)
+
+Зависимости:
+  requests==2.32.3
+  beautifulsoup4==4.12.3
 """
 
-import os, sys, re, json, time, random, datetime as dt
+import os, sys, re, json, datetime as dt
 from zoneinfo import ZoneInfo
 from html import escape
 from typing import Dict, List, Tuple, Any, Optional
@@ -34,6 +38,7 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 
 # ───── Настройки
 TZ_MSK = ZoneInfo("Europe/Moscow")
@@ -71,7 +76,7 @@ TEAM_META = {
     "COL": ("⛰️", "Колорадо"),
     "MIN": ("🌲", "Миннесота"),
     "WPG": ("✈️", "Виннипег"),
-    "ARI": ("🦣", "Юта"),   # Аризона → Юта
+    "ARI": ("🦣", "Юта"),
     "SEA": ("🦑", "Сиэтл"),
     "VGK": ("🎰", "Вегас"),
 }
@@ -94,7 +99,7 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-RU-Merger/1.1",
+        "User-Agent": "NHL-RU-Merger/1.2",
         "Accept": "text/html,application/json,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
@@ -169,64 +174,93 @@ def abs_time(period: int, mmss: str) -> str:
     base = (period-1)*20 if period<=3 else 60 + 5*(period-4)
     return f"{base + mm}.{ss:02d}"
 
-# ───── Поиск матча на sports.ru через Календарь
+# ───── Календарь sports.ru: поиск строки матча с допуском по времени
+def _norm_team(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def _parse_dt_from_td(a_dt_text: str) -> Tuple[Optional[dt.date], Optional[dt.time]]:
+    # пример "26.10.2025|20:00"
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}):(\d{2})", a_dt_text)
+    if not m:
+        return None, None
+    d, mth, y, hh, mm = map(int, m.groups())
+    try:
+        return dt.date(y, mth, d), dt.time(hh, mm)
+    except Exception:
+        return None, None
+
 def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
     """
-    Парсим таблицу календаря и ищем строку, где:
-      - owner-td a.player содержит home_ru,
-      - guests-td a.player содержит away_ru,
-      - столбец дата содержит дату и время старта (совпадает до минут).
-    Возвращаем ссылку со столбца score-td (сама страница матча).
+    Ищем в таблице календаря строку, где:
+      - owner-td содержит home_ru,
+      - guests-td содержит away_ru,
+      - дата совпадает,
+      - время — с наименьшей разницей (не требуем полного совпадения).
+    Возвращаем ссылку из score-td.
     """
     html = get_html(SPORTS_CAL)
     soup = BeautifulSoup(html, "html.parser")
 
-    # Нормализаторы
-    def norm_team(s: str) -> str:
-        return re.sub(r"\s+", " ", s).strip().lower()
+    home_key = _norm_team(home_ru)
+    away_key = _norm_team(away_ru)
 
-    home_key = norm_team(home_ru)
-    away_key = norm_team(away_ru)
-    date_key = start_msk.strftime("%d.%m.%Y")
-    time_key = start_msk.strftime("%H:%M")
+    best = None  # (abs_minutes, href)
+    candidates_same_date = []
 
     for tr in soup.find_all("tr"):
-        try:
-            td_name = tr.find("td", class_=re.compile(r"name-td"))
-            td_home = tr.find("td", class_=re.compile(r"owner-td"))
-            td_away = tr.find("td", class_=re.compile(r"guests-td"))
-            td_score = tr.find("td", class_=re.compile(r"score-td"))
-            if not (td_name and td_home and td_away and td_score):
-                continue
-
-            # дата|время
-            a_dt = td_name.find("a")
-            dt_text = a_dt.get_text(" ", strip=True) if a_dt else ""
-            if date_key not in dt_text or time_key not in dt_text:
-                continue
-
-            # команды
-            a_home = td_home.find("a", class_=re.compile(r"player"))
-            a_away = td_away.find("a", class_=re.compile(r"player"))
-            home_txt = a_home.get("title") or a_home.get_text(" ", strip=True) if a_home else ""
-            away_txt = a_away.get("title") or a_away.get_text(" ", strip=True) if a_away else ""
-            if norm_team(home_txt) != home_key or norm_team(away_txt) != away_key:
-                continue
-
-            # ссылка на матч — в score-td
-            a_score = td_score.find("a", href=True)
-            if not a_score:
-                continue
-            href = a_score["href"]
-            if not href.startswith("http"):
-                href = "https://www.sports.ru" + href
-            return href
-        except Exception:
+        td_name = tr.find("td", class_=re.compile(r"name-td"))
+        td_home = tr.find("td", class_=re.compile(r"owner-td"))
+        td_away = tr.find("td", class_=re.compile(r"guests-td"))
+        td_score = tr.find("td", class_=re.compile(r"score-td"))
+        if not (td_name and td_home and td_away and td_score):
             continue
 
+        a_dt = td_name.find("a")
+        dt_text = a_dt.get_text(" ", strip=True) if a_dt else ""
+        row_date, row_time = _parse_dt_from_td(dt_text)
+        if row_date is None:
+            continue
+        # дата должна совпасть с датой старта по МСК
+        if row_date != start_msk.date():
+            continue
+
+        a_home = td_home.find("a", class_=re.compile(r"player"))
+        a_away = td_away.find("a", class_=re.compile(r"player"))
+        home_txt = (a_home.get("title") or a_home.get_text(" ", strip=True)) if a_home else ""
+        away_txt = (a_away.get("title") or a_away.get_text(" ", strip=True)) if a_away else ""
+
+        # допускаем, что местами могли перепутаться хозяева/гости
+        ok_direct = (_norm_team(home_txt) == home_key and _norm_team(away_txt) == away_key)
+        ok_swapped = (_norm_team(home_txt) == away_key and _norm_team(away_txt) == home_key)
+        if not (ok_direct or ok_swapped):
+            continue
+
+        a_score = td_score.find("a", href=True)
+        if not a_score:
+            continue
+        href = a_score["href"]
+        if not href.startswith("http"):
+            href = "https://www.sports.ru" + href
+
+        candidates_same_date.append((row_time, href))
+
+        # если есть время — считаем разницу
+        if row_time is not None:
+            row_dt = dt.datetime.combine(row_date, row_time, tzinfo=TZ_MSK)
+            diff_min = abs(int((row_dt - start_msk).total_seconds() // 60))
+            pair = (diff_min, href)
+            if (best is None) or (pair[0] < best[0]):
+                best = pair
+
+    # приоритет — лучший по минимальной разнице времени
+    if best is not None:
+        return best[1]
+    # иначе: если в этот день ровно одна строка под эти команды — берём её
+    if len(candidates_same_date) == 1:
+        return candidates_same_date[0][1]
     return None
 
-# ───── Запасной поиск sports.ru (если календарь не дал ссылку)
+# ───── Запасной поиск sports.ru
 def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -> Optional[str]:
     query = f"{home_ru} {away_ru} НХЛ {ru_date(d)} {d.year}"
     r = S.get(SPORTS_SEARCH, params={"q": query}, timeout=25)
@@ -240,7 +274,6 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
         if "/hockey/match/" in href and href.endswith(".html"):
             if not href.startswith("http"):
                 href = "https://www.sports.ru" + href
-            # в тексте результата присутствуют обе команды (хотя бы первым словом)
             if (home_ru.split()[0] in txt) and (away_ru.split()[0] in txt):
                 cands.append(href)
     if not cands:
@@ -253,15 +286,15 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
     return cands[0] if cands else None
 
 def find_sportsru_match_url(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
-    # 1) пробуем календарь
+    # 1) календарь (устойчивый к неточному времени)
     u = find_sportsru_match_url_via_calendar(home_ru, away_ru, start_msk)
     if u:
         return u
-    # 2) пробуем поиск на дату матча
+    # 2) поиск на дату старта
     u = find_sportsru_match_url_via_search(home_ru, away_ru, start_msk.date())
     if u:
         return u
-    # 3) пробуем поиск на соседнюю дату (на всякий случай)
+    # 3) поиск на соседнюю дату
     u = find_sportsru_match_url_via_search(home_ru, away_ru, (start_msk - dt.timedelta(days=1)).date())
     return u
 
@@ -291,7 +324,7 @@ def parse_sportsru_goals(url: str) -> Tuple[Dict[Tuple[int,str], Tuple[str, List
     txt = soup.get_text("\n", strip=True)
     txt = txt.replace("—", "–").replace("−", "–").replace("‒", "–")
 
-    # выделим раздел с голами (между заголовками)
+    # выделим раздел с голами
     start = None
     for m in re.finditer(r"(1[-–]?й\s+период|Голы|Ход матча)", txt, re.I):
         start = m.start(); break
@@ -361,7 +394,7 @@ def build_match_block(g: dict) -> str:
         as_ = ev.get("awayScore", 0)
         nhl_goals.append({"period": per, "t": t_in, "score": f"{hs}:{as_}"})
 
-    # русские имена со sports.ru: сначала найдём ссылку на матч через календарь
+    # русские имена со sports.ru
     h_emoji, h_ru = TEAM_META.get(g["home"], ("🏒", g["home"]))
     a_emoji, a_ru = TEAM_META.get(g["away"], ("🏒", g["away"]))
 
