@@ -2,507 +2,403 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL Daily Results -> Telegram (RU) via championat.com
+NHL → Telegram (RU): NHL-время, sports.ru-имена
 
-Источник:
-  - Календарь: https://www.championat.com/hockey/_nhl/tournament/6606/calendar/
-  - Страница матча: /hockey/_nhl/xxxxxx/match/zzzzzz.html (внутри — голы, ассисты, буллиты на русском)
+Логика:
+1) Берём окно игрового дня по МСК:
+   - все матчи REPORT_DATE,
+   - и матчи REPORT_DATE-1, начавшиеся >= 15:00 МСК.
+2) Для каждого матча:
+   - тянем play-by-play из api-web.nhle.com (период, timeInPeriod, счёт после гола).
+   - ищем этот матч на sports.ru через их поиск:
+       https://www.sports.ru/search/?q=<Команда1> <Команда2> НХЛ <дата по-русски>
+     из результатов берём первую ссылку вида /hockey/match/....html,
+     в заголовке/крошках которой встречаются обе команды.
+   - с матча sports.ru вытягиваем список голов по периодам в виде:
+       "1:0 – 12:34 Имя Фамилия (Ассистент, ...)"
+     и строим словарь: ключ = (period, "MM:SS"), значение = (Автор, [ассисты])
+   - склеиваем: для каждого гола из NHL берём русские фамилии по ключу (period, timeInPeriod).
+   - если не найдено — падаем (чтобы не было английских имен).
+   - буллиты: ищем "Победный буллит" на sports.ru, берём имя.
+3) Печать: жирным победитель, по периодам, время в абсолюте (mm.ss), только победный буллит.
 
-Правила включения матчей:
-  - Для поста от даты D (по МСК) берём:
-      * все матчи с датой начала = D (МСК),
-      * все матчи с датой начала = D-1, у которых время старта >= 15:00 МСК.
-Формат событий:
-  - «Счёт – MM.SS Автор (Ассистент1, Ассистент2)»
-  - Время — абсолютное от старта матча (1-й период 0–20, 2-й 20–40, 3-й 40–60, ОТ — 60+)
-  - Серия буллитов: только «Победный буллит» и автор.
-
-Требуются переменные окружения:
-  - TELEGRAM_BOT_TOKEN
-  - TELEGRAM_CHAT_ID
-Опционально:
-  - REPORT_DATE=YYYY-MM-DD  (дата поста по МСК)
-
-Зависимости:
-  requests==2.32.3
-  beautifulsoup4==4.12.3
+ENV:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  REPORT_DATE=YYYY-MM-DD (опционально, МСК)
 """
 
-import os, re, sys, time, json, random, datetime as dt
+import os, sys, re, json, time, random, datetime as dt
 from zoneinfo import ZoneInfo
 from html import escape
-
 import requests
 from bs4 import BeautifulSoup
+from typing import Dict, List, Tuple, Any, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ───── Константы/конфиг
-CAL_URL = "https://www.championat.com/hockey/_nhl/tournament/6606/calendar/"
-BASE    = "https://www.championat.com"
-TZ_MSK  = ZoneInfo("Europe/Moscow")
-TZ_CHAT = TZ_MSK  # заголовок дат тоже по МСК
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-REPORT_DATE_ENV = os.getenv("REPORT_DATE", "").strip()
+# ───── Настройки
+TZ_MSK = ZoneInfo("Europe/Moscow")
+API = "https://api-web.nhle.com"
+SPORTS_SEARCH = "https://www.sports.ru/search/"
+TEAM_META = {
+    "NJD": ("😈", "Нью-Джерси"),
+    "NYI": ("🟠", "Айлендерс"),
+    "NYR": ("🗽", "Рейнджерс"),
+    "PHI": ("🛩", "Филадельфия"),
+    "PIT": ("🐧", "Питтсбург"),
+    "BOS": ("🐻", "Бостон"),
+    "BUF": ("🦬", "Баффало"),
+    "MTL": ("🇨🇦", "Монреаль"),
+    "OTT": ("🛡", "Оттава"),
+    "TOR": ("🍁", "Торонто"),
+    "CAR": ("🌪️", "Каролина"),
+    "FLA": ("🐆", "Флорида"),
+    "TBL": ("⚡", "Тампа-Бэй"),
+    "WSH": ("🦅", "Вашингтон"),
+    "CHI": ("🦅", "Чикаго"),
+    "DET": ("🔴", "Детройт"),
+    "NSH": ("🐯", "Нэшвилл"),
+    "STL": ("🎵", "Сент-Луис"),
+    "CGY": ("🔥", "Калгари"),
+    "EDM": ("🛢️", "Эдмонтон"),
+    "VAN": ("🐳", "Ванкувер"),
+    "ANA": ("🦆", "Анахайм"),
+    "DAL": ("⭐", "Даллас"),
+    "LAK": ("👑", "Лос-Анджелес"),
+    "SJS": ("🦈", "Сан-Хосе"),
+    "CBJ": ("💣", "Коламбус"),
+    "COL": ("⛰️", "Колорадо"),
+    "MIN": ("🌲", "Миннесота"),
+    "WPG": ("✈️", "Виннипег"),
+    "ARI": ("🦣", "Юта"),   # Аризона → Юта
+    "SEA": ("🦑", "Сиэтл"),
+    "VGK": ("🎰", "Вегас"),
+}
 
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/125.0 Safari/537.36")
-
-JITTER = (0.4, 0.9)
-
-# ───── HTTP
-S = requests.Session()
-S.headers.update({
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
-})
-
-def jitter():
-    time.sleep(random.uniform(*JITTER))
-
-def get_html(url: str) -> str:
-    try:
-        r = S.get(url, timeout=25)
-        if r.status_code == 200:
-            return r.text
-        # иногда страница вешается — повтор
-        if r.status_code in (403, 429, 500, 502, 503, 504):
-            jitter()
-            r2 = S.get(url, timeout=25)
-            if r2.status_code == 200:
-                return r2.text
-        print(f"[WARN] GET {url} -> {r.status_code}", file=sys.stderr)
-    except Exception as e:
-        print(f"[ERR ] GET {url} -> {e}", file=sys.stderr)
-    return ""
-
-# ───── Даты/текст
 RU_MONTHS = {
     1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
-    7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
+    7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабра"
 }
 def ru_date(d: dt.date) -> str:
     return f"{d.day} {RU_MONTHS[d.month]}"
 
-def pick_report_date() -> dt.date:
-    if REPORT_DATE_ENV:
-        try:
-            return dt.date.fromisoformat(REPORT_DATE_ENV)
-        except Exception:
-            pass
-    now = dt.datetime.now(TZ_MSK)
-    return now.date()
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=5, connect=5, read=5, backoff_factor=0.6,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET","POST"],
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.headers.update({
+        "User-Agent": "NHL-RU-Merger/1.0",
+        "Accept": "text/html,application/json,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    })
+    return s
 
-# ───── Утилиты форматирования
-def initial_ru(full_ru: str) -> str:
-    """
-    «Имя Фамилия»/«Имя-Имя Фамилия-Фамилия» -> «И. Фамилия-Фамилия»
-    Если фамилия многословная — берём последний токен (с дефисами сохраняем).
-    """
-    t = (full_ru or "").strip()
-    if not t:
-        return ""
-    # уберём лишние пробелы
-    t = re.sub(r"\s+", " ", t)
-    parts = t.split(" ")
-    if len(parts) == 1:
-        # бывает только фамилия
-        fam = parts[0]
-        return fam
-    ini = parts[0][0] + "."
-    fam = parts[-1]
-    return f"{ini} {fam}"
+S = make_session()
 
-def abs_time_from_period(period: int, mmss: str) -> str:
-    """Преобразует время периода (MM:SS) в абсолютное MM.SS (1п=0–20, 2п=20–40...)"""
+def get_json(url: str) -> dict:
+    r = S.get(url, timeout=25)
+    if r.status_code == 200:
+        return r.json()
+    raise RuntimeError(f"GET {url} -> {r.status_code}")
+
+def get_html(url: str) -> str:
+    r = S.get(url, timeout=25)
+    if r.status_code == 200:
+        return r.text
+    raise RuntimeError(f"GET {url} -> {r.status_code}")
+
+# ───── Окно игрового дня
+def report_date() -> dt.date:
+    env = os.getenv("REPORT_DATE","").strip()
+    if env:
+        return dt.date.fromisoformat(env)
+    return dt.datetime.now(TZ_MSK).date()
+
+def window_msk(d: dt.date) -> Tuple[dt.datetime, dt.datetime]:
+    start = dt.datetime.combine(d - dt.timedelta(days=1), dt.time(15,0), tzinfo=TZ_MSK)
+    end   = dt.datetime.combine(d, dt.time(23,59,59,999000), tzinfo=TZ_MSK)
+    return start, end
+
+def to_msk(utc_iso: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(utc_iso.replace("Z","+00:00")).astimezone(TZ_MSK)
+
+# ───── NHL schedule & pbp
+def pick_games(d: dt.date) -> List[dict]:
+    start, end = window_msk(d)
+    all_days = [d - dt.timedelta(days=1), d]
+    games = []
+    for day in all_days:
+        js = get_json(f"{API}/v1/schedule/{day.isoformat()}")
+        lst = js.get("games") or js.get("gameWeek",[{}])[0].get("games",[])
+        games.extend(lst)
+    picked = []
+    seen = set()
+    for g in games:
+        gid = int(g.get("id") or 0)
+        if not gid or gid in seen: continue
+        seen.add(gid)
+        utc = g.get("startTimeUTC") or g.get("startTime")
+        if not utc: continue
+        msk = to_msk(utc)
+        if start <= msk <= end:
+            picked.append({
+                "id": gid,
+                "msk": msk,
+                "home": g["homeTeam"]["abbrev"],
+                "away": g["awayTeam"]["abbrev"],
+            })
+    picked.sort(key=lambda x: x["msk"])
+    return picked
+
+def pbp_and_scores(gid: int) -> Tuple[List[dict], dict]:
+    pbp = get_json(f"{API}/v1/gamecenter/{gid}/play-by-play")
+    # list of goals
+    events = []
+    for p in pbp.get("plays", []):
+        if (p.get("typeDescKey") or "").lower() != "goal":
+            continue
+        per = int((p.get("periodDescriptor") or {}).get("number") or 0)
+        t_in = (p.get("timeInPeriod") or p.get("timeRemaining") or "00:00").strip()
+        hs = p.get("homeScore", 0); as_ = p.get("awayScore", 0)
+        events.append({"period": per, "t": t_in, "score": f"{hs}:{as_}"})
+    outcome = (pbp.get("gameOutcome") or {}).get("lastPeriodType")  # REG/OT/SO
+    return events, {"decision": outcome}
+
+# ───── Время: абсолютные минуты
+def abs_time(period: int, mmss: str) -> str:
     m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", mmss)
     if not m:
         return mmss.replace(":", ".")
     mm, ss = int(m.group(1)), int(m.group(2))
-    if period >= 4:  # OT
-        return f"{60 + mm}.{ss:02d}"
-    return f"{(period-1)*20 + mm}.{ss:02d}"
+    base = (period-1)*20 if period<=3 else 60 + 5*(period-4)
+    return f"{base + mm}.{ss:02d}"
 
-def bold_winner_line(name: str, score: int, winner: bool) -> str:
-    s = f"{escape(name)}: {score}"
-    return f"<b>{s}</b>" if winner else s
+# ───── Поиск матча на sports.ru
+def build_search_query(home_ru: str, away_ru: str, d: dt.date) -> str:
+    # Пример запроса: "Тампа-Бэй Анахайм НХЛ 27 октября 2025"
+    return f"{home_ru} {away_ru} НХЛ {ru_date(d)} {d.year}"
 
-# ───── Парсинг календаря ⇒ ссылки матчей
-def find_match_links_for_date_range(cal_html: str, dates_keep: set[dt.date]) -> list[str]:
-    """
-    Из HTML календаря вытаскивает все ссылки матчей '/hockey/_nhl/.../match/....html'
-    и отфильтровывает их по датам начала из самой страницы матча (по МСК).
-    Чтобы не полагаться на структуру календаря, время матча берём с match-страницы.
-    """
-    soup = BeautifulSoup(cal_html, "html.parser")
-    # все ссылки на матчи
-    links = []
+def find_sportsru_match_url(home_ru: str, away_ru: str, d: dt.date) -> Optional[str]:
+    q = build_search_query(home_ru, away_ru, d)
+    r = S.get(SPORTS_SEARCH, params={"q": q}, timeout=25)
+    if r.status_code != 200:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+    # В результатах ищем первую ссылку на матч: /hockey/match/.....html
+    cands = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/match/" in href and href.endswith(".html"):
+        txt = a.get_text(" ", strip=True)
+        if "/hockey/match/" in href and href.endswith(".html"):
             if not href.startswith("http"):
-                href = BASE + href
-            links.append(href)
-    # уникализируем
-    seen, uniq = set(), []
-    for u in links:
-        if u not in seen:
-            uniq.append(u); seen.add(u)
+                href = "https://www.sports.ru" + href
+            # проверим, что в тексте встречаются обе команды
+            if home_ru.split()[0] in txt and away_ru.split()[0] in txt:
+                cands.append(href)
+    # если пусто — возьмём вообще первую матчевую ссылку
+    if not cands:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/hockey/match/" in href and href.endswith(".html"):
+                if not href.startswith("http"):
+                    href = "https://www.sports.ru" + href
+                cands.append(href)
+    return cands[0] if cands else None
 
-    # Фильтруем по дате старта (достаём из страницы матча)
-    out = []
-    for url in uniq:
-        d_start = get_match_start_date_msk(url)
-        if not d_start:
-            # если дату не распознали, оставим — возможно нужный матч; лишнее отсеем позже
-            out.append(url)
-        elif d_start in dates_keep:
-            out.append(url)
-    return out
-
-def get_match_start_date_msk(match_url: str) -> dt.date | None:
-    """
-    Пытаемся достать дату начала матча по МСК со страницы матча.
-    Ищем <time datetime="YYYY-MM-DDTHH:MM:SS+03:00">, либо текст вида 'Начало: 02:30 ... 27 октября ...'
-    Возвращаем только дату (по МСК).
-    """
-    html = get_html(match_url)
-    if not html:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Популярный вариант — <time datetime="...+03:00">
-    for t in soup.find_all("time"):
-        dt_attr = t.get("datetime") or t.get("content")
-        if dt_attr:
-            try:
-                # Пытаемся распарсить ISO с таймзоной
-                dt_full = dt.datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
-                # Переведём в МСК
-                d_msk = dt_full.astimezone(TZ_MSK).date()
-                return d_msk
-            except Exception:
-                pass
-
-    # Фолбэк: ищем текстовую дату в шапке
-    full_text = soup.get_text("\n", strip=True)
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", full_text)
-    if m:
-        y, mo, d, hh, mm = map(int, m.groups())
-        try:
-            dtt = dt.datetime(y, mo, d, hh, mm, tzinfo=TZ_MSK)
-            return dtt.date()
-        except Exception:
-            pass
-
-    # Если совсем не нашли — None
-    return None
-
-# ───── Парсинг страницы матча
+# ───── Парсинг голов на sports.ru -> карта (period, "MM:SS") -> (Автор, [ассистенты])
 GOAL_LINE_RE = re.compile(
-    r"(?P<score>\d+:\d+)\s*[—–-]\s*(?P<time>\d{1,2}[:.]\d{2})\s+(?P<who>[А-ЯЁA-Z][^()\n\r]*?)(?:\s*\((?P<ass>[^)]*)\))?(?=\s|$)",
+    r"(?P<score>\d+:\d+)\s*[—–-]\s*(?P<time>\d{1,2}[:.]\d{2})\s+(?P<who>[А-ЯЁ][^()\n\r]*?)(?:\s*\((?P<ass>[^)]*)\))?(?=\s|$)",
     re.U
 )
-PERIOD_RE_LIST = [
+PERIOD_HEADERS = [
     (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
     (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
     (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
-    (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),  # базово 4, если №N → 3+N
+    (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),  # 4 = OT1; если №N → 3+N
 ]
 
-def parse_match_page(match_url: str) -> dict:
-    """
-    Возвращает:
-      {
-        "home": "Тампа-Бэй", "away": "Анахайм",
-        "home_score": 4, "away_score": 3,
-        "ot": False, "so": True/False,
-        "goals": [ {"score":"1:0","abs_time":"9.10","scorer":"Д. Гентцель","ass":["Б. Хэйгел","А. Чирелли"]}, ... ],
-        "so_winner": "Т. Зеграс" | None
-      }
-    """
-    html = get_html(match_url)
-    if not html:
-        raise RuntimeError(f"Не удалось загрузить страницу матча: {match_url}")
+def ru_initial(full: str) -> str:
+    t = re.sub(r"\s+", " ", (full or "").strip())
+    if not t: return ""
+    parts = t.split(" ")
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0][0]}. {parts[-1]}"
+
+def parse_sportsru_goals(url: str) -> Tuple[Dict[Tuple[int,str], Tuple[str, List[str]]], Optional[str]]:
+    html = get_html(url)
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = text.replace("—", "–").replace("−", "–").replace("‒", "–")
+    txt = soup.get_text("\n", strip=True)
+    txt = txt.replace("—", "–").replace("−", "–").replace("‒", "–")
 
-    # Заголовок: команды и итоговый счёт
-    # Пробуем вытащить из <h1>
-    h1 = soup.find("h1")
-    h1txt = h1.get_text(" ", strip=True) if h1 else ""
-    # Часто встречающийся формат: «Тампа-Бэй» – «Анахайм» 4:3 (..)
-    m_hdr = re.search(r"«?([А-ЯЁA-Za-z \-\.]+?)»?\s*[–-]\s*«?([А-ЯЁA-Za-z \-\.]+?)»?\s+(\d+):(\d+)(?:\s*\((.*?)\))?\s*(\(?(ОТ|Б)\)?)?", h1txt)
-    if not m_hdr:
-        # фолбэк — искать похожее в тексте
-        m_hdr = re.search(r"([А-ЯЁA-Za-z \-\.]+?)\s*[–-]\s*([А-ЯЁA-Za-z \-\.]+?)\s+(\d+):(\d+)", text)
-    if not m_hdr:
-        raise RuntimeError(f"Не разобрал заголовок/счёт: {match_url}")
+    # Выделяем блок голов (между заголовками разделов)
+    start = None
+    for m in re.finditer(r"(1[-–]?й\s+период|Голы|Ход матча)", txt, re.I):
+        start = m.start(); break
+    if start is None:
+        start = 0
+    endm = re.search(r"(Буллиты|Серия буллитов|Удаления|Статистика|Составы)", txt, re.I)
+    end = endm.start() if endm else len(txt)
+    section = txt[start:end]
 
-    home = m_hdr.group(1).strip().strip("«»")
-    away = m_hdr.group(2).strip().strip("«»")
-    home_score = int(m_hdr.group(3))
-    away_score = int(m_hdr.group(4))
-    winner_home = home_score > away_score
-
-    # Определяем, был ли ОТ/Б
-    so = bool(re.search(r"\bБуллиты\b|\(Б\)|в серии буллитов", text, re.I))
-    ot = bool(re.search(r"\bОвертайм\b|\(ОТ\)", text, re.I))
-
-    # Выделяем секцию с голами (между заголовками разделов)
-    # Ищем начало по «1-й период»/«Голы» и конец по «Удаления|Штраф|Буллиты|Статистика» и т.п.
-    start_idx = None
-    for m in re.finditer(r"(1[-–]?й\s+период|Голы|Ход матча)", text, re.I):
-        start_idx = m.start(); break
-    if start_idx is None:
-        # последняя попытка — с начала h1 вниз
-        start_idx = text.find(h1txt) + len(h1txt) if h1txt else 0
-    end_m = re.search(r"(Удаления|Штраф|Буллиты|Серия буллитов|Статистика|Составы|Видео)", text, re.I)
-    end_idx = end_m.start() if end_m else len(text)
-
-    goals_section = text[start_idx:end_idx]
-
-    # Парсим по периодам
+    # Разбираем
     period = 1
-    goals = []
-    # Разобьём на строки, чтобы увидеть заголовки периодов
-    lines = [ln.strip() for ln in goals_section.split("\n") if ln.strip()]
+    by_key: Dict[Tuple[int,str], Tuple[str, List[str]]] = {}
+    lines = [ln.strip() for ln in section.split("\n") if ln.strip()]
     for ln in lines:
-        # Детект заголовка периода
-        hit_period = False
-        for rx, base_p in PERIOD_RE_LIST:
+        # смена периода
+        sw = False
+        for rx, base in PERIOD_HEADERS:
             m = rx.search(ln)
             if m:
-                if base_p == 4 and m.lastindex == 1 and m.group(1):
-                    # «Овертайм №N»
-                    try:
-                        n = int(m.group(1))
-                    except Exception:
-                        n = 1
-                    period = 3 + max(1, n)
+                if base == 4 and m.lastindex == 1 and m.group(1):
+                    period = 3 + max(1, int(m.group(1)))
                 else:
-                    period = base_p
-                hit_period = True
+                    period = base
+                sw = True
                 break
-        if hit_period:
+        if sw:
             continue
 
-        # Ищем строки голов
         for m in GOAL_LINE_RE.finditer(ln):
-            score = m.group("score").strip()
-            t_in  = m.group("time").replace(".", ":")
-            who   = m.group("who").strip()
-            ass   = (m.group("ass") or "").strip()
-
-            # чистим имя/ассистентов (non-breaking и латиницу)
-            who = re.sub(r"\s+", " ", who)
-            # Иногда после имени добавляют лишние фрагменты типа «— команда», отрежем по « – » или « — »
-            who = re.split(r"\s+[–-]\s+", who)[0].strip()
-
-            # Превращаем в «И. Фамилия»
-            who_sh = initial_ru(who)
-
-            assists = []
+            mmss = m.group("time").replace(".", ":")
+            who = m.group("who").strip()
+            ass = (m.group("ass") or "").strip()
+            who_sh = ru_initial(re.split(r"\s+[–-]\s+", who)[0].strip())
+            assists: List[str] = []
             if ass:
                 for a in ass.split(","):
-                    aa = a.strip()
-                    # отрезаем возможные «— команда»
-                    aa = re.split(r"\s+[–-]\s+", aa)[0].strip()
+                    aa = ru_initial(re.split(r"\s+[–-]\s+", a.strip())[0].strip())
                     if aa:
-                        assists.append(initial_ru(aa))
+                        assists.append(aa)
+            by_key[(period, mmss)] = (who_sh, assists)
 
-            abs_t = abs_time_from_period(period, t_in)
-            goals.append({
-                "score": score,
-                "abs_time": abs_t,
-                "scorer": who_sh,
-                "ass": assists
-            })
-
-    # Победный буллит
+    # Победный буллит:
     so_winner = None
-    if so:
-        # Явная формулировка
-        m = re.search(r"Победный\s+буллит[:\s–-]+([А-ЯЁA-Z][^,\n\r]+)", text, re.I)
-        if m:
-            so_winner = initial_ru(m.group(1).strip())
+    m = re.search(r"Победный\s+буллит[:\s–-]+([А-ЯЁ][^,\n\r]+)", txt, re.I)
+    if m:
+        so_winner = ru_initial(m.group(1).strip())
+
+    return by_key, so_winner
+
+# ───── Вывод матча
+def build_match_block(g: dict) -> str:
+    gid = g["id"]
+    nhl_goals, meta = pbp_and_scores(gid)
+    decision = meta.get("decision")  # REG/OT/SO
+    h_emoji, h_ru = TEAM_META.get(g["home"], ("🏒", g["home"]))
+    a_emoji, a_ru = TEAM_META.get(g["away"], ("🏒", g["away"]))
+
+    # Найдём страницу матча на sports.ru (ищем по дате отчёта, а не по старту — чаще покрывает случай)
+    url = find_sportsru_match_url(h_ru, a_ru, g["msk"].date())
+    if not url:
+        # попробуем накануне (если матч попал из вчерашних)
+        url = find_sportsru_match_url(h_ru, a_ru, (g["msk"] - dt.timedelta(days=1)).date())
+    if not url:
+        raise RuntimeError(f"Не найден матч на sports.ru для {h_ru} — {a_ru} ({g['msk']:%d.%m})")
+
+    ru_map, so_winner = parse_sportsru_goals(url)
+
+    # Итоговый счёт (возьмём из последнего гола NHL; если серии/ОТ — добавим пометку)
+    if nhl_goals:
+        last = nhl_goals[-1]["score"]
+        hs, as_ = map(int, last.split(":"))
+    else:
+        # если голов не было — возьмём из страницы sports.ru заголовок (упустим — редкость)
+        hs = as_ = 0
+
+    # Жирным победителя
+    home_line = f"{h_emoji} «{h_ru}»: {hs}"
+    away_line = f"{a_emoji} «{a_ru}»: {as_}"
+    if hs > as_:
+        home_line = f"<b>{home_line}</b>"
+    elif as_ > hs:
+        away_line = f"<b>{away_line}</b>"
+    suffix = ""
+    if decision == "OT": suffix = " (ОТ)"
+    if decision == "SO": suffix = " (Б)"
+
+    parts = [home_line + suffix, away_line, ""]
+
+    # Склейка: для каждого гола NHL найдём автора/ассистов по (period, timeInPeriod) на sports.ru
+    # Если ключей не хватает — соберём список и упадём одной ошибкой
+    missing = []
+    goals_by_period: Dict[int, List[str]] = {}
+    for ev in nhl_goals:
+        key = (ev["period"], ev["t"])
+        if key not in ru_map:
+            # Иногда sports.ru пишет 09:05 vs 9:05 — у нас нормализовано, но подстрахуемся: уберём ведущий ноль в минутах
+            mm, ss = ev["t"].split(":")
+            alt = f"{int(mm)}:{ss}"
+            if (ev["period"], alt) in ru_map:
+                key = (ev["period"], alt)
+            else:
+                missing.append(f"p{ev['period']} {ev['t']} (score {ev['score']})")
+                continue
+        who, assists = ru_map[key]
+        line = f"{ev['score']} – {abs_time(ev['period'], ev['t'])} {who}"
+        if assists:
+            line += f" ({', '.join(assists)})"
+        goals_by_period.setdefault(ev["period"], []).append(line)
+
+    if missing:
+        raise RuntimeError("Не нашли соответствия по времени на sports.ru:\n" + "\n".join(missing))
+
+    # Печать по периодам
+    for p in sorted(goals_by_period.keys()):
+        if p <= 3:
+            parts.append(f"<i>{p}-й период</i>")
         else:
-            # Иногда в блоке буллитов отмечают «решающий» — попробуем
-            m2 = re.search(r"(решающ|победн)[^:\n\r]*[:\s–-]+([А-ЯЁA-Z][^,\n\r]+)", text, re.I)
-            if m2:
-                so_winner = initial_ru(m2.group(2).strip())
+            parts.append(f"<i>Овертайм №{p-3}</i>")
+        parts.extend(goals_by_period[p])
 
-    return {
-        "home": home, "away": away,
-        "home_score": home_score, "away_score": away_score,
-        "winner_home": winner_home,
-        "ot": ot, "so": so,
-        "goals": goals,
-        "so_winner": so_winner,
-        "url": match_url
-    }
+    # Победный буллит (если был и нашли имя)
+    if decision == "SO" and so_winner:
+        parts.append("Победный буллит")
+        parts.append(so_winner)
 
-# ───── Сбор матчей по правилу «день D + день D-1 после 15:00»
-def collect_match_urls_for_report(d_report: dt.date) -> list[str]:
-    """
-    Грузим календарь (основной), достаём все ссылки матчей, фильтруем по датам начала:
-      - дата == D
-      - дата == D-1 и время >= 15:00 МСК
-    Чтобы не зависеть от того, отдаёт ли календарь сразу обе даты, подстрахуемся:
-      - сначала берём базовый календарь,
-      - если D-1 другой месяц, пробуем ещё раз с параметром ?date=YYYY-MM-01
-    """
-    html_main = get_html(CAL_URL)
-    if not html_main:
-        raise RuntimeError("Не удалось открыть календарь Championat")
+    return "\n".join(parts)
 
-    # Список кандидатов (мы всё равно сверим дату на странице матча)
-    cand = []
-    # Из основного календаря
-    cand += find_match_links_for_date_range(html_main, {d_report, d_report - dt.timedelta(days=1)})
-
-    # Если D-1 в другом месяце — подстрахуемся
-    d_prev = d_report - dt.timedelta(days=1)
-    if d_prev.month != d_report.month:
-        url_prev_month = CAL_URL + f"?date={d_prev.strftime('%Y-%m-01')}"
-        html_prev = get_html(url_prev_month)
-        if html_prev:
-            cand += find_match_links_for_date_range(html_prev, {d_prev})
-
-    # Уникализируем
-    seen, uniq = set(), []
-    for u in cand:
-        if u not in seen:
-            uniq.append(u); seen.add(u)
-
-    # Отфильтруем по точному правилу времени
-    selected = []
-    for url in uniq:
-        # попробуем достать точное время старта из <time datetime=...>
-        html = get_html(url)
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        start_dt = None
-        for t in soup.find_all("time"):
-            dt_attr = t.get("datetime") or t.get("content")
-            if dt_attr:
-                try:
-                    dtt = dt.datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
-                    start_dt = dtt.astimezone(TZ_MSK)
-                    break
-                except Exception:
-                    pass
-        # фолбэк — не нашли <time> → берём только по дате страницы (как раньше)
-        if not start_dt:
-            donly = get_match_start_date_msk(url)
-            if not donly:
-                continue
-            # неизвестно время — пусть решит по дате
-            if donly == d_report:
-                selected.append(url)
-            elif donly == d_prev:
-                # без времени не можем гарантировать фильтр 15:00 — пропустим
-                continue
-            continue
-
-        d_local = start_dt.date()
-        if d_local == d_report:
-            selected.append(url)
-        elif d_local == d_prev and start_dt.time() >= dt.time(15, 0):
-            selected.append(url)
-
-    return selected
-
-# ───── Формирование текста поста
-def build_post_text(d_report: dt.date) -> str:
-    urls = collect_match_urls_for_report(d_report)
-    # Парсим все матчи
-    matches = []
-    for u in urls:
-        try:
-            jitter()
-            matches.append(parse_match_page(u))
-        except Exception as e:
-            print(f"[WARN] {u}: {e}", file=sys.stderr)
-
-    # Отбрасываем пустые
-    matches = [m for m in matches if m.get("goals") or m.get("so") or (m.get("home") and m.get("away"))]
-    n = len(matches)
-
-    # Заголовок
-    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(d_report)} • {n} " + \
-            ("матч" if n == 1 else "матча" if n % 10 in (2, 3, 4) and not 12 <= n % 100 <= 14 else "матчей")
+# ───── Пост целиком
+def build_post(d: dt.date) -> str:
+    games = pick_games(d)
+    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(d)} • {len(games)} " + \
+            ("матч" if len(games)==1 else "матча" if len(games)%10 in (2,3,4) and not 12<=len(games)%100<=14 else "матчей")
     head = f"{title}\n\nРезультаты надёжно спрятаны 👇\n\n——————————————————\n\n"
 
-    if not matches:
+    if not games:
         return head.strip()
 
-    # Сортировка по времени начала? Сейчас порядок календаря/ссылок.
     blocks = []
-    for idx, m in enumerate(matches, 1):
-        home_line = bold_winner_line(m["home"], m["home_score"], m["winner_home"])
-        away_line = bold_winner_line(m["away"], m["away_score"], not m["winner_home"])
-
-        suffix = ""
-        if m["so"]:
-            suffix = " (Б)"
-        elif m["ot"]:
-            suffix = " (ОТ)"
-
-        lines = [f"{home_line}{suffix}", f"{away_line}"]
-
-        # события
-        for ev in m["goals"]:
-            ass = f" ({', '.join(escape(a) for a in ev['ass'])})" if ev["ass"] else ""
-            lines.append(f"{escape(ev['score'])} – {escape(ev['abs_time'])} {escape(ev['scorer'])}{ass}")
-
-        if m["so"] and m.get("so_winner"):
-            lines.append("<i>Победный буллит</i>")
-            lines.append(f"65.00 {escape(m['so_winner'])}")
-
-        blocks.append("\n".join(lines))
-        if idx < len(matches):
+    for i, g in enumerate(games, 1):
+        blocks.append(build_match_block(g))
+        if i < len(games):
             blocks.append("")
-
     return head + "\n".join(blocks).strip()
 
 # ───── Telegram
 def tg_send(text: str):
-    if not (BOT_TOKEN and CHAT_ID):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    maxlen = 3500
-    rest = text
-    while rest:
-        if len(rest) <= maxlen:
-            chunk, rest = rest, ""
-        else:
-            cut = rest.rfind("\n\n", 0, maxlen)
-            if cut == -1:
-                cut = maxlen
-            chunk, rest = rest[:cut], rest[cut:].lstrip()
-        r = S.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=25)
-        if r.status_code != 200:
-            raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:200]}")
-        time.sleep(0.25)
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN","").strip(), os.getenv("TELEGRAM_CHAT_ID","").strip()
+    if not token or not chat:
+        print(text)
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = S.post(url, json={"chat_id": chat, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:200]}")
 
 # ───── main
 if __name__ == "__main__":
     try:
-        d = pick_report_date()
-        post = build_post_text(d)
-        tg_send(post)
+        d = report_date()
+        msg = build_post(d)
+        tg_send(msg)
         print("OK")
     except Exception as e:
         print("ERROR:", repr(e), file=sys.stderr)
