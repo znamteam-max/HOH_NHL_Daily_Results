@@ -2,106 +2,84 @@
 # -*- coding: utf-8 -*-
 
 """
-NHL Daily Results -> Telegram (RU)
-- Игры: /v1/score/{date}
-- Детализация:
-    1) /v1/gamecenter/{gameId}/play-by-play
-    2) /v1/wsc/play-by-play/{gameId}
-    3) /v1/gamecenter/{gameId}/landing  (summary/scoring/byPeriod)
-- Имёны игроков: строго со sports.ru/hockey/person/<slug>/ из <h1 class="titleH1">.
-  Нет кириллицы -> считаем НЕ НАЙДЕНО и падаем (STRICT_RU=True).
-- Печать по периодам, время голов — абсолютное (MM.SS от старта матча).
-- Серия буллитов: печатаем только «Победный буллит».
+NHL Daily Results -> Telegram (RU) via championat.com
 
-requirements.txt:
-    requests==2.32.3
-    beautifulsoup4==4.12.3
+Источник:
+  - Календарь: https://www.championat.com/hockey/_nhl/tournament/6606/calendar/
+  - Страница матча: /hockey/_nhl/xxxxxx/match/zzzzzz.html (внутри — голы, ассисты, буллиты на русском)
+
+Правила включения матчей:
+  - Для поста от даты D (по МСК) берём:
+      * все матчи с датой начала = D (МСК),
+      * все матчи с датой начала = D-1, у которых время старта >= 15:00 МСК.
+Формат событий:
+  - «Счёт – MM.SS Автор (Ассистент1, Ассистент2)»
+  - Время — абсолютное от старта матча (1-й период 0–20, 2-й 20–40, 3-й 40–60, ОТ — 60+)
+  - Серия буллитов: только «Победный буллит» и автор.
+
+Требуются переменные окружения:
+  - TELEGRAM_BOT_TOKEN
+  - TELEGRAM_CHAT_ID
+Опционально:
+  - REPORT_DATE=YYYY-MM-DD  (дата поста по МСК)
+
+Зависимости:
+  requests==2.32.3
+  beautifulsoup4==4.12.3
 """
 
-import os, sys, re, json, time, random, unicodedata
-import datetime as dt
+import os, re, sys, time, json, random, datetime as dt
 from zoneinfo import ZoneInfo
 from html import escape
 
 import requests
 from bs4 import BeautifulSoup
 
-# ───────── Конфиг
+# ───── Константы/конфиг
+CAL_URL = "https://www.championat.com/hockey/_nhl/tournament/6606/calendar/"
+BASE    = "https://www.championat.com"
+TZ_MSK  = ZoneInfo("Europe/Moscow")
+TZ_CHAT = TZ_MSK  # заголовок дат тоже по МСК
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TZ_OUTPUT = "Europe/Helsinki"
+REPORT_DATE_ENV = os.getenv("REPORT_DATE", "").strip()
 
-STRICT_RU = True  # если не нашли кириллицу на sports.ru — падать
-RU_CACHE_FILE   = "ru_names_sportsru.json"     # {playerId: "И. Фамилия"}
-RU_PENDING_FILE = "ru_pending_sportsru.json"   # {playerId: ["slug1","slug2",...]}
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/125.0 Safari/537.36")
 
-REQUEST_JITTER = (0.4, 0.9)
-API = "https://api-web.nhle.com/v1"
-SPORTS_ROOT = "https://www.sports.ru/hockey/person/"
+JITTER = (0.4, 0.9)
 
-# ───────── HTTP
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/125.0 Safari/537.36"),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Origin": "https://www.nhl.com",
-        "Referer": "https://www.nhl.com/",
-        "Connection": "keep-alive",
-    })
-    return s
-
-S = make_session()
-
-def get_json(url, *, allow_retry=True):
-    params = {"_": str(int(time.time()*1000))}
-    try:
-        r = S.get(url, params=params, timeout=20)
-        if r.status_code == 200:
-            return r.json()
-        if allow_retry and r.status_code in (403, 429, 503):
-            time.sleep(random.uniform(0.8, 1.2))
-            r2 = S.get(url, params={"_": str(int(time.time()*1000))}, timeout=20)
-            if r2.status_code == 200:
-                return r2.json()
-            print(f"[WARN] GET {url} -> {r.status_code} / retry {r2.status_code}", file=sys.stderr)
-        else:
-            print(f"[WARN] GET {url} -> {r.status_code}", file=sys.stderr)
-    except Exception as e:
-        print(f"[ERR ] GET {url} -> {repr(e)}", file=sys.stderr)
-    return {}
+# ───── HTTP
+S = requests.Session()
+S.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+})
 
 def jitter():
-    time.sleep(random.uniform(*REQUEST_JITTER))
+    time.sleep(random.uniform(*JITTER))
 
-# ───────── Утилиты строк
-def to_text(v) -> str:
-    """Любое поле ⇒ нормализованная строка. Поддерживает dict с 'default', 'name' и т.п."""
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        for key in ("default", "name", "fullName", "scoringPlayerName", "playerName"):
-            val = v.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            if isinstance(val, dict):
-                inner = val.get("default")
-                if isinstance(inner, str) and inner.strip():
-                    return inner.strip()
-        parts = [x for x in v.values() if isinstance(x, str)]
-        if parts:
-            return " ".join(parts).strip()
-        return ""
-    if isinstance(v, list):
-        return " ".join(to_text(x) for x in v if x).strip()
-    return str(v)
+def get_html(url: str) -> str:
+    try:
+        r = S.get(url, timeout=25)
+        if r.status_code == 200:
+            return r.text
+        # иногда страница вешается — повтор
+        if r.status_code in (403, 429, 500, 502, 503, 504):
+            jitter()
+            r2 = S.get(url, timeout=25)
+            if r2.status_code == 200:
+                return r2.text
+        print(f"[WARN] GET {url} -> {r.status_code}", file=sys.stderr)
+    except Exception as e:
+        print(f"[ERR ] GET {url} -> {e}", file=sys.stderr)
+    return ""
 
-# ───────── Дата
+# ───── Даты/текст
 RU_MONTHS = {
     1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
     7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
@@ -110,435 +88,391 @@ def ru_date(d: dt.date) -> str:
     return f"{d.day} {RU_MONTHS[d.month]}"
 
 def pick_report_date() -> dt.date:
-    now = dt.datetime.now(ZoneInfo(TZ_OUTPUT))
-    return (now - dt.timedelta(days=1)).date()
+    if REPORT_DATE_ENV:
+        try:
+            return dt.date.fromisoformat(REPORT_DATE_ENV)
+        except Exception:
+            pass
+    now = dt.datetime.now(TZ_MSK)
+    return now.date()
 
-# ───────── Игры дня
-def fetch_games_for_date(day: dt.date) -> list[dict]:
-    j = get_json(f"{API}/score/{day.isoformat()}")
-    games = j.get("games") or []
-    finished = []
-    for g in games:
-        state = (g.get("gameState") or g.get("gameStateCode") or "").upper()
-        if state in {"FINAL", "OFF", "COMPLETED"}:
-            finished.append(g)
-    return finished
-
-# ───────── Время
-def abs_time_mmss(period_num: int, time_in_period: str, ptype: str) -> str:
-    """Вернёт абсолютное время MM.SS. Для SO — 65.00, для OT — 60+."""
-    t = to_text(time_in_period)
-    try:
-        m, s = t.split(":")
-        mm = int(m); ss = int(s)
-    except Exception:
-        return t.replace(":", ".") if isinstance(t, str) else "0.00"
-    if ptype == "SO":
-        return "65.00"
-    if period_num >= 4:
-        return f"{60 + mm}.{ss:02d}"
-    return f"{(period_num-1)*20 + mm}.{ss:02d}"
-
-# ───────── Player EN name by id (landing)
-def fetch_player_en_name_by_id(pid: int) -> str:
-    """Всегда пытаемся вернуть 'First Last' из /player/{id}/landing."""
-    if not pid:
+# ───── Утилиты форматирования
+def initial_ru(full_ru: str) -> str:
+    """
+    «Имя Фамилия»/«Имя-Имя Фамилия-Фамилия» -> «И. Фамилия-Фамилия»
+    Если фамилия многословная — берём последний токен (с дефисами сохраняем).
+    """
+    t = (full_ru or "").strip()
+    if not t:
         return ""
-    j = get_json(f"{API}/player/{pid}/landing")
-    fn = to_text((j.get("firstName") or {}))
-    ln  = to_text((j.get("lastName")  or {}))
-    return f"{fn} {ln}".strip()
+    # уберём лишние пробелы
+    t = re.sub(r"\s+", " ", t)
+    parts = t.split(" ")
+    if len(parts) == 1:
+        # бывает только фамилия
+        fam = parts[0]
+        return fam
+    ini = parts[0][0] + "."
+    fam = parts[-1]
+    return f"{ini} {fam}"
 
-# ───────── Boxscore: roster (id -> "First Last")
-def fetch_box_roster_names(game_id: int) -> dict[int, str]:
-    jitter()
-    j = get_json(f"{API}/gamecenter/{game_id}/boxscore")
-    roster = {}
-    pbgs = j.get("playerByGameStats") or {}
-    for side in ("homeTeam", "awayTeam"):
-        team = pbgs.get(side) or {}
-        for group in ("forwards", "defense", "goalies"):
-            for p in team.get(group, []) or []:
-                pid = p.get("playerId")
-                fn  = to_text((p.get("firstName") or {}))
-                ln  = to_text((p.get("lastName")  or {}))
-                full = f"{fn} {ln}".strip()
-                if pid and full:
-                    roster[int(pid)] = full
-    return roster
+def abs_time_from_period(period: int, mmss: str) -> str:
+    """Преобразует время периода (MM:SS) в абсолютное MM.SS (1п=0–20, 2п=20–40...)"""
+    m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", mmss)
+    if not m:
+        return mmss.replace(":", ".")
+    mm, ss = int(m.group(1)), int(m.group(2))
+    if period >= 4:  # OT
+        return f"{60 + mm}.{ss:02d}"
+    return f"{(period-1)*20 + mm}.{ss:02d}"
 
-# ───────── PBP основа
-def fetch_goals_primary(game_id: int):
-    jitter()
-    j = get_json(f"{API}/gamecenter/{game_id}/play-by-play")
-    plays = j.get("plays") or []
-    goals, shootout = [], None
+def bold_winner_line(name: str, score: int, winner: bool) -> str:
+    s = f"{escape(name)}: {score}"
+    return f"<b>{s}</b>" if winner else s
 
-    for p in plays:
-        t = to_text(p.get("typeDescKey")).lower()
-        if t != "goal":
-            continue
-        pd = p.get("periodDescriptor") or {}
-        pn = int(pd.get("number") or 0)
-        ptype = to_text(pd.get("periodType")).upper() or "REG"
-        time_in = to_text(p.get("timeInPeriod") or p.get("timeRemaining") or "0:00")
-        d = p.get("details") or {}
+# ───── Парсинг календаря ⇒ ссылки матчей
+def find_match_links_for_date_range(cal_html: str, dates_keep: set[dt.date]) -> list[str]:
+    """
+    Из HTML календаря вытаскивает все ссылки матчей '/hockey/_nhl/.../match/....html'
+    и отфильтровывает их по датам начала из самой страницы матча (по МСК).
+    Чтобы не полагаться на структуру календаря, время матча берём с match-страницы.
+    """
+    soup = BeautifulSoup(cal_html, "html.parser")
+    # все ссылки на матчи
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/match/" in href and href.endswith(".html"):
+            if not href.startswith("http"):
+                href = BASE + href
+            links.append(href)
+    # уникализируем
+    seen, uniq = set(), []
+    for u in links:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
 
-        scorer_id = d.get("scoringPlayerId") or d.get("playerId")
-        scorer = to_text(d.get("scoringPlayerName") or d.get("playerName") or d.get("name"))
-
-        assists = []
-        if isinstance(d.get("assists"), list):
-            for a in d["assists"]:
-                assists.append((a.get("playerId"), to_text(a.get("playerName"))))
-        else:
-            for k in ("assist1PlayerId","assist2PlayerId"):
-                pid = d.get(k)
-                if pid:
-                    assists.append((pid, to_text(d.get(k.replace("Id","Name")))))
-
-        rec = {
-            "period": pn,
-            "ptype": ptype,
-            "time": time_in,
-            "abs_time": abs_time_mmss(pn, time_in, ptype),
-            "scorerId": scorer_id,
-            "scorer": scorer,
-            "assists": assists,
-            "eventId": p.get("eventId") or 0,
-            "teamId": d.get("eventOwnerTeamId") or p.get("teamId") or d.get("teamId"),
-        }
-
-        if ptype == "SO":
-            if (d.get("isGameWinning") or d.get("gameWinning")):
-                shootout = {"scorerId": scorer_id, "scorer": scorer}
-        else:
-            goals.append(rec)
-
-    goals.sort(key=lambda r: (r["period"], r["eventId"]))
-    return goals, shootout
-
-# ───────── WSC фолбэк
-def fetch_goals_fallback_wsc(game_id: int):
-    jitter()
-    j = get_json(f"{API}/wsc/play-by-play/{game_id}")
-    items = j.get("plays") or j.get("items") or []
-    goals, shootout = [], None
-
-    for p in items:
-        t = to_text(p.get("typeDescKey") or p.get("type")).lower()
-        if t != "goal":
-            continue
-        pd = p.get("periodDescriptor") or {}
-        pn = int(pd.get("number") or 0)
-        ptype = to_text(pd.get("periodType")).upper() or "REG"
-        time_in = to_text(p.get("timeInPeriod") or p.get("time") or "0:00")
-        d = p.get("details") or p
-
-        scorer_id = d.get("scoringPlayerId") or d.get("playerId")
-        scorer = to_text(d.get("scoringPlayerName") or d.get("playerName") or d.get("name"))
-
-        assists = []
-        if isinstance(d.get("assists"), list):
-            for a in d["assists"]:
-                assists.append((a.get("playerId"), to_text(a.get("playerName") or a.get("name"))))
-        else:
-            for k in ("assist1PlayerId","assist2PlayerId"):
-                pid = d.get(k)
-                if pid:
-                    assists.append((pid, to_text(d.get(k.replace("Id","Name")))))
-
-        rec = {
-            "period": pn, "ptype": ptype, "time": time_in,
-            "abs_time": abs_time_mmss(pn, time_in, ptype),
-            "scorerId": scorer_id, "scorer": scorer,
-            "assists": assists, "eventId": p.get("eventId") or p.get("eventNumber") or 0,
-            "teamId": d.get("eventOwnerTeamId") or p.get("teamId") or d.get("teamId"),
-        }
-        if ptype == "SO":
-            if (d.get("isGameWinning") or d.get("gameWinning")):
-                shootout = {"scorerId": scorer_id, "scorer": scorer}
-        else:
-            goals.append(rec)
-
-    goals.sort(key=lambda r: (r["period"], r["eventId"]))
-    return goals, shootout
-
-# ───────── landing фолбэк
-def fetch_goals_fallback_landing(game_id: int):
-    jitter()
-    j = get_json(f"{API}/gamecenter/{game_id}/landing")
-    scoring = (j.get("summary") or {}).get("scoring") or {}
-    goals, shootout = [], None
-    for byp in scoring.get("byPeriod", []) or []:
-        pd = byp.get("periodDescriptor") or {}
-        pn = int(pd.get("number") or 0)
-        ptype = to_text(pd.get("periodType")).upper() or "REG"
-        for ev in byp.get("goals", []) or []:
-            time_in = to_text(ev.get("timeInPeriod") or "0:00")
-            scorer = to_text(ev.get("scorer"))
-            assists_names = ev.get("assists") or []
-            assists = []
-            for a in assists_names:
-                assists.append((None, to_text(a)))
-            rec = {
-                "period": pn, "ptype": ptype, "time": time_in,
-                "abs_time": abs_time_mmss(pn, time_in, ptype),
-                "scorerId": None, "scorer": scorer,
-                "assists": assists, "eventId": 0,
-                "teamId": None,
-            }
-            if ptype == "SO":
-                if ev.get("gameWinning"):
-                    shootout = {"scorerId": None, "scorer": scorer}
-            else:
-                goals.append(rec)
-    goals.sort(key=lambda r: (r["period"], r["eventId"]))
-    return goals, shootout
-
-# ───────── Кириллица со sports.ru
-def load_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-def save_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-RU_MAP     = load_json(RU_CACHE_FILE, {})
-RU_PENDING = load_json(RU_PENDING_FILE, {})
-
-# Сид-словарь ручных исправлений (минимально и адресно)
-RU_SEED = {
-    # Victor Hedman
-    "8475167": "В. Хедман",
-}
-RU_MAP.update({k: v for k, v in RU_SEED.items() if k not in RU_MAP})
-
-def _norm_ascii(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "")
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
-    s = re.sub(r"[^a-z0-9\- ]+", " ", s)
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"-{2,}", "-", s)
-    return s.strip("-")
-
-def slugify_en(full_en: str) -> list[str]:
-    """Возвращает список кандидатов slug: ['first-last', 'last', 'first-last-1', ...]"""
-    name = re.sub(r"[^A-Za-z\-\s']", " ", full_en).strip()
-    name = re.sub(r"\s+", " ", name)
-    parts = name.lower().split()
-    if not parts:
-        return []
-    slug_main = "-".join(parts)
-
-    # Альтернативы имени (минимальный набор для типичных случаев)
-    first_alt_map = {
-        "victor": "viktor",
-    }
-    alts = []
-    if len(parts) >= 2:
-        first, last = parts[0], parts[-1]
-        if first in first_alt_map:
-            alts.append(f"{first_alt_map[first]}-{last}")
-
-    cands = [slug_main]
-    if len(parts) >= 2:
-        cands.append(parts[-1])  # только фамилия
-    cands += alts
-
-    # Добавим суффиксы -1/-2/-3 для каждого варианта
-    with_suffix = []
-    for c in cands:
-        with_suffix.extend([c, f"{c}-1", f"{c}-2", f"{c}-3"])
-
-    # нормализуем и уникализируем
-    out, seen = [], set()
-    for c in with_suffix:
-        cc = _norm_ascii(c)
-        if cc and cc not in seen:
-            out.append(cc); seen.add(cc)
+    # Фильтруем по дате старта (достаём из страницы матча)
+    out = []
+    for url in uniq:
+        d_start = get_match_start_date_msk(url)
+        if not d_start:
+            # если дату не распознали, оставим — возможно нужный матч; лишнее отсеем позже
+            out.append(url)
+        elif d_start in dates_keep:
+            out.append(url)
     return out
 
-def sportsru_fetch_ru_initial(full_en: str):
-    """Ищем страницу игрока на sports.ru и берём <h1 class="titleH1"> «Имя Фамилия» -> «И. Фамилия»."""
-    candidates = slugify_en(full_en)
-    tried = []
-    for slug in candidates:
-        url = f"{SPORTS_ROOT}{slug}/"
-        tried.append(slug)
-        try:
-            r = S.get(url, timeout=20)
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            h1 = soup.select_one("h1.titleH1") or soup.find("h1")
-            if not h1:
-                continue
-            ru_full = to_text(h1.get_text(strip=True))
-            if not re.search(r"[А-Яа-яЁё]", ru_full):
-                continue
-            parts = ru_full.split()
-            if len(parts) >= 2:
-                fam = parts[-1]
-                ini = parts[0][0] + "."
-                return f"{ini} {fam}"
-            return ru_full
-        except Exception as e:
-            print(f"[WARN] sports.ru {url}: {e}", file=sys.stderr)
-    return (None, tried)
+def get_match_start_date_msk(match_url: str) -> dt.date | None:
+    """
+    Пытаемся достать дату начала матча по МСК со страницы матча.
+    Ищем <time datetime="YYYY-MM-DDTHH:MM:SS+03:00">, либо текст вида 'Начало: 02:30 ... 27 октября ...'
+    Возвращаем только дату (по МСК).
+    """
+    html = get_html(match_url)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
 
-def to_ru_initial(player_id: int | None, full_en: str) -> str | None:
-    """Вернёт «И. Фамилия» или None. Кэшируем по playerId."""
-    if not full_en:
-        return None
-    pid = str(player_id) if player_id is not None else None
-    if pid and (v := RU_MAP.get(pid)):
-        return v
-    ru = sportsru_fetch_ru_initial(full_en)
-    if isinstance(ru, tuple):
-        # не нашли — сохраним все попытки
-        _, tried = ru
-        if pid:
-            RU_PENDING.setdefault(pid, [])
-            for sl in tried:
-                if sl not in RU_PENDING[pid]:
-                    RU_PENDING[pid].append(sl)
-        return None
-    if ru:
-        if pid:
-            RU_MAP[pid] = ru
-        return ru
+    # Популярный вариант — <time datetime="...+03:00">
+    for t in soup.find_all("time"):
+        dt_attr = t.get("datetime") or t.get("content")
+        if dt_attr:
+            try:
+                # Пытаемся распарсить ISO с таймзоной
+                dt_full = dt.datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
+                # Переведём в МСК
+                d_msk = dt_full.astimezone(TZ_MSK).date()
+                return d_msk
+            except Exception:
+                pass
+
+    # Фолбэк: ищем текстовую дату в шапке
+    full_text = soup.get_text("\n", strip=True)
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", full_text)
+    if m:
+        y, mo, d, hh, mm = map(int, m.groups())
+        try:
+            dtt = dt.datetime(y, mo, d, hh, mm, tzinfo=TZ_MSK)
+            return dtt.date()
+        except Exception:
+            pass
+
+    # Если совсем не нашли — None
     return None
 
-# ───────── Построение блока матча
-def build_game_block(g: dict) -> str:
-    game_id = g.get("id") or g.get("gameId")
-    home_name = to_text((g.get("homeTeam") or {}).get("name"))
-    away_name = to_text((g.get("awayTeam") or {}).get("name"))
-    home_score = int((g.get("homeTeam") or {}).get("score") or 0)
-    away_score = int((g.get("awayTeam") or {}).get("score") or 0)
+# ───── Парсинг страницы матча
+GOAL_LINE_RE = re.compile(
+    r"(?P<score>\d+:\d+)\s*[—–-]\s*(?P<time>\d{1,2}[:.]\d{2})\s+(?P<who>[А-ЯЁA-Z][^()\n\r]*?)(?:\s*\((?P<ass>[^)]*)\))?(?=\s|$)",
+    re.U
+)
+PERIOD_RE_LIST = [
+    (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
+    (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
+    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
+    (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),  # базово 4, если №N → 3+N
+]
+
+def parse_match_page(match_url: str) -> dict:
+    """
+    Возвращает:
+      {
+        "home": "Тампа-Бэй", "away": "Анахайм",
+        "home_score": 4, "away_score": 3,
+        "ot": False, "so": True/False,
+        "goals": [ {"score":"1:0","abs_time":"9.10","scorer":"Д. Гентцель","ass":["Б. Хэйгел","А. Чирелли"]}, ... ],
+        "so_winner": "Т. Зеграс" | None
+      }
+    """
+    html = get_html(match_url)
+    if not html:
+        raise RuntimeError(f"Не удалось загрузить страницу матча: {match_url}")
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = text.replace("—", "–").replace("−", "–").replace("‒", "–")
+
+    # Заголовок: команды и итоговый счёт
+    # Пробуем вытащить из <h1>
+    h1 = soup.find("h1")
+    h1txt = h1.get_text(" ", strip=True) if h1 else ""
+    # Часто встречающийся формат: «Тампа-Бэй» – «Анахайм» 4:3 (..)
+    m_hdr = re.search(r"«?([А-ЯЁA-Za-z \-\.]+?)»?\s*[–-]\s*«?([А-ЯЁA-Za-z \-\.]+?)»?\s+(\d+):(\d+)(?:\s*\((.*?)\))?\s*(\(?(ОТ|Б)\)?)?", h1txt)
+    if not m_hdr:
+        # фолбэк — искать похожее в тексте
+        m_hdr = re.search(r"([А-ЯЁA-Za-z \-\.]+?)\s*[–-]\s*([А-ЯЁA-Za-z \-\.]+?)\s+(\d+):(\d+)", text)
+    if not m_hdr:
+        raise RuntimeError(f"Не разобрал заголовок/счёт: {match_url}")
+
+    home = m_hdr.group(1).strip().strip("«»")
+    away = m_hdr.group(2).strip().strip("«»")
+    home_score = int(m_hdr.group(3))
+    away_score = int(m_hdr.group(4))
     winner_home = home_score > away_score
 
-    # цели голов
-    goals, shootout = fetch_goals_primary(game_id)
-    if not goals and not shootout:
-        print(f"[INFO] {game_id}: PBP empty -> WSC", file=sys.stderr)
-        goals, shootout = fetch_goals_fallback_wsc(game_id)
-    if not goals and not shootout:
-        print(f"[INFO] {game_id}: WSC empty -> LANDING", file=sys.stderr)
-        goals, shootout = fetch_goals_fallback_landing(game_id)
+    # Определяем, был ли ОТ/Б
+    so = bool(re.search(r"\bБуллиты\b|\(Б\)|в серии буллитов", text, re.I))
+    ot = bool(re.search(r"\bОвертайм\b|\(ОТ\)", text, re.I))
 
-    roster = fetch_box_roster_names(game_id)
+    # Выделяем секцию с голами (между заголовками разделов)
+    # Ищем начало по «1-й период»/«Голы» и конец по «Удаления|Штраф|Буллиты|Статистика» и т.п.
+    start_idx = None
+    for m in re.finditer(r"(1[-–]?й\s+период|Голы|Ход матча)", text, re.I):
+        start_idx = m.start(); break
+    if start_idx is None:
+        # последняя попытка — с начала h1 вниз
+        start_idx = text.find(h1txt) + len(h1txt) if h1txt else 0
+    end_m = re.search(r"(Удаления|Штраф|Буллиты|Серия буллитов|Статистика|Составы|Видео)", text, re.I)
+    end_idx = end_m.start() if end_m else len(text)
 
-    # Заголовок
-    home_line = f"{escape(home_name)}: {home_score}"
-    away_line = f"{escape(away_name)}: {away_score}"
-    if winner_home:
-        home_line = f"<b>{home_line}</b>"
-    else:
-        away_line = f"<b>{away_line}</b>"
-    parts = [f"{home_line}\n{away_line}\n"]
+    goals_section = text[start_idx:end_idx]
 
-    if not goals and not shootout:
-        raise RuntimeError("Нет событий матча (play-by-play пуст)")
+    # Парсим по периодам
+    period = 1
+    goals = []
+    # Разобьём на строки, чтобы увидеть заголовки периодов
+    lines = [ln.strip() for ln in goals_section.split("\n") if ln.strip()]
+    for ln in lines:
+        # Детект заголовка периода
+        hit_period = False
+        for rx, base_p in PERIOD_RE_LIST:
+            m = rx.search(ln)
+            if m:
+                if base_p == 4 and m.lastindex == 1 and m.group(1):
+                    # «Овертайм №N»
+                    try:
+                        n = int(m.group(1))
+                    except Exception:
+                        n = 1
+                    period = 3 + max(1, n)
+                else:
+                    period = base_p
+                hit_period = True
+                break
+        if hit_period:
+            continue
 
-    # билд имя EN → EN full (по roster/raw/landing), затем → RU (sports.ru)
-    def normalize_full_en(pid, raw):
-        raw = to_text(raw).strip()
-        if pid and pid in roster and roster[pid]:
-            return roster[pid]
-        if raw:
-            return raw
-        if pid:
-            name = fetch_player_en_name_by_id(int(pid))
-            if name:
-                return name
-        return raw
+        # Ищем строки голов
+        for m in GOAL_LINE_RE.finditer(ln):
+            score = m.group("score").strip()
+            t_in  = m.group("time").replace(".", ":")
+            who   = m.group("who").strip()
+            ass   = (m.group("ass") or "").strip()
 
-    goals_by_p = {}
-    for r in goals:
-        goals_by_p.setdefault(r["period"], []).append(r)
+            # чистим имя/ассистентов (non-breaking и латиницу)
+            who = re.sub(r"\s+", " ", who)
+            # Иногда после имени добавляют лишние фрагменты типа «— команда», отрежем по « – » или « — »
+            who = re.split(r"\s+[–-]\s+", who)[0].strip()
 
-    ru_missing = {}  # key -> en_full
+            # Превращаем в «И. Фамилия»
+            who_sh = initial_ru(who)
 
-    def ru_name(pid, en_full) -> str | None:
-        if not en_full and pid:
-            en_full = fetch_player_en_name_by_id(int(pid)) or ""
-        ru = to_ru_initial(pid, en_full)
-        if ru:
-            return ru
-        key = str(pid) if pid else f"noid|{en_full}"
-        if key not in ru_missing:
-            ru_missing[key] = en_full
-        return None
+            assists = []
+            if ass:
+                for a in ass.split(","):
+                    aa = a.strip()
+                    # отрезаем возможные «— команда»
+                    aa = re.split(r"\s+[–-]\s+", aa)[0].strip()
+                    if aa:
+                        assists.append(initial_ru(aa))
 
-    for p in sorted(goals_by_p.keys()):
-        if p <= 3:
-            parts.append(f"<i>{p}-й период</i>")
-        else:
-            parts.append(f"<i>Овертайм №{p-3}</i>")
-        for r in goals_by_p[p]:
-            en_scorer = normalize_full_en(r.get("scorerId"), r.get("scorer"))
-            ru_scorer = ru_name(r.get("scorerId"), en_scorer) or en_scorer or "—"
-
-            ass_ru = []
-            for aid, aname in (r.get("assists") or []):
-                en_a = normalize_full_en(aid, aname)
-                rux = ru_name(aid, en_a) or en_a or "—"
-                ass_ru.append(rux)
-
-            t_abs = to_text(r.get("abs_time")) or to_text(r.get("time")) or ""
-            ass_txt = f" ({', '.join(escape(x) for x in ass_ru if x and x != '—')})" if ass_ru else ""
-            parts.append(f"{escape(t_abs)} {escape(ru_scorer)}{ass_txt}")
+            abs_t = abs_time_from_period(period, t_in)
+            goals.append({
+                "score": score,
+                "abs_time": abs_t,
+                "scorer": who_sh,
+                "ass": assists
+            })
 
     # Победный буллит
-    if shootout:
-        parts.append("<i>Победный буллит</i>")
-        en_w = normalize_full_en(shootout.get("scorerId"), shootout.get("scorer"))
-        ru_w = ru_name(shootout.get("scorerId"), en_w) or en_w or "—"
-        parts.append(f"65.00 {escape(ru_w)}")
+    so_winner = None
+    if so:
+        # Явная формулировка
+        m = re.search(r"Победный\s+буллит[:\s–-]+([А-ЯЁA-Z][^,\n\r]+)", text, re.I)
+        if m:
+            so_winner = initial_ru(m.group(1).strip())
+        else:
+            # Иногда в блоке буллитов отмечают «решающий» — попробуем
+            m2 = re.search(r"(решающ|победн)[^:\n\r]*[:\s–-]+([А-ЯЁA-Z][^,\n\r]+)", text, re.I)
+            if m2:
+                so_winner = initial_ru(m2.group(2).strip())
 
-    if STRICT_RU and ru_missing:
-        save_json(RU_CACHE_FILE, RU_MAP)
-        save_json(RU_PENDING_FILE, RU_PENDING)
-        preview = "\n".join(
-            f"- id={k} | {v}" for k, v in list(ru_missing.items())[:20]
-        )
-        raise RuntimeError(
-            "Не удалось получить имена на кириллице для некоторых игроков sports.ru.\n"
-            "Примеры:\n" + preview + ("\n…см. ru_pending_sportsru.json" if len(ru_missing) > 20 else "")
-        )
+    return {
+        "home": home, "away": away,
+        "home_score": home_score, "away_score": away_score,
+        "winner_home": winner_home,
+        "ot": ot, "so": so,
+        "goals": goals,
+        "so_winner": so_winner,
+        "url": match_url
+    }
 
-    return "\n".join(parts)
+# ───── Сбор матчей по правилу «день D + день D-1 после 15:00»
+def collect_match_urls_for_report(d_report: dt.date) -> list[str]:
+    """
+    Грузим календарь (основной), достаём все ссылки матчей, фильтруем по датам начала:
+      - дата == D
+      - дата == D-1 и время >= 15:00 МСК
+    Чтобы не зависеть от того, отдаёт ли календарь сразу обе даты, подстрахуемся:
+      - сначала берём базовый календарь,
+      - если D-1 другой месяц, пробуем ещё раз с параметром ?date=YYYY-MM-01
+    """
+    html_main = get_html(CAL_URL)
+    if not html_main:
+        raise RuntimeError("Не удалось открыть календарь Championat")
 
-# ───────── Пост
-def build_post(day: dt.date) -> str:
-    games = fetch_games_for_date(day)
-    n = len(games)
-    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(day)} • {n} " + \
-            ("матч" if n==1 else "матча" if n%10 in (2,3,4) and not 12<=n%100<=14 else "матчей")
+    # Список кандидатов (мы всё равно сверим дату на странице матча)
+    cand = []
+    # Из основного календаря
+    cand += find_match_links_for_date_range(html_main, {d_report, d_report - dt.timedelta(days=1)})
+
+    # Если D-1 в другом месяце — подстрахуемся
+    d_prev = d_report - dt.timedelta(days=1)
+    if d_prev.month != d_report.month:
+        url_prev_month = CAL_URL + f"?date={d_prev.strftime('%Y-%m-01')}"
+        html_prev = get_html(url_prev_month)
+        if html_prev:
+            cand += find_match_links_for_date_range(html_prev, {d_prev})
+
+    # Уникализируем
+    seen, uniq = set(), []
+    for u in cand:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+
+    # Отфильтруем по точному правилу времени
+    selected = []
+    for url in uniq:
+        # попробуем достать точное время старта из <time datetime=...>
+        html = get_html(url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        start_dt = None
+        for t in soup.find_all("time"):
+            dt_attr = t.get("datetime") or t.get("content")
+            if dt_attr:
+                try:
+                    dtt = dt.datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
+                    start_dt = dtt.astimezone(TZ_MSK)
+                    break
+                except Exception:
+                    pass
+        # фолбэк — не нашли <time> → берём только по дате страницы (как раньше)
+        if not start_dt:
+            donly = get_match_start_date_msk(url)
+            if not donly:
+                continue
+            # неизвестно время — пусть решит по дате
+            if donly == d_report:
+                selected.append(url)
+            elif donly == d_prev:
+                # без времени не можем гарантировать фильтр 15:00 — пропустим
+                continue
+            continue
+
+        d_local = start_dt.date()
+        if d_local == d_report:
+            selected.append(url)
+        elif d_local == d_prev and start_dt.time() >= dt.time(15, 0):
+            selected.append(url)
+
+    return selected
+
+# ───── Формирование текста поста
+def build_post_text(d_report: dt.date) -> str:
+    urls = collect_match_urls_for_report(d_report)
+    # Парсим все матчи
+    matches = []
+    for u in urls:
+        try:
+            jitter()
+            matches.append(parse_match_page(u))
+        except Exception as e:
+            print(f"[WARN] {u}: {e}", file=sys.stderr)
+
+    # Отбрасываем пустые
+    matches = [m for m in matches if m.get("goals") or m.get("so") or (m.get("home") and m.get("away"))]
+    n = len(matches)
+
+    # Заголовок
+    title = f"🗓 Регулярный чемпионат НХЛ • {ru_date(d_report)} • {n} " + \
+            ("матч" if n == 1 else "матча" if n % 10 in (2, 3, 4) and not 12 <= n % 100 <= 14 else "матчей")
     head = f"{title}\n\nРезультаты надёжно спрятаны 👇\n\n——————————————————\n\n"
 
-    if not games:
+    if not matches:
         return head.strip()
 
+    # Сортировка по времени начала? Сейчас порядок календаря/ссылок.
     blocks = []
-    for i, g in enumerate(games, 1):
-        blocks.append(build_game_block(g))
-        if i < len(games):
+    for idx, m in enumerate(matches, 1):
+        home_line = bold_winner_line(m["home"], m["home_score"], m["winner_home"])
+        away_line = bold_winner_line(m["away"], m["away_score"], not m["winner_home"])
+
+        suffix = ""
+        if m["so"]:
+            suffix = " (Б)"
+        elif m["ot"]:
+            suffix = " (ОТ)"
+
+        lines = [f"{home_line}{suffix}", f"{away_line}"]
+
+        # события
+        for ev in m["goals"]:
+            ass = f" ({', '.join(escape(a) for a in ev['ass'])})" if ev["ass"] else ""
+            lines.append(f"{escape(ev['score'])} – {escape(ev['abs_time'])} {escape(ev['scorer'])}{ass}")
+
+        if m["so"] and m.get("so_winner"):
+            lines.append("<i>Победный буллит</i>")
+            lines.append(f"65.00 {escape(m['so_winner'])}")
+
+        blocks.append("\n".join(lines))
+        if idx < len(matches):
             blocks.append("")
 
     return head + "\n".join(blocks).strip()
 
-# ───────── Telegram
+# ───── Telegram
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
@@ -550,27 +484,26 @@ def tg_send(text: str):
             chunk, rest = rest, ""
         else:
             cut = rest.rfind("\n\n", 0, maxlen)
-            if cut == -1: cut = maxlen
+            if cut == -1:
+                cut = maxlen
             chunk, rest = rest[:cut], rest[cut:].lstrip()
         r = S.post(url, json={
-            "chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML",
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
-        }, timeout=20)
+        }, timeout=25)
         if r.status_code != 200:
             raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:200]}")
         time.sleep(0.25)
 
-# ───────── main
+# ───── main
 if __name__ == "__main__":
     try:
-        day = pick_report_date()
-        text = build_post(day)
-        save_json(RU_CACHE_FILE, RU_MAP)
-        save_json(RU_PENDING_FILE, RU_PENDING)
-        tg_send(text)
+        d = pick_report_date()
+        post = build_post_text(d)
+        tg_send(post)
         print("OK")
     except Exception as e:
-        save_json(RU_CACHE_FILE, RU_MAP)
-        save_json(RU_PENDING_FILE, RU_PENDING)
         print("ERROR:", repr(e), file=sys.stderr)
         sys.exit(1)
