@@ -20,9 +20,12 @@ ENV:
   beautifulsoup4==4.12.3
 """
 
-import os, sys, re, datetime as dt
+import os
+import sys
+import re
+import datetime as dt
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,7 +39,7 @@ API = "https://api-web.nhle.com"
 SPORTS_CAL = "https://www.sports.ru/hockey/tournament/nhl/calendar/"
 SPORTS_SEARCH = "https://www.sports.ru/search/"
 
-TEAM_META = {
+TEAM_META: Dict[str, Tuple[str, str]] = {
     "NJD": ("😈", "Нью-Джерси"),
     "NYI": ("🟠", "Айлендерс"),
     "NYR": ("🗽", "Рейнджерс"),
@@ -66,9 +69,9 @@ TEAM_META = {
     "COL": ("⛰️", "Колорадо"),
     "MIN": ("🌲", "Миннесота"),
     "WPG": ("✈️", "Виннипег"),
-    # Важное дополнение: UTA = Utah Hockey Club
+    # UTA = Utah Hockey Club
     "UTA": ("🦣", "Юта"),
-    # Оставляем старую ссылку на случай, если где-то ещё попадётся ARI
+    # На всякий случай старое ARI → Юта
     "ARI": ("🦣", "Юта"),
     "SEA": ("🦑", "Сиэтл"),
     "VGK": ("🎰", "Вегас"),
@@ -119,7 +122,7 @@ def report_date() -> dt.date:
         return dt.date.fromisoformat(env)
     return dt.datetime.now(TZ_MSK).date()
 
-def window_msk(d: dt.date) -> tuple[dt.datetime, dt.datetime]:
+def window_msk(d: dt.date) -> Tuple[dt.datetime, dt.datetime]:
     start = dt.datetime.combine(d - dt.timedelta(days=1), dt.time(15,0), tzinfo=TZ_MSK)
     end   = dt.datetime.combine(d, dt.time(23,59,59,999000), tzinfo=TZ_MSK)
     return start, end
@@ -130,18 +133,21 @@ def to_msk(utc_iso: str) -> dt.datetime:
 # ───── NHL schedule & PBP
 def pick_games(d: dt.date) -> List[dict]:
     start, end = window_msk(d)
-    games = []
+    games: List[dict] = []
     for day in (d - dt.timedelta(days=1), d):
         js = get_json(f"{API}/v1/schedule/{day.isoformat()}")
         lst = js.get("games") or js.get("gameWeek",[{}])[0].get("games",[])
         games.extend(lst)
-    picked, seen = [], set()
+    picked: List[dict] = []
+    seen = set()
     for g in games:
         gid = int(g.get("id") or 0)
-        if not gid or gid in seen: continue
+        if not gid or gid in seen:
+            continue
         seen.add(gid)
         utc = g.get("startTimeUTC") or g.get("startTime")
-        if not utc: continue
+        if not utc:
+            continue
         msk = to_msk(utc)
         if start <= msk <= end:
             picked.append({
@@ -168,7 +174,8 @@ def to_elapsed_mmss(period: int, time_in_period: Optional[str], time_remaining: 
         pr_len = 20 if period <= 3 else 5
         mm, ss = map(int, time_remaining.split(":"))
         total = pr_len*60 - (mm*60 + ss)
-        if total < 0: total = 0
+        if total < 0:
+            total = 0
         return f"{total//60}:{total%60:02d}"
     # на худой случай
     t = time_in_period or time_remaining or "0:00"
@@ -179,7 +186,7 @@ def abs_time(period: int, mmss: str) -> str:
     if not m:
         return mmss.replace(":", ".")
     mm, ss = int(m.group(1)), int(m.group(2))
-    base = (period-1)*20 if period<=3 else 60 + 5*(period-4)
+    base = (period-1)*20 if period <= 3 else 60 + 5*(period-4)
     return f"{base + mm}.{ss:02d}"
 
 # ───── Нормализация и сравнение названий команд (чтобы ловить «Юта» vs «Юта ХК»)
@@ -196,7 +203,7 @@ def _teams_match(a: str, b: str) -> bool:
     return ak == bk or ak in bk or bk in ak
 
 # ───── Календарь sports.ru: допуск по дате (±1 день) и минимальная разница времени
-def _parse_dt_from_td(a_dt_text: str) -> tuple[Optional[dt.date], Optional[dt.time]]:
+def _parse_dt_from_td(a_dt_text: str) -> Tuple[Optional[dt.date], Optional[dt.time]]:
     # пример "26.10.2025|20:00"
     m = re.search(r"(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}):(\d{2})", a_dt_text)
     if not m:
@@ -211,7 +218,7 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
     html = get_html(SPORTS_CAL)
     soup = BeautifulSoup(html, "html.parser")
 
-    best: Optional[tuple[int, str]] = None  # (abs_minutes_diff, href)
+    best: Optional[Tuple[int, str]] = None  # (abs_minutes_diff, href)
     fallback_same_day: List[str] = []
 
     for tr in soup.find_all("tr"):
@@ -274,7 +281,7 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
     if r.status_code != 200:
         return None
     soup = BeautifulSoup(r.text, "html.parser")
-    cands = []
+    cands: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         txt = a.get_text(" ", strip=True)
@@ -295,11 +302,13 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
 
 def find_sportsru_match_url(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
     u = find_sportsru_match_url_via_calendar(home_ru, away_ru, start_msk)
-    if u: return u
+    if u:
+        return u
     # пробуем поиск на дату старта и соседние
     for delta in (0, -1, 1):
         u = find_sportsru_match_url_via_search(home_ru, away_ru, (start_msk + dt.timedelta(days=delta)).date())
-        if u: return u
+        if u:
+            return u
     return None
 
 # ───── Парсинг голов на sports.ru
@@ -310,18 +319,20 @@ GOAL_LINE_RE = re.compile(
 PERIOD_HEADERS = [
     (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
     (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
-    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re_U), 3),
+    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
     (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),  # 4=OT1; №N → 3+N
 ]
 
 def ru_initial(full: str) -> str:
     t = re.sub(r"\s+", " ", (full or "").strip())
-    if not t: return ""
+    if not t:
+        return ""
     parts = t.split(" ")
-    if len(parts) == 1: return parts[0]
+    if len(parts) == 1:
+        return parts[0]
     return f"{parts[0][0]}. {parts[-1]}"
 
-def parse_sportsru_goals(url: str) -> tuple[List[dict], Optional[str]]:
+def parse_sportsru_goals(url: str) -> Tuple[List[dict], Optional[str]]:
     html = get_html(url)
     soup = BeautifulSoup(html, "html.parser")
     txt = soup.get_text("\n", strip=True)
@@ -330,8 +341,10 @@ def parse_sportsru_goals(url: str) -> tuple[List[dict], Optional[str]]:
     # выделим раздел с голами
     start = None
     for m in re.finditer(r"(1[-–]?й\s+период|Голы|Ход матча)", txt, re.I):
-        start = m.start(); break
-    if start is None: start = 0
+        start = m.start()
+        break
+    if start is None:
+        start = 0
     endm = re.search(r"(Буллиты|Серия буллитов|Удаления|Статистика|Составы)", txt, re.I)
     end = endm.start() if endm else len(txt)
     section = txt[start:end]
@@ -362,7 +375,8 @@ def parse_sportsru_goals(url: str) -> tuple[List[dict], Optional[str]]:
             if ass:
                 for a in ass.split(","):
                     aa = ru_initial(re.split(r"\s+[–-]\s+", a.strip())[0].strip())
-                    if aa: assists.append(aa)
+                    if aa:
+                        assists.append(aa)
             goals.append({
                 "period": period,
                 "t": mmss,
@@ -394,7 +408,7 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
       3) ближайшее время в том же периоде (±15с)
       4) по порядку (следующая неиспользованная запись)
     """
-    by_ptime: Dict[tuple, List[int]] = {}
+    by_ptime: Dict[Tuple[int, str], List[int]] = {}
     by_score: Dict[str, List[int]] = {}
     for idx, g in enumerate(ru_goals):
         by_ptime.setdefault((g["period"], g["t"]), []).append(idx)
@@ -411,32 +425,42 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
     for ev in nhl_goals:
         p, t, sc = ev["period"], ev["t"], ev["score"]
 
+        # 1) exact period+time
         cand = [j for j in by_ptime.get((p, t), []) if j not in used]
         if not cand:
+            # вариант без ведущего нуля в минутах
             mm, ss = t.split(":")
             alt = f"{int(mm)}:{ss}"
             cand = [j for j in by_ptime.get((p, alt), []) if j not in used]
         if cand:
-            out.append(take(cand[0])); continue
+            out.append(take(cand[0]))
+            continue
 
+        # 2) by score
         cand = [j for j in by_score.get(sc, []) if j not in used]
         if cand:
-            out.append(take(cand[0])); continue
+            out.append(take(cand[0]))
+            continue
 
+        # 3) nearest time in same period (±15s)
         nhl_sec = mmss_to_seconds(t)
         best = None
         for j, rg in enumerate(ru_goals):
-            if j in used or rg["period"] != p: continue
+            if j in used or rg["period"] != p:
+                continue
             diff = abs(mmss_to_seconds(rg["t"]) - nhl_sec)
             if diff <= 15:
                 if (best is None) or diff < best[0]:
                     best = (diff, j)
         if best:
-            out.append(take(best[1])); continue
+            out.append(take(best[1]))
+            continue
 
+        # 4) next unused by order
         fallback = next((j for j in range(len(ru_goals)) if j not in used), None)
         if fallback is not None:
-            out.append(take(fallback)); continue
+            out.append(take(fallback))
+            continue
 
         out.append({"who": "—", "assists": []})
 
@@ -493,8 +517,10 @@ def build_match_block(g: dict) -> str:
         goals_by_period.setdefault(ev["period"], []).append(line)
 
     for p in sorted(goals_by_period.keys()):
-        if p <= 3: parts.append(f"<i>{p}-й период</i>")
-        else:      parts.append(f"<i>Овертайм №{p-3}</i>")
+        if p <= 3:
+            parts.append(f"<i>{p}-й период</i>")
+        else:
+            parts.append(f"<i>Овертайм №{p-3}</i>")
         parts.extend(goals_by_period[p])
 
     if decision == "SO" and so_winner:
@@ -513,17 +539,20 @@ def build_post(d: dt.date) -> str:
     if not games:
         return head.strip()
 
-    blocks = []
+    blocks: List[str] = []
     for i, g in enumerate(games, 1):
         blocks.append(build_match_block(g))
-        if i < len(games): blocks.append("")
+        if i < len(games):
+            blocks.append("")
     return head + "\n".join(blocks).strip()
 
 # ───── Telegram
 def tg_send(text: str):
-    token, chat = os.getenv("TELEGRAM_BOT_TOKEN","").strip(), os.getenv("TELEGRAM_CHAT_ID","").strip()
+    token = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    chat = os.getenv("TELEGRAM_CHAT_ID","").strip()
     if not token or not chat:
-        print(text); return
+        print(text)
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = S.post(url, json={"chat_id": chat, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}, timeout=25)
     if r.status_code != 200:
