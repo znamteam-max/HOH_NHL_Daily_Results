@@ -146,7 +146,7 @@ def fetch_player_en_name_by_id(pid: int) -> str:
         return ""
     j = get_json(f"{API}/player/{pid}/landing")
     fn = to_text((j.get("firstName") or {}))
-    ln = to_text((j.get("lastName")  or {}))
+    ln  = to_text((j.get("lastName")  or {}))
     return f"{fn} {ln}".strip()
 
 # ───────── Boxscore: roster (id -> "First Last")
@@ -318,15 +318,15 @@ def _norm_ascii(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     s = s.replace("'", "").replace("’","").replace("."," ").replace("/"," ")
-    s = re.sub(r"[^a-z0-9\\- ]+", " ", s)
-    s = re.sub(r"\\s+", "-", s).strip("-")
+    s = re.sub(r"[^a-z0-9\- ]+", " ", s)   # ← фикс: дефис только один раз экранируем
+    s = re.sub(r"\s+", "-", s)             # ← фикс: \s, а не \\s
     s = re.sub(r"-{2,}", "-", s)
-    return s
+    return s.strip("-")
 
 def slugify_en(full_en: str) -> list[str]:
     """Возвращает список кандидатов slug: ['first-last', 'last']"""
-    name = re.sub(r"[^A-Za-z\\-\\s']", " ", full_en).strip()
-    name = re.sub(r"\\s+", " ", name)
+    name = re.sub(r"[^A-Za-z\-\s']", " ", full_en).strip()  # ← фикс
+    name = re.sub(r"\s+", " ", name)                        # ← фикс
     parts = name.lower().split()
     if not parts:
         return []
@@ -425,25 +425,21 @@ def build_game_block(g: dict) -> str:
     # билд имя EN → EN full (по roster/raw/landing), затем → RU (sports.ru)
     def normalize_full_en(pid, raw):
         raw = to_text(raw).strip()
-        # 1) по id в ростере
         if pid and pid in roster and roster[pid]:
             return roster[pid]
-        # 2) если в raw уже что-то есть — отдадим
         if raw:
             return raw
-        # 3) как крайняя мера — дернуть landing по id
         if pid:
             name = fetch_player_en_name_by_id(int(pid))
             if name:
                 return name
-        return raw  # пусто
+        return raw
 
     goals_by_p = {}
     for r in goals:
         goals_by_p.setdefault(r["period"], []).append(r)
 
-    # собираем «пропущенных» без дублей
-    ru_missing = {}  # key -> en_full; key='pid' или 'noid|Name'
+    ru_missing = {}  # key -> en_full
 
     def ru_name(pid, en_full) -> str | None:
         if not en_full and pid:
