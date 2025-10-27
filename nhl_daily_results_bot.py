@@ -5,7 +5,7 @@
 NHL → Telegram (RU)
 - События (время, счёт, порядок) берём из api-web.nhle.com.
 - СТРАНИЦУ МАТЧА и ФАМИЛИИ (кириллица) берём со sports.ru:
-  1) сначала ищем ссылку в календаре турнира c допуском по дате (±1 день) и по минимальной разнице времени;
+  1) сначала ищем ссылку в календаре турнира с допуском по дате (±1 день) и по минимальной разнице времени;
   2) если не нашли — запасной поиск по сайту.
 - Склейка голов: (период, время) → если нет — по счёту после гола → если нет — ближайшее время в том же периоде (±15с) → если нет — по порядку.
 - Время печатаем как абсолютные минуты матча (mm.ss).
@@ -20,7 +20,7 @@ ENV:
   beautifulsoup4==4.12.3
 """
 
-import os, sys, re, json, datetime as dt
+import os, sys, re, datetime as dt
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -66,7 +66,10 @@ TEAM_META = {
     "COL": ("⛰️", "Колорадо"),
     "MIN": ("🌲", "Миннесота"),
     "WPG": ("✈️", "Виннипег"),
-    "ARI": ("🦣", "Юта"),  # Аризона -> Юта
+    # Важное дополнение: UTA = Utah Hockey Club
+    "UTA": ("🦣", "Юта"),
+    # Оставляем старую ссылку на случай, если где-то ещё попадётся ARI
+    "ARI": ("🦣", "Юта"),
     "SEA": ("🦑", "Сиэтл"),
     "VGK": ("🎰", "Вегас"),
 }
@@ -89,7 +92,7 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-RU-Merger/1.3",
+        "User-Agent": "NHL-RU-Merger/1.4",
         "Accept": "text/html,application/json,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     })
@@ -179,10 +182,20 @@ def abs_time(period: int, mmss: str) -> str:
     base = (period-1)*20 if period<=3 else 60 + 5*(period-4)
     return f"{base + mm}.{ss:02d}"
 
-# ───── Календарь sports.ru: допуск по дате (±1 день) и минимальная разница времени
-def _norm_team(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+# ───── Нормализация и сравнение названий команд (чтобы ловить «Юта» vs «Юта ХК»)
+def _norm_team_key(s: str) -> str:
+    t = s.lower()
+    t = re.sub(r"[^a-zа-яё]+", " ", t)
+    t = t.replace(" хк ", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
+def _teams_match(a: str, b: str) -> bool:
+    ak = _norm_team_key(a)
+    bk = _norm_team_key(b)
+    return ak == bk or ak in bk or bk in ak
+
+# ───── Календарь sports.ru: допуск по дате (±1 день) и минимальная разница времени
 def _parse_dt_from_td(a_dt_text: str) -> tuple[Optional[dt.date], Optional[dt.time]]:
     # пример "26.10.2025|20:00"
     m = re.search(r"(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}):(\d{2})", a_dt_text)
@@ -197,9 +210,6 @@ def _parse_dt_from_td(a_dt_text: str) -> tuple[Optional[dt.date], Optional[dt.ti
 def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
     html = get_html(SPORTS_CAL)
     soup = BeautifulSoup(html, "html.parser")
-
-    home_key = _norm_team(home_ru)
-    away_key = _norm_team(away_ru)
 
     best: Optional[tuple[int, str]] = None  # (abs_minutes_diff, href)
     fallback_same_day: List[str] = []
@@ -227,8 +237,9 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
         home_txt = (a_home.get("title") or a_home.get_text(" ", strip=True)) if a_home else ""
         away_txt = (a_away.get("title") or a_away.get_text(" ", strip=True)) if a_away else ""
 
-        ok_direct = (_norm_team(home_txt) == home_key and _norm_team(away_txt) == away_key)
-        ok_swapped = (_norm_team(home_txt) == away_key and _norm_team(away_txt) == home_key)
+        # допускаем любые вариации («Юта» ↔ «Юта ХК», «Нью-Джерси» ↔ «Нью-Джерси Дэвилз»)
+        ok_direct = _teams_match(home_txt, home_ru) and _teams_match(away_txt, away_ru)
+        ok_swapped = _teams_match(home_txt, away_ru) and _teams_match(away_txt, home_ru)
         if not (ok_direct or ok_swapped):
             continue
 
@@ -270,6 +281,7 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
         if "/hockey/match/" in href and href.endswith(".html"):
             if not href.startswith("http"):
                 href = "https://www.sports.ru" + href
+            # расслабим проверку: достаточно, чтобы встречалось первое слово команды
             if (home_ru.split()[0] in txt) and (away_ru.split()[0] in txt):
                 cands.append(href)
     if not cands:
@@ -298,7 +310,7 @@ GOAL_LINE_RE = re.compile(
 PERIOD_HEADERS = [
     (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
     (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
-    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
+    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re_U), 3),
     (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),  # 4=OT1; №N → 3+N
 ]
 
@@ -367,7 +379,7 @@ def parse_sportsru_goals(url: str) -> tuple[List[dict], Optional[str]]:
 
     return goals, so_winner
 
-# ───── Утилиты для сопоставления списков голов
+# ───── Сопоставление голов NHL ↔ sports.ru
 def mmss_to_seconds(mmss: str) -> int:
     mm, ss = mmss.split(":")
     return int(mm) * 60 + int(ss)
@@ -382,7 +394,6 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
       3) ближайшее время в том же периоде (±15с)
       4) по порядку (следующая неиспользованная запись)
     """
-    # Индексы быстрых поисков
     by_ptime: Dict[tuple, List[int]] = {}
     by_score: Dict[str, List[int]] = {}
     for idx, g in enumerate(ru_goals):
@@ -397,25 +408,21 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
         rg = ru_goals[idx]
         return {"who": rg["who"], "assists": rg["assists"]}
 
-    for i, ev in enumerate(nhl_goals):
+    for ev in nhl_goals:
         p, t, sc = ev["period"], ev["t"], ev["score"]
 
-        # 1) exact period+time
         cand = [j for j in by_ptime.get((p, t), []) if j not in used]
         if not cand:
-            # вариант без ведущего нуля в минутах
             mm, ss = t.split(":")
             alt = f"{int(mm)}:{ss}"
             cand = [j for j in by_ptime.get((p, alt), []) if j not in used]
         if cand:
             out.append(take(cand[0])); continue
 
-        # 2) by score
         cand = [j for j in by_score.get(sc, []) if j not in used]
         if cand:
             out.append(take(cand[0])); continue
 
-        # 3) nearest time in same period (±15s)
         nhl_sec = mmss_to_seconds(t)
         best = None
         for j, rg in enumerate(ru_goals):
@@ -427,12 +434,10 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
         if best:
             out.append(take(best[1])); continue
 
-        # 4) next unused by order
         fallback = next((j for j in range(len(ru_goals)) if j not in used), None)
         if fallback is not None:
             out.append(take(fallback)); continue
 
-        # если вообще ничего — заполним заглушкой (такое практически не встретится)
         out.append({"who": "—", "assists": []})
 
     return out
