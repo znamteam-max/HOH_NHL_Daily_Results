@@ -3,13 +3,12 @@
 
 """
 NHL → Telegram (RU)
-- События (время, счёт, порядок) берём из api-web.nhle.com.
-- СТРАНИЦУ МАТЧА и ФАМИЛИИ (кириллица) берём со sports.ru:
-  1) сначала ищем ссылку в календаре турнира с допуском по дате (±1 день) и по минимальной разнице времени;
-  2) если не нашли — запасной поиск по сайту.
-- Склейка голов: (период, время) → если нет — по счёту после гола → если нет — ближайшее время в том же периоде (±15с) → если нет — по порядку.
-- Время печатаем как абсолютные минуты матча (mm.ss).
-- В буллитах печатаем только «Победный буллит».
+— Матчи берём из api-web.nhle.com по "игровому дню" (МСК: вчера с 15:00 до сегодня 23:59:59).
+— Для каждого матча:
+   • PBP (время и порядок) из NHL;
+   • Страницу матча и имена (кириллица) — со sports.ru (календарь ±1 день, допуск по времени, гибкое сравнение названий).
+— Если сопоставление голов (NHL↔sports.ru) неуверенное, печатаем ровно то, что на sports.ru (там уже есть «счёт после гола» и кириллица).
+— Время выводим как абсолютные минуты матча (mm.ss). В буллитах печатаем только «Победный буллит».
 
 ENV:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -68,11 +67,9 @@ TEAM_META: Dict[str, Tuple[str, str]] = {
     "CBJ": ("💣", "Коламбус"),
     "COL": ("⛰️", "Колорадо"),
     "MIN": ("🌲", "Миннесота"),
-    "WPG": ("✈️", "Виннипег"),
-    # UTA = Utah Hockey Club
-    "UTA": ("🦣", "Юта"),
-    # На всякий случай старое ARI → Юта
-    "ARI": ("🦣", "Юта"),
+    "WPG": ("✈", "Виннипег"),
+    "UTA": ("🦣", "Юта"),  # Utah Hockey Club
+    "ARI": ("🦣", "Юта"),  # на всякий
     "SEA": ("🦑", "Сиэтл"),
     "VGK": ("🎰", "Вегас"),
 }
@@ -95,7 +92,7 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-RU-Merger/1.4",
+        "User-Agent": "NHL-RU-Merger/1.5",
         "Accept": "text/html,application/json,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     })
@@ -189,7 +186,7 @@ def abs_time(period: int, mmss: str) -> str:
     base = (period-1)*20 if period <= 3 else 60 + 5*(period-4)
     return f"{base + mm}.{ss:02d}"
 
-# ───── Нормализация и сравнение названий команд (чтобы ловить «Юта» vs «Юта ХК»)
+# ───── Нормализация и сравнение названий команд (catch «Юта» vs «Юта ХК»)
 def _norm_team_key(s: str) -> str:
     t = s.lower()
     t = re.sub(r"[^a-zа-яё]+", " ", t)
@@ -244,7 +241,6 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
         home_txt = (a_home.get("title") or a_home.get_text(" ", strip=True)) if a_home else ""
         away_txt = (a_away.get("title") or a_away.get_text(" ", strip=True)) if a_away else ""
 
-        # допускаем любые вариации («Юта» ↔ «Юта ХК», «Нью-Джерси» ↔ «Нью-Джерси Дэвилз»)
         ok_direct = _teams_match(home_txt, home_ru) and _teams_match(away_txt, away_ru)
         ok_swapped = _teams_match(home_txt, away_ru) and _teams_match(away_txt, home_ru)
         if not (ok_direct or ok_swapped):
@@ -288,7 +284,6 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
         if "/hockey/match/" in href and href.endswith(".html"):
             if not href.startswith("http"):
                 href = "https://www.sports.ru" + href
-            # расслабим проверку: достаточно, чтобы встречалось первое слово команды
             if (home_ru.split()[0] in txt) and (away_ru.split()[0] in txt):
                 cands.append(href)
     if not cands:
@@ -304,7 +299,6 @@ def find_sportsru_match_url(home_ru: str, away_ru: str, start_msk: dt.datetime) 
     u = find_sportsru_match_url_via_calendar(home_ru, away_ru, start_msk)
     if u:
         return u
-    # пробуем поиск на дату старта и соседние
     for delta in (0, -1, 1):
         u = find_sportsru_match_url_via_search(home_ru, away_ru, (start_msk + dt.timedelta(days=delta)).date())
         if u:
@@ -433,34 +427,29 @@ def match_goals(nhl_goals: List[dict], ru_goals: List[dict]) -> List[dict]:
             alt = f"{int(mm)}:{ss}"
             cand = [j for j in by_ptime.get((p, alt), []) if j not in used]
         if cand:
-            out.append(take(cand[0]))
-            continue
+            out.append(take(cand[0])); continue
 
         # 2) by score
         cand = [j for j in by_score.get(sc, []) if j not in used]
         if cand:
-            out.append(take(cand[0]))
-            continue
+            out.append(take(cand[0])); continue
 
         # 3) nearest time in same period (±15s)
         nhl_sec = mmss_to_seconds(t)
         best = None
         for j, rg in enumerate(ru_goals):
-            if j in used or rg["period"] != p:
-                continue
+            if j in used or rg["period"] != p: continue
             diff = abs(mmss_to_seconds(rg["t"]) - nhl_sec)
             if diff <= 15:
                 if (best is None) or diff < best[0]:
                     best = (diff, j)
         if best:
-            out.append(take(best[1]))
-            continue
+            out.append(take(best[1])); continue
 
         # 4) next unused by order
         fallback = next((j for j in range(len(ru_goals)) if j not in used), None)
         if fallback is not None:
-            out.append(take(fallback))
-            continue
+            out.append(take(fallback)); continue
 
         out.append({"who": "—", "assists": []})
 
@@ -475,15 +464,18 @@ def build_match_block(g: dict) -> str:
     final_away = pbp.get("awayTeam", {}).get("score", 0)
     decision = (pbp.get("gameOutcome") or {}).get("lastPeriodType")  # REG/OT/SO
 
-    # Голы NHL (в хронологическом порядке)
+    # Голы NHL (в хронологическом порядке) — теперь с корректным счётом из details.*
     nhl_goals: List[dict] = []
     for ev in pbp.get("plays", []):
-        if (ev.get("typeDescKey") or "").lower() != "goal":
+        if str(ev.get("typeDescKey", "")).lower() != "goal":
             continue
-        per = int((ev.get("periodDescriptor") or {}).get("number") or 0)
+        per = int((ev.get("periodDescriptor") or {}).get("number") or ev.get("period") or 0)
         t_elapsed = to_elapsed_mmss(per, ev.get("timeInPeriod"), ev.get("timeRemaining"))
-        hs = ev.get("homeScore", 0)
-        as_ = ev.get("awayScore", 0)
+
+        det = ev.get("details") or {}
+        hs = det.get("homeScore", ev.get("homeScore", 0)) or 0
+        as_ = det.get("awayScore", ev.get("awayScore", 0)) or 0
+
         nhl_goals.append({"period": per, "t": t_elapsed, "score": f"{hs}:{as_}"})
 
     # Страница матча на sports.ru
@@ -495,8 +487,16 @@ def build_match_block(g: dict) -> str:
 
     ru_goals, so_winner = parse_sportsru_goals(url)
 
-    # Сопоставим списки
-    ru_rows = match_goals(nhl_goals, ru_goals)
+    # Попытка сопоставить, иначе — печатаем как на sports.ru
+    ru_rows: List[dict] = []
+    use_ru_direct = False
+    if nhl_goals and ru_goals:
+        ru_rows = match_goals(nhl_goals, ru_goals)
+        placeholders = sum(1 for r in ru_rows if r["who"] == "—")
+        if placeholders >= max(1, len(ru_rows) // 2):
+            use_ru_direct = True
+    else:
+        use_ru_direct = True
 
     # Заголовок (жирным победителя)
     home_line = f"{h_emoji} «{h_ru}»: {final_home}"
@@ -510,17 +510,24 @@ def build_match_block(g: dict) -> str:
 
     # Печать по периодам
     goals_by_period: Dict[int, List[str]] = {}
-    for ev, names in zip(nhl_goals, ru_rows):
-        line = f"{ev['score']} – {abs_time(ev['period'], ev['t'])} {names['who']}"
-        if names["assists"]:
-            line += f" ({', '.join(names['assists'])})"
-        goals_by_period.setdefault(ev["period"], []).append(line)
+
+    if not use_ru_direct:
+        # печатаем по NHL-порядку, но с кириллицей и счётом из NHL
+        for ev, names in zip(nhl_goals, ru_rows):
+            line = f"{ev['score']} – {abs_time(ev['period'], ev['t'])} {names['who']}"
+            if names["assists"]:
+                line += f" ({', '.join(names['assists'])})"
+            goals_by_period.setdefault(ev["period"], []).append(line)
+    else:
+        # печатаем ровно как на sports.ru (их счёт/время/кириллица)
+        for rg in ru_goals:
+            line = f"{rg['score']} – {abs_time(rg['period'], rg['t'])} {rg['who']}"
+            if rg["assists"]:
+                line += f" ({', '.join(rg['assists'])})"
+            goals_by_period.setdefault(rg["period"], []).append(line)
 
     for p in sorted(goals_by_period.keys()):
-        if p <= 3:
-            parts.append(f"<i>{p}-й период</i>")
-        else:
-            parts.append(f"<i>Овертайм №{p-3}</i>")
+        parts.append(f"<i>{p}-й период</i>" if p <= 3 else f"<i>Овертайм №{p-3}</i>")
         parts.extend(goals_by_period[p])
 
     if decision == "SO" and so_winner:
