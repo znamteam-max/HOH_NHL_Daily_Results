@@ -521,7 +521,7 @@ GOAL_LINE_RE = re.compile(
 PERIOD_HEADERS = [
     (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
     (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
-    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re_U), 3),
+    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
     (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),
 ]
 
