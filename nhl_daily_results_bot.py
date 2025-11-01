@@ -62,7 +62,7 @@ def make_session():
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"], raise_on_status=False)
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.3"})
+    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.4"})
     return s
 S = make_session()
 
@@ -152,6 +152,20 @@ def collect_games_for_msk_day(report_d: dt.date):
     return out
 
 # ---------------- standings / records ----------------
+def _norm_tri(v):
+    # teamAbbrev может быть строкой или словарём; нормализуем
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        for k in ("default","en","EN","ru"):
+            if k in v and isinstance(v[k], str) and v[k]:
+                return v[k].strip()
+        # попытка взять первое строковое значение
+        for x in v.values():
+            if isinstance(x, str) and x:
+                return x.strip()
+    return ""
+
 def load_team_records() -> dict:
     """
     Возвращает { TRI: (w,l,ot,pts) }
@@ -163,11 +177,13 @@ def load_team_records() -> dict:
         j = r.json() or {}
         m = {}
         for row in (j.get("standings") or []):
-            tri = row.get("teamAbbrev") or row.get("teamAbbrevDefault") or ""
-            w = int(row.get("wins", 0))
-            l = int(row.get("losses", 0))
-            ot = int(row.get("otLosses", 0))
-            pts = int(row.get("points", 2*w + ot))
+            tri = _norm_tri(row.get("teamAbbrev")) or (row.get("teamAbbrevDefault") or "")
+            if not isinstance(tri, str): tri = _norm_tri(tri)
+            w = int(row.get("wins", 0) or 0)
+            l = int(row.get("losses", 0) or 0)
+            ot = int(row.get("otLosses", 0) or 0)
+            pts = int(row.get("points", 2*w + ot) or 2*w + ot)
+            tri = tri.strip()
             if tri:
                 m[tri] = (w,l,ot,pts)
         dbg("records loaded:", len(m))
@@ -194,8 +210,7 @@ def extract_goal_events(pbp_json, home_tri, away_tri, home_id, away_id):
     """
     Возвращает список голов с:
       abs_sec, period, home_score, away_score, team ('HOME'|'AWAY')
-    Приоритетно используем homeScore/awayScore из события.
-    Определяем принадлежность по teamId/details.eventOwnerTeamId (fallback — по tri).
+    Приоритетно используем homeScore/awayScore из события; иначе — расчёт по teamId.
     """
     out = []
     for p in _iter_plays(pbp_json):
@@ -212,9 +227,9 @@ def extract_goal_events(pbp_json, home_tri, away_tri, home_id, away_id):
         per = int((pd.get("number") if isinstance(pd, dict) else 0) or p.get("period") or 0) or 1
         abs_sec = (per-1)*20*60 + mm*60 + ss
 
-        # --- чей гол ---
+        # чей гол — по teamId / details.eventOwnerTeamId / tri
         ev_team_id = None
-        if "teamId" in p and isinstance(p["teamId"], int):
+        if isinstance(p.get("teamId"), int):
             ev_team_id = p["teamId"]
         elif isinstance(p.get("team"), dict) and isinstance(p["team"].get("id"), int):
             ev_team_id = p["team"]["id"]
@@ -228,17 +243,15 @@ def extract_goal_events(pbp_json, home_tri, away_tri, home_id, away_id):
         elif ev_team_id == away_id:
             who = "AWAY"
         else:
-            # Фоллбек по tri, если id не дали/нестандарт
             if tri == home_tri: who = "HOME"
             elif tri == away_tri: who = "AWAY"
             else:
-                # как минимум отметим и считаем по ходу
-                dbg("WARN: cannot map teamId/tri -> assume AWAY", {"tri":tri,"hid":home_id,"aid":away_id})
+                dbg("WARN: cannot map team -> assume AWAY", {"tri":tri,"hid":home_id,"aid":away_id})
                 who = "AWAY"
 
-        # --- счёт из события, если есть ---
         hs = p.get("homeScore")
         as_ = p.get("awayScore")
+
         out.append({
             "abs_sec": abs_sec,
             "period": per,
@@ -250,13 +263,12 @@ def extract_goal_events(pbp_json, home_tri, away_tri, home_id, away_id):
 
     out.sort(key=lambda x: x["abs_sec"])
 
-    # Проставляем счёт.
+    # Проставляем счёт «дом:гости».
     home = away = 0
     for e in out:
         if e["home_score_event"] is not None and e["away_score_event"] is not None:
             e["home_score"] = e["home_score_event"]
             e["away_score"] = e["away_score_event"]
-            # синхронизируем накопитель (на случай микса событий)
             home, away = e["home_score"], e["away_score"]
         else:
             if e["team"] == "HOME": home += 1
@@ -303,11 +315,10 @@ def parse_lineups_goals(html_text):
     res.sort(key=lambda x: x["abs_sec"])
     return res
 
-# Парсер страницы матча (трансляция): ищем «Гол!» и ближайшее время перед ним.
+# Парсер страницы матча (трансляция): «Гол!» и «Ассистент(ы):»
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
 def parse_matchpage_goals(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
-    # В трансляции время и событие часто идут соседними блоками.
     items = soup.get_text("\n", strip=True).split("\n")
     res, seen = [], set()
     last_time = None
@@ -318,13 +329,7 @@ def parse_matchpage_goals(html_text):
             last_time = tm.group(1)
             continue
         if "Гол!" in line:
-            # автор после "Гол!  "
             author = line.split("Гол!",1)[1].strip()
-            # иногда после автора отдельно строка "Ассистент(ы): …"
-            # попробуем выцепить ассистов в той же строке в скобках, иначе добавим позже
-            assists = ""
-            # ищем следующую строку «Ассистент» уже вторым проходом:
-            # (упростим — вторая фаза ниже)
             if last_time and re.search(r"[А-ЯЁа-яё]", author):
                 mm, ss = [int(x) for x in last_time.split(":")]
                 abs_sec = mm*60 + ss
@@ -334,36 +339,71 @@ def parse_matchpage_goals(html_text):
                 res.append({"abs_sec": abs_sec, "scorer_ru": author, "assists_ru": ""})
             last_time = None
         elif line.startswith("Ассист"):
-            # добавим ассистов к последнему голу, если есть
             if res:
                 assists = line.split(":",1)[1].strip()
                 res[-1]["assists_ru"] = assists
     res.sort(key=lambda x: x["abs_sec"])
     return res
 
+# Поиск матча через календарь клуба (фоллбек)
+def find_match_slug_via_club_calendar(team_slug:str, opp_slug:str):
+    url = f"https://www.sports.ru/hockey/club/{team_slug}/calendar/"
+    html = fetch_url(url)
+    if not html: return None
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/hockey/match/"): continue
+        slug = href.strip("/").split("/", 2)[-1]  # hockey/match/<slug>/
+        if opp_slug in slug and (team_slug in slug):
+            return slug.rstrip("/")
+    return None
+
 def get_ru_goals_for_pair(away_tri, home_tri):
     slug_a, slug_b = sports_slug_for_pair(away_tri, home_tri)
+    tried = []
+
+    # 1) прямые слаги
     for slug in (slug_a, slug_b):
         if not slug: continue
-        # 1) lineups
+        tried.append(slug)
         html = fetch_url(f"https://www.sports.ru/hockey/match/{slug}/lineups/")
         if html:
             g = parse_lineups_goals(html)
             if g:
                 dbg("sports.ru matched lineups:", slug, "goals:", len(g))
                 return g
-        # 2) трансляция
         html2 = fetch_url(f"https://www.sports.ru/hockey/match/{slug}/")
         if html2:
             g2 = parse_matchpage_goals(html2)
             if g2:
                 dbg("sports.ru matched matchpage:", slug, "goals:", len(g2))
                 return g2
-    dbg("sports.ru no goals for pair", away_tri, home_tri)
+
+    # 2) календарь клуба: ищем правильный slug
+    a_slug = SPORTS_SLUG.get(away_tri); h_slug = SPORTS_SLUG.get(home_tri)
+    for team_slug, opp_slug in ((a_slug, h_slug), (h_slug, a_slug)):
+        if not team_slug or not opp_slug: continue
+        match_slug = find_match_slug_via_club_calendar(team_slug, opp_slug)
+        if match_slug and match_slug not in tried:
+            tried.append(match_slug)
+            html = fetch_url(f"https://www.sports.ru/hockey/match/{match_slug}/lineups/")
+            if html:
+                g = parse_lineups_goals(html)
+                if g:
+                    dbg("sports.ru matched via club calendar (lineups):", match_slug, "goals:", len(g))
+                    return g
+            html2 = fetch_url(f"https://www.sports.ru/hockey/match/{match_slug}/")
+            if html2:
+                g2 = parse_matchpage_goals(html2)
+                if g2:
+                    dbg("sports.ru matched via club calendar (matchpage):", match_slug, "goals:", len(g2))
+                    return g2
+
+    dbg("sports.ru no goals for pair", away_tri, home_tri, "tried:", tried)
     return []
 
 def attach_ru_names_to_pbp(pbp_events, ru_events):
-    # матчим по ближайшему времени ±2 сек
     for e in pbp_events:
         best=None; diff_best=999
         for r in ru_events:
@@ -377,6 +417,14 @@ def attach_ru_names_to_pbp(pbp_events, ru_events):
             e["scorer_ru"]  = ""
             e["assists_ru"] = ""
 
+# победный буллит с Sports.ru (если встречается в тексте)
+def parse_matchpage_shootout_winner(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    txt = soup.get_text("\n", strip=True)
+    m = re.search(r"Победный буллит\s*—\s*([А-ЯЁ][\w\-\s\.]+)", txt)
+    if m: return m.group(1).strip()
+    return ""
+
 # ---------------- вывод ----------------
 def fmt_team_line(tri_home, tri_away, home_score, away_score, rec_map):
     eh = TEAM_EMOJI.get(tri_home,"🏒"); ea = TEAM_EMOJI.get(tri_away,"🏒")
@@ -387,7 +435,7 @@ def fmt_team_line(tri_home, tri_away, home_score, away_score, rec_map):
     rec_a = f" ({wlh_away[0]}-{wlh_away[1]}-{wlh_away[2]}, {wlh_away[3]} о.)" if wlh_away else ""
     return f"{eh} {th}: {home_score}{rec_h}\n{ea} {ta}: {away_score}{rec_a}\n"
 
-def build_match_block(ev, goals, has_shootout, rec_map):
+def build_match_block(ev, goals, has_shootout, rec_map, so_winner_ru=""):
     tri_home = (ev.get("homeTeam") or {}).get("abbrev")
     tri_away = (ev.get("awayTeam") or {}).get("abbrev")
     home_score = int((ev.get("homeTeam") or {}).get("score") or 0)
@@ -413,7 +461,10 @@ def build_match_block(ev, goals, has_shootout, rec_map):
         lines.append(f"{score_str} – {t} {who}{a}")
 
     if has_shootout:
-        lines.append("Победный буллит — (Sports.ru)")
+        if so_winner_ru:
+            lines.append(f"Победный буллит — {so_winner_ru}")
+        else:
+            lines.append("Победный буллит —")
     lines.append("")
     return "\n".join(lines)
 
@@ -439,7 +490,7 @@ def build_report():
 
         dbg(f"Game {gid}: {tri_home} (id:{id_home}) vs {tri_away} (id:{id_away})")
 
-        goals=[]; has_so=False
+        goals=[]; has_so=False; so_winner_ru=""
         try:
             pbp = load_pbp(gid)
             goals = extract_goal_events(pbp, tri_home, tri_away, id_home, id_away)
@@ -449,16 +500,31 @@ def build_report():
         except Exception as e:
             dbg("PBP error:", repr(e))
 
+        ru_events=[]
         try:
             ru_events = get_ru_goals_for_pair(tri_away, tri_home)
+            # Попробуем вынуть победный буллит (если был) — с той же страницы матча
+            if has_so:
+                sa, sb = sports_slug_for_pair(tri_away, tri_home)
+                pages = []
+                if sa:
+                    pages.append(f"https://www.sports.ru/hockey/match/{sa}/")
+                if sb and (not sa or sb != sa):
+                    pages.append(f"https://www.sports.ru/hockey/match/{sb}/")
+                for u in pages:
+                    html = fetch_url(u)
+                    if not html: continue
+                    name = parse_matchpage_shootout_winner(html)
+                    if name:
+                        so_winner_ru = name
+                        break
         except Exception as e:
             dbg("Sports.ru parse error:", repr(e))
-            ru_events = []
 
         if goals and ru_events:
             attach_ru_names_to_pbp(goals, ru_events)
 
-        blocks.append(build_match_block(ev, goals, has_so, rec_map))
+        blocks.append(build_match_block(ev, goals, has_so, rec_map, so_winner_ru))
 
     return "\n".join(blocks).rstrip()
 
