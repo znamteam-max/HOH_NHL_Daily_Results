@@ -19,6 +19,20 @@ ENV:
   beautifulsoup4==4.12.3
 """
 
+# вверху файла
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+TZ_PT = ZoneInfo("America/Los_Angeles")
+
+def resolve_pt_report_date():
+    s = os.getenv("REPORT_DATE_PT","").strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except Exception:
+        return None
+
 import os, sys, re, datetime as dt
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Optional, Set
