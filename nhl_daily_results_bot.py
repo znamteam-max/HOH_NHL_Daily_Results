@@ -43,7 +43,6 @@ TEAM_RU = {
     "VAN":"«Ванкувер»","EDM":"«Эдмонтон»","BOS":"«Бостон»","CAR":"«Каролина»",
     "PIT":"«Питтсбург»"
 }
-# slugs sports.ru
 SPORTS_SLUG = {
     "VGK":"vegas-golden-knights","COL":"colorado-avalanche","WSH":"washington-capitals",
     "NYI":"new-york-islanders","ANA":"anaheim-ducks","DET":"detroit-red-wings",
@@ -53,7 +52,6 @@ SPORTS_SLUG = {
     "NYR":"new-york-rangers","VAN":"vancouver-canucks","EDM":"edmonton-oilers",
     "BOS":"boston-bruins","CAR":"carolina-hurricanes","PIT":"pittsburgh-penguins"
 }
-# названия для championat (поиск в тексте календаря)
 CHAMP_TEAM_RU = {
     "VGK":["Вегас"],
     "COL":["Колорадо","Эвеланш"],
@@ -71,7 +69,7 @@ CHAMP_TEAM_RU = {
     "DAL":["Даллас","Старз"],
     "CGY":["Калгари","Флэймз","Флеймз","Флэймс"],
     "NYR":["Рейнджерс","Нью-Йорк Рейнджерс"],
-    "VAN":["Ванкувер","Кэнакс","Кэнакс","Кэнакс"],
+    "VAN":["Ванкувер","Кэнакс"],
     "EDM":["Эдмонтон","Ойлерз","Ойлерс"],
     "BOS":["Бостон","Брюинз","Брюинс"],
     "CAR":["Каролина","Харрикейнз","Харрикейнс"],
@@ -87,7 +85,7 @@ def make_session():
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"], raise_on_status=False)
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.5"})
+    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.6"})
     return s
 S = make_session()
 
@@ -295,18 +293,26 @@ def detect_shootout(pbp_json) -> bool:
     so = summary.get("shootout") or {}
     return bool(so) or (summary.get("hasShootout") is True)
 
-# ---------------- Sports.ru ----------------
-def sports_slug_for_pair(away_tri, home_tri):
-    a = SPORTS_SLUG.get(away_tri); h = SPORTS_SLUG.get(home_tri)
-    if not a or not h: return None, None
-    return f"{a}-vs-{h}", f"{h}-vs-{a}"
-
+# ---------------- общие утилиты для парсинга страниц ----------------
 def fetch_url(url):
     dbg("GET", url)
     r = S.get(url, timeout=25)
     if r.status_code != 200: return None
     return r.text
 
+TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
+
+def sanitize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def assists_sanitize(s: str) -> str:
+    s = s.replace(" и ", ", ")
+    s = s.replace("Ассистенты:", "").replace("Ассистент:", "").replace("Передачи:", "")
+    s = s.replace("Ассистенты", "").replace("Ассистент", "").replace("Передачи", "")
+    s = s.strip(" :–—-")
+    return sanitize_spaces(s)
+
+# ---------------- Sports.ru ----------------
 GOAL_LINE_RE_LINEUPS = re.compile(r"(\d{1,2}:\d{2})\s*([А-ЯЁ][^()\n]+?)(?:\s*\(([^)]+)\))?(?:\s|$)")
 def parse_lineups_goals(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
@@ -314,11 +320,9 @@ def parse_lineups_goals(html_text):
     seen=set(); res=[]
     for m in GOAL_LINE_RE_LINEUPS.finditer(text):
         tmm = m.group(1)
-        who = (m.group(2) or "").strip()
-        ass = (m.group(3) or "").strip()
+        who = sanitize_spaces(m.group(2) or "")
+        ass = assists_sanitize(m.group(3) or "")
         if not re.search(r"[А-ЯЁа-яё]", who): continue
-        who = re.sub(r"\s+", " ", who)
-        ass = re.sub(r"\s+", " ", ass)
         mm, ss = [int(x) for x in tmm.split(":")]
         abs_sec = mm*60 + ss
         k=(abs_sec, who)
@@ -328,7 +332,6 @@ def parse_lineups_goals(html_text):
     res.sort(key=lambda x: x["abs_sec"])
     return res
 
-TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
 def parse_matchpage_goals(html_text, src_tag="sports"):
     soup = BeautifulSoup(html_text, "html.parser")
     items = soup.get_text("\n", strip=True).split("\n")
@@ -340,8 +343,10 @@ def parse_matchpage_goals(html_text, src_tag="sports"):
         if tm:
             last_time = tm.group(1)
             continue
-        if "Гол!" in line:
-            author = line.split("Гол!",1)[1].strip()
+        if re.search(r"\bГол!?(\s|:|—|-)", line, flags=re.I) or re.search(r"Заброшенн\w*\s+шайб", line, flags=re.I):
+            # вытянуть автора после слова "Гол"/"Заброшенная шайба"
+            author = re.split(r"\bГол!?[:\s–—-]*|\bЗаброшенн\w*\s+шайб\w*[:\s–—-]*", line, flags=re.I)[-1]
+            author = sanitize_spaces(author)
             if last_time and re.search(r"[А-ЯЁа-яё]", author):
                 mm, ss = [int(x) for x in last_time.split(":")]
                 abs_sec = mm*60 + ss
@@ -350,10 +355,9 @@ def parse_matchpage_goals(html_text, src_tag="sports"):
                 seen.add(k)
                 res.append({"abs_sec": abs_sec, "scorer_ru": author, "assists_ru": "", "src":src_tag})
             last_time = None
-        elif line.startswith("Ассист"):
+        elif re.match(r"^(Ассистент|Ассистенты|Передачи)\s*:", line):
             if res:
-                assists = line.split(":",1)[1].strip()
-                res[-1]["assists_ru"] = assists
+                res[-1]["assists_ru"] = assists_sanitize(line.split(":",1)[1])
     res.sort(key=lambda x: x["abs_sec"])
     return res
 
@@ -361,8 +365,13 @@ def parse_matchpage_shootout_winner(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
     txt = soup.get_text("\n", strip=True)
     m = re.search(r"Победный буллит\s*—\s*([А-ЯЁ][\w\-\s\.]+)", txt)
-    if m: return m.group(1).strip()
+    if m: return sanitize_spaces(m.group(1))
     return ""
+
+def sports_slug_for_pair(away_tri, home_tri):
+    a = SPORTS_SLUG.get(away_tri); h = SPORTS_SLUG.get(home_tri)
+    if not a or not h: return None, None
+    return f"{a}-vs-{h}", f"{h}-vs-{a}"
 
 def find_match_slug_via_club_calendar(team_slug:str, opp_slug:str):
     url = f"https://www.sports.ru/hockey/club/{team_slug}/calendar/"
@@ -421,20 +430,15 @@ def get_ru_goals_from_sports(away_tri, home_tri):
     return [], ""
 
 # ---------------- Championat fallback ----------------
-CHAMP_TOURNAMENT_ID = "6606"  # текущая НХЛ у Чемпа
+CHAMP_TOURNAMENT_ID = "6606"
 
 def champ_calendar_urls_for_date(msk_date: dt.date):
-    # смотрим текущий и предыдущий месяц
     months = sorted({msk_date.month, (msk_date.month-1) or 12})
-    urls = [f"https://www.championat.com/hockey/_nhl/tournament/{CHAMP_TOURNAMENT_ID}/calendar/?m={m}" for m in months]
-    return urls
+    return [f"https://www.championat.com/hockey/_nhl/tournament/{CHAMP_TOURNAMENT_ID}/calendar/?m={m}" for m in months]
 
 def champ_text_has_any(text, keys):
     t = text.lower()
-    for k in keys:
-        if k.lower() in t:
-            return True
-    return False
+    return any(k.lower() in t for k in keys)
 
 def champ_find_match_links(msk_date: dt.date, away_tri, home_tri):
     cand = []
@@ -454,24 +458,58 @@ def champ_find_match_links(msk_date: dt.date, away_tri, home_tri):
             for a in a_tags:
                 href = a["href"]
                 if "/match/" in href:
-                    if href.startswith("http"):
-                        cand.append(href)
-                    else:
-                        cand.append("https://www.championat.com" + href)
+                    full = href if href.startswith("http") else ("https://www.championat.com" + href)
+                    cand.append(full.rstrip("/"))
                     break
     return cand
 
+def champ_extract_goals_from_text(text: str, src_tag="champ"):
+    # Общий extractor для чемпионат /online и основной страницы
+    lines = [sanitize_spaces(x) for x in text.split("\n")]
+    res, seen = [], set()
+    last_time = None
+    for line in lines:
+        if not line: continue
+        tm = TIME_RE.search(line)
+        if tm:
+            last_time = tm.group(1)
+        # события гола
+        if re.search(r"\bГол!?(\s|:|—|-)|Заброшенн\w*\s+шайб", line, flags=re.I):
+            # Автор после "Гол" или после двоеточия
+            author = re.split(r"\bГол!?[:\s–—-]*|\bЗаброшенн\w*\s+шайб\w*[:\s–—-]*", line, flags=re.I)[-1]
+            author = sanitize_spaces(author)
+            if last_time and re.search(r"[А-ЯЁа-яё]", author):
+                mm, ss = [int(x) for x in last_time.split(":")]
+                abs_sec = mm*60 + ss
+                k=(abs_sec, author)
+                if k not in seen:
+                    seen.add(k)
+                    res.append({"abs_sec": abs_sec, "scorer_ru": author, "assists_ru": "", "src":src_tag})
+            last_time = None
+        elif re.match(r"^(Ассистент|Ассистенты|Передачи)\s*:", line):
+            if res:
+                res[-1]["assists_ru"] = assists_sanitize(line.split(":",1)[1])
+    res.sort(key=lambda x: x["abs_sec"])
+    return res
+
 def champ_parse_match_goals(match_url):
-    dbg("GET", match_url)
-    r = S.get(match_url, timeout=25)
-    if r.status_code != 200: return [], ""
-    # Чемп часто грузит события сразу на странице; парсим так же, как sports (универсальный)
-    goals = parse_matchpage_goals(r.text, src_tag="champ")
-    # победный буллит, если встречается
-    so_name = ""
-    m = re.search(r"Победный буллит\s*—\s*([А-ЯЁ][\w\-\s\.]+)", r.text)
-    if m: so_name = m.group(1).strip()
-    return goals, so_name
+    # 1) пробуем /online (там чаще всего «Гол!» и «Ассистенты» в тексте)
+    online = match_url.rstrip("/") + "/online"
+    for u in (online, match_url):
+        dbg("GET", u)
+        r = S.get(u, timeout=25)
+        if r.status_code != 200: 
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text("\n", strip=True)
+        goals = champ_extract_goals_from_text(text, src_tag="champ")
+        if goals:
+            # победный буллит, если попался
+            so_name = ""
+            m = re.search(r"Победный буллит\s*—\s*([А-ЯЁ][\w\-\s\.]+)", text)
+            if m: so_name = sanitize_spaces(m.group(1))
+            return goals, so_name
+    return [], ""
 
 def get_ru_goals_from_champ(msk_date: dt.date, away_tri, home_tri):
     links = champ_find_match_links(msk_date, away_tri, home_tri)
@@ -506,7 +544,6 @@ def fmt_team_line(tri_home, tri_away, home_score, away_score, rec_map):
     wlh_away = rec_map.get(tri_away)
     rec_h = f" ({wlh_home[0]}-{wlh_home[1]}-{wlh_home[2]}, {wlh_home[3]} о.)" if wlh_home else ""
     rec_a = f" ({wlh_away[0]}-{wlh_away[1]}-{wlh_away[2]}, {wlh_away[3]} о.)" if wlh_away else ""
-    # жирным выделять счёт победителя не просили здесь, но можно добавить при желании
     return f"{eh} {th}: {home_score}{rec_h}\n{ea} {ta}: {away_score}{rec_a}\n"
 
 def build_match_block(ev, goals, has_shootout, rec_map, so_winner_ru=""):
@@ -574,10 +611,10 @@ def build_report():
         except Exception as e:
             dbg("PBP error:", repr(e))
 
-        # 1) пробуем Sports.ru
+        # 1) Sports.ru
         ru_events, so1 = get_ru_goals_from_sports(tri_away, tri_home)
 
-        # 2) если пусто — Чемпионат
+        # 2) Championat fallback (+/online)
         if not ru_events:
             ru_events, so2 = get_ru_goals_from_champ(report_d, tri_away, tri_home)
             if so2: so_winner_ru = so2
@@ -587,7 +624,7 @@ def build_report():
         # Склейка имён
         if goals and ru_events:
             src = ru_events[0].get("src","sports")
-            tol = 2 if src == "sports" else 90
+            tol = 2 if src == "sports" else 120  # Чемп — более щедрый допуск
             attach_ru_names_to_pbp(goals, ru_events, tolerance_sec=tol)
 
         blocks.append(build_match_block(ev, goals, has_so, rec_map, so_winner_ru))
