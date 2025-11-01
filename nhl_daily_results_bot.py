@@ -33,6 +33,7 @@ TZ_MSK = ZoneInfo("Europe/Moscow")
 API = "https://api-web.nhle.com"
 SPORTS_CAL = "https://www.sports.ru/hockey/tournament/nhl/calendar/"
 SPORTS_SEARCH = "https://www.sports.ru/search/"
+SPORTS_MATCH_BASE = "https://www.sports.ru/hockey/match/"
 
 TEAM_META: Dict[str, Tuple[str, str]] = {
     "NJD": ("😈", "Нью-Джерси"),
@@ -70,6 +71,50 @@ TEAM_META: Dict[str, Tuple[str, str]] = {
     "VGK": ("🎰", "Вегас"),
 }
 
+# Слаги клубов на sports.ru (для прямого построения URL)
+ABBR_TO_SLUG: Dict[str, str] = {
+    "NJD": "new-jersey-devils",
+    "NYI": "new-york-islanders",
+    "NYR": "new-york-rangers",
+    "PHI": "philadelphia-flyers",
+    "PIT": "pittsburgh-penguins",
+    "BOS": "boston-bruins",
+    "BUF": "buffalo-sabres",
+    "MTL": "montreal-canadiens",
+    "OTT": "ottawa-senators",
+    "TOR": "toronto-maple-leafs",
+    "CAR": "carolina-hurricanes",
+    "FLA": "florida-panthers",
+    "TBL": "tampa-bay-lightning",
+    "WSH": "washington-capitals",
+    "CHI": "chicago-blackhawks",
+    "DET": "detroit-red-wings",
+    "NSH": "nashville-predators",
+    "STL": "st-louis-blues",          # без точки в "st"
+    "CGY": "calgary-flames",
+    "EDM": "edmonton-oilers",
+    "VAN": "vancouver-canucks",
+    "ANA": "anaheim-ducks",
+    "DAL": "dallas-stars",
+    "LAK": "los-angeles-kings",
+    "SJS": "san-jose-sharks",
+    "CBJ": "columbus-blue-jackets",
+    "COL": "colorado-avalanche",
+    "MIN": "minnesota-wild",
+    "WPG": "winnipeg-jets",
+    "SEA": "seattle-kraken",
+    "VGK": "vegas-golden-knights",
+    # Юта: sports.ru использует "utah-hc" (иногда "utah-hockey-club" — попробуем оба)
+    "UTA": "utah-hc",
+    "ARI": "arizona-coyotes",  # старый клуб на всякий
+}
+
+# альтернативные слаги, если основной не открылся
+ALT_SLUGS: Dict[str, List[str]] = {
+    "STL": ["st-louis-blues", "st.-louis-blues"],
+    "UTA": ["utah-hc", "utah-hockey-club", "utah"],
+}
+
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 
@@ -87,7 +132,7 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "NHL-RU-LiveMerge/1.1",
+        "User-Agent": "NHL-RU-LiveMerge/1.2",
         "Accept": "text/html,application/json,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     })
@@ -217,10 +262,8 @@ def _discover_season_ids_from_html(html: str) -> Set[str]:
 def _calendar_urls_for_month(d_when: dt.datetime) -> List[str]:
     mm = d_when.month
     urls: List[str] = []
-    # База
     urls.append(SPORTS_CAL)
     urls.append(f"{SPORTS_CAL}?m={mm}")
-    # Попробуем собрать все s=… с двух страниц (без m и с m)
     try:
         base_html = get_html(SPORTS_CAL)
     except Exception:
@@ -233,7 +276,6 @@ def _calendar_urls_for_month(d_when: dt.datetime) -> List[str]:
     for sid in season_ids:
         urls.append(f"{SPORTS_CAL}?s={sid}")
         urls.append(f"{SPORTS_CAL}?m={mm}&s={sid}")
-    # Также захватим соседний месяц — игры на стыке месяцев
     mm_prev = 12 if mm == 1 else mm-1
     mm_next = 1 if mm == 12 else mm+1
     urls.append(f"{SPORTS_CAL}?m={mm_prev}")
@@ -241,18 +283,15 @@ def _calendar_urls_for_month(d_when: dt.datetime) -> List[str]:
     for sid in season_ids:
         urls.append(f"{SPORTS_CAL}?m={mm_prev}&s={sid}")
         urls.append(f"{SPORTS_CAL}?m={mm_next}&s={sid}")
-    # Убираем дубли, сохраняя порядок
-    seen = set()
-    compact = []
+    seen = set(); compact=[]
     for u in urls:
         if u not in seen:
-            seen.add(u)
-            compact.append(u)
+            seen.add(u); compact.append(u)
     return compact
 
 def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
     candidate_pages = _calendar_urls_for_month(start_msk)
-    best: Optional[Tuple[int, str]] = None  # (abs_minutes_diff, href)
+    best: Optional[Tuple[int, str]] = None
     fallback_same_day: List[str] = []
 
     for cal_url in candidate_pages:
@@ -273,10 +312,10 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
             a_dt = td_name.find("a")
             dt_text = a_dt.get_text(" ", strip=True) if a_dt else ""
             row_date, row_time = _parse_dt_from_td(dt_text)
-            if row_date is None:
-                continue
+            if row_date is None:  # бывает строка без времени — допустим, но хуже для ранжирования
+                row_date = start_msk.date()
+                row_time = None
 
-            # Допускаем сдвиг даты ±1 день относительно начала по МСК
             if abs((row_date - start_msk.date()).days) > 1:
                 continue
 
@@ -297,8 +336,8 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
             if not href.startswith("http"):
                 href = "https://www.sports.ru" + href
 
-            # если нет времени — просто запомним как кандидат на эту дату
             if row_time is None:
+                # если времени нет, но пара команд совпала — добавим как fallback-кандидат
                 fallback_same_day.append(href)
                 continue
 
@@ -310,8 +349,47 @@ def find_sportsru_match_url_via_calendar(home_ru: str, away_ru: str, start_msk: 
 
     if best is not None:
         return best[1]
-    if len(fallback_same_day) == 1:
+    # если много кандидатов без времени, попробуем отфильтровать по слагам команд
+    if fallback_same_day:
         return fallback_same_day[0]
+    return None
+
+# ───── Прямое построение URL по слагам (надёжный план C)
+def _slug_variants_for_abbr(abbr: str) -> List[str]:
+    base = ABBR_TO_SLUG.get(abbr)
+    if not base:
+        return []
+    alts = ALT_SLUGS.get(abbr, [])
+    return [base] + [s for s in alts if s != base]
+
+def try_match_url_by_slugs(home_abbr: str, away_abbr: str) -> Optional[str]:
+    """
+    Пробуем:
+      /hockey/match/<home>-vs-<away>/
+      /hockey/match/<away>-vs-<home>/
+    с альтернативными слагами.
+    Возвращаем первый, который отдаёт 200 и по тексту похож на страницу матча.
+    """
+    home_slugs = _slug_variants_for_abbr(home_abbr)
+    away_slugs = _slug_variants_for_abbr(away_abbr)
+    pairs: List[Tuple[str, str]] = []
+    for hs in home_slugs:
+        for as_ in away_slugs:
+            pairs.append((hs, as_))
+            pairs.append((as_, hs))  # на всякий — обратный порядок
+
+    seen = set()
+    for hs, as_ in pairs:
+        url = f"{SPORTS_MATCH_BASE}{hs}-vs-{as_}/"
+        if url in seen: continue
+        seen.add(url)
+        try:
+            html = get_html(url)
+        except Exception:
+            continue
+        # грубая проверка, что это страница матча
+        if re.search(r"(Трансляция|Матч|Составы|Статистика)", html, re.I):
+            return url
     return None
 
 # ───── Запасной поиск sports.ru
@@ -328,7 +406,6 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
         if "/hockey/match/" in href and href.endswith(".html"):
             if not href.startswith("http"):
                 href = "https://www.sports.ru" + href
-            # достаточно, чтобы встречалось первое слово команды
             if (home_ru.split()[0] in txt) and (away_ru.split()[0] in txt):
                 cands.append(href)
     if not cands:
@@ -340,13 +417,17 @@ def find_sportsru_match_url_via_search(home_ru: str, away_ru: str, d: dt.date) -
                 cands.append(href)
     return cands[0] if cands else None
 
-def find_sportsru_match_url(home_ru: str, away_ru: str, start_msk: dt.datetime) -> Optional[str]:
+def find_sportsru_match_url(home_ru: str, away_ru: str, start_msk: dt.datetime, home_abbr: str, away_abbr: str) -> Optional[str]:
+    # A: календарь (включая ?m=&s=)
     u = find_sportsru_match_url_via_calendar(home_ru, away_ru, start_msk)
     if u: return u
-    # пробуем поиск на дату старта и соседние
+    # B: поиск
     for delta in (0, -1, 1):
         u = find_sportsru_match_url_via_search(home_ru, away_ru, (start_msk + dt.timedelta(days=delta)).date())
         if u: return u
+    # C: прямой слаг
+    u = try_match_url_by_slugs(home_abbr, away_abbr)
+    if u: return u
     return None
 
 # ───── ТРАНСЛЯЦИЯ sports.ru: извлекаем «Гол!» + ассистентов + абсолютное время (mm:ss)
@@ -426,7 +507,7 @@ GOAL_LINE_RE = re.compile(
 PERIOD_HEADERS = [
     (re.compile(r"\b1[-–]?й\s+период\b", re.I | re.U), 1),
     (re.compile(r"\b2[-–]?й\s+период\b", re.I | re.U), 2),
-    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re.U), 3),
+    (re.compile(r"\b3[-–]?й\s+период\b", re.I | re_U), 3),
     (re.compile(r"\bОвертайм(?:\s*№\s*(\d+))?\b", re.I | re.U), 4),
 ]
 
@@ -565,7 +646,7 @@ def build_match_block(g: dict) -> str:
     # Страница матча на sports.ru
     h_emoji, h_ru = TEAM_META.get(g["home"], ("🏒", g["home"]))
     a_emoji, a_ru = TEAM_META.get(g["away"], ("🏒", g["away"]))
-    url = find_sportsru_match_url(h_ru, a_ru, g["msk"])
+    url = find_sportsru_match_url(h_ru, a_ru, g["msk"], g["home"], g["away"])
     if not url:
         raise RuntimeError(f"Не найден матч на sports.ru для {h_ru} — {a_ru} ({g['msk']:%d.%m})")
 
@@ -581,10 +662,10 @@ def build_match_block(g: dict) -> str:
                     abs_txt = abs_time(it["period"], it["p_rel"]).replace(".", ":")
                 else:
                     abs_txt = "0:00"
-                who = _extract_lastname(it["who"]) or it["who"]
-                ru_live.append({"abs": abs_txt, "who": who, "assists": [ _extract_lastname(a) or a for a in it["assists"] ]})
+                who = (re.findall(r"[А-ЯЁ][а-яё\-]+", it["who"]) or [it["who"]])[-1]
+                ru_live.append({"abs": abs_txt, "who": who, "assists": [ (re.findall(r'[А-ЯЁ][а-яё\-]+', a) or [a])[-1] for a in it["assists"] ]})
         if (not so_winner) and so2:
-            so_winner = _extract_lastname(so2) or so2
+            so_winner = (re.findall(r"[А-ЯЁ][а-яё\-]+", so2) or [so2])[-1]
 
     rows = attach_scores_from_nhl(nhl_goals, ru_live) if ru_live else []
 
@@ -608,7 +689,6 @@ def build_match_block(g: dict) -> str:
 
     for p in sorted(by_p.keys()):
         parts.append(f"<i>{p}-й период</i>" if p <= 3 else f"<i>Овертайм №{p-3}</i>")
-        # Приводим время к mm.ss
         lines = []
         for ln in by_p[p]:
             ln = re.sub(r"(\d{1,3}):(\d{2})(\s+)", lambda m: f"{int(m.group(1))}.{m.group(2)}{m.group(3)}", ln, count=1)
