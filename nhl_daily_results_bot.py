@@ -8,10 +8,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# ===== Конфиг =====
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-FORCE_MSK_DATE = os.getenv("REPORT_DATE_MSK", "").strip()  # YYYY-MM-DD вручную
+FORCE_MSK_DATE = os.getenv("REPORT_DATE_MSK", "").strip()
 DEBUG = True
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -63,7 +62,7 @@ def make_session():
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"], raise_on_status=False)
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.2"})
+    s.headers.update({"User-Agent":"HOH NHL Daily Results/1.3"})
     return s
 S = make_session()
 
@@ -93,7 +92,7 @@ def period_caption(idx: int) -> str:
     if idx == 3: return "_3-й период_"
     return f"_Овертайм №{idx-3}_"
 
-# ---------- отчётная дата ----------
+# ---------------- отчётная дата ----------------
 def resolve_report_date_msk() -> dt.date:
     if FORCE_MSK_DATE:
         try:
@@ -152,10 +151,10 @@ def collect_games_for_msk_day(report_d: dt.date):
     dbg("Collected unique FINAL games:", len(out))
     return out
 
-# ---------- standings (records) ----------
+# ---------------- standings / records ----------------
 def load_team_records() -> dict:
     """
-    Возвращает { 'VGK': '7-3-1', ... }
+    Возвращает { TRI: (w,l,ot,pts) }
     """
     url = "https://api-web.nhle.com/v1/standings/now"
     try:
@@ -165,18 +164,19 @@ def load_team_records() -> dict:
         m = {}
         for row in (j.get("standings") or []):
             tri = row.get("teamAbbrev") or row.get("teamAbbrevDefault") or ""
-            w = row.get("wins", 0)
-            l = row.get("losses", 0)
-            ot = row.get("otLosses", 0)
+            w = int(row.get("wins", 0))
+            l = int(row.get("losses", 0))
+            ot = int(row.get("otLosses", 0))
+            pts = int(row.get("points", 2*w + ot))
             if tri:
-                m[tri] = f"{w}-{l}-{ot}"
+                m[tri] = (w,l,ot,pts)
         dbg("records loaded:", len(m))
         return m
     except Exception as e:
         dbg("records error:", repr(e))
         return {}
 
-# ---------- NHL PBP ----------
+# ---------------- PBP ----------------
 def load_pbp(game_id: int):
     url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
     dbg("GET", url)
@@ -190,35 +190,79 @@ def _iter_plays(pbp_json):
     if isinstance(plays, list): return plays
     return []
 
-def extract_goal_events(pbp_json, home_abbr, away_abbr):
+def extract_goal_events(pbp_json, home_tri, away_tri, home_id, away_id):
+    """
+    Возвращает список голов с:
+      abs_sec, period, home_score, away_score, team ('HOME'|'AWAY')
+    Приоритетно используем homeScore/awayScore из события.
+    Определяем принадлежность по teamId/details.eventOwnerTeamId (fallback — по tri).
+    """
     out = []
     for p in _iter_plays(pbp_json):
-        t = (p.get("typeDescKey") or "").lower()
-        if t != "goal": continue
+        if (p.get("typeDescKey") or "").lower() != "goal":
+            continue
+
         clock = p.get("timeInPeriod") or "00:00"
         try:
             mm, ss = [int(x) for x in clock.split(":")]
         except Exception:
             mm, ss = 0, 0
+
         pd = p.get("periodDescriptor") or {}
         per = int((pd.get("number") if isinstance(pd, dict) else 0) or p.get("period") or 0) or 1
         abs_sec = (per-1)*20*60 + mm*60 + ss
-        tri = ((p.get("team") or {}).get("abbrev") or (p.get("team") or {}).get("triCode") or "")
-        who = "HOME" if tri == home_abbr else "AWAY"
+
+        # --- чей гол ---
+        ev_team_id = None
+        if "teamId" in p and isinstance(p["teamId"], int):
+            ev_team_id = p["teamId"]
+        elif isinstance(p.get("team"), dict) and isinstance(p["team"].get("id"), int):
+            ev_team_id = p["team"]["id"]
+        elif isinstance(p.get("details"), dict) and isinstance(p["details"].get("eventOwnerTeamId"), int):
+            ev_team_id = p["details"]["eventOwnerTeamId"]
+
+        tri = (p.get("team") or {}).get("abbrev") or (p.get("team") or {}).get("triCode") or ""
+
+        if ev_team_id == home_id:
+            who = "HOME"
+        elif ev_team_id == away_id:
+            who = "AWAY"
+        else:
+            # Фоллбек по tri, если id не дали/нестандарт
+            if tri == home_tri: who = "HOME"
+            elif tri == away_tri: who = "AWAY"
+            else:
+                # как минимум отметим и считаем по ходу
+                dbg("WARN: cannot map teamId/tri -> assume AWAY", {"tri":tri,"hid":home_id,"aid":away_id})
+                who = "AWAY"
+
+        # --- счёт из события, если есть ---
+        hs = p.get("homeScore")
+        as_ = p.get("awayScore")
         out.append({
             "abs_sec": abs_sec,
             "period": per,
             "team": who,
-            "tri": tri
+            "tri": tri,
+            "home_score_event": int(hs) if isinstance(hs, int) else None,
+            "away_score_event": int(as_) if isinstance(as_, int) else None
         })
+
     out.sort(key=lambda x: x["abs_sec"])
-    # считаем "дома:в гостях" нарастающим итогом
+
+    # Проставляем счёт.
     home = away = 0
     for e in out:
-        if e["team"] == "HOME": home += 1
-        else: away += 1
-        e["home_score"] = home
-        e["away_score"] = away
+        if e["home_score_event"] is not None and e["away_score_event"] is not None:
+            e["home_score"] = e["home_score_event"]
+            e["away_score"] = e["away_score_event"]
+            # синхронизируем накопитель (на случай микса событий)
+            home, away = e["home_score"], e["away_score"]
+        else:
+            if e["team"] == "HOME": home += 1
+            else: away += 1
+            e["home_score"] = home
+            e["away_score"] = away
     return out
 
 def detect_shootout(pbp_json) -> bool:
@@ -226,31 +270,27 @@ def detect_shootout(pbp_json) -> bool:
     so = summary.get("shootout") or {}
     return bool(so) or (summary.get("hasShootout") is True)
 
-# ---------- Sports.ru /lineups/ ----------
+# ---------------- Sports.ru ----------------
 def sports_slug_for_pair(away_tri, home_tri):
     a = SPORTS_SLUG.get(away_tri); h = SPORTS_SLUG.get(home_tri)
     if not a or not h: return None, None
     return f"{a}-vs-{h}", f"{h}-vs-{a}"
 
-def fetch_sports_lineups(slug):
-    url = f"https://www.sports.ru/hockey/match/{slug}/lineups/"
+def fetch_url(url):
     dbg("GET", url)
     r = S.get(url, timeout=25)
     if r.status_code != 200: return None
     return r.text
 
-# Ищем строки с временем и кириллицей. Пример: "24:48 Уилсон (Чикран, Рой)"
-GOAL_LINE_RE = re.compile(r"(\d{1,2}:\d{2})\s*([А-ЯЁ][^()\n]+?)(?:\s*\(([^)]+)\))?(?:\s|$)")
-
-def parse_sports_lineups_goals(html_text):
+GOAL_LINE_RE_LINEUPS = re.compile(r"(\d{1,2}:\d{2})\s*([А-ЯЁ][^()\n]+?)(?:\s*\(([^)]+)\))?(?:\s|$)")
+def parse_lineups_goals(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
     text = soup.get_text("\n", strip=True)
     seen=set(); res=[]
-    for m in GOAL_LINE_RE.finditer(text):
+    for m in GOAL_LINE_RE_LINEUPS.finditer(text):
         tmm = m.group(1)
         who = (m.group(2) or "").strip()
         ass = (m.group(3) or "").strip()
-        # пропускаем мусор без кириллицы
         if not re.search(r"[А-ЯЁа-яё]", who): continue
         who = re.sub(r"\s+", " ", who)
         ass = re.sub(r"\s+", " ", ass)
@@ -261,8 +301,66 @@ def parse_sports_lineups_goals(html_text):
         seen.add(k)
         res.append({"abs_sec": abs_sec, "scorer_ru": who, "assists_ru": ass})
     res.sort(key=lambda x: x["abs_sec"])
-    dbg("sports.ru goals parsed:", len(res))
     return res
+
+# Парсер страницы матча (трансляция): ищем «Гол!» и ближайшее время перед ним.
+TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
+def parse_matchpage_goals(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    # В трансляции время и событие часто идут соседними блоками.
+    items = soup.get_text("\n", strip=True).split("\n")
+    res, seen = [], set()
+    last_time = None
+    for line in items:
+        line = line.strip()
+        tm = TIME_RE.fullmatch(line)
+        if tm:
+            last_time = tm.group(1)
+            continue
+        if "Гол!" in line:
+            # автор после "Гол!  "
+            author = line.split("Гол!",1)[1].strip()
+            # иногда после автора отдельно строка "Ассистент(ы): …"
+            # попробуем выцепить ассистов в той же строке в скобках, иначе добавим позже
+            assists = ""
+            # ищем следующую строку «Ассистент» уже вторым проходом:
+            # (упростим — вторая фаза ниже)
+            if last_time and re.search(r"[А-ЯЁа-яё]", author):
+                mm, ss = [int(x) for x in last_time.split(":")]
+                abs_sec = mm*60 + ss
+                k=(abs_sec, author)
+                if k in seen: continue
+                seen.add(k)
+                res.append({"abs_sec": abs_sec, "scorer_ru": author, "assists_ru": ""})
+            last_time = None
+        elif line.startswith("Ассист"):
+            # добавим ассистов к последнему голу, если есть
+            if res:
+                assists = line.split(":",1)[1].strip()
+                res[-1]["assists_ru"] = assists
+    res.sort(key=lambda x: x["abs_sec"])
+    return res
+
+def get_ru_goals_for_pair(away_tri, home_tri):
+    slug_a, slug_b = sports_slug_for_pair(away_tri, home_tri)
+    for slug in (slug_a, slug_b):
+        if not slug: continue
+        # 1) lineups
+        html = fetch_url(f"https://www.sports.ru/hockey/match/{slug}/lineups/")
+        if html:
+            g = parse_lineups_goals(html)
+            if g:
+                dbg("sports.ru matched lineups:", slug, "goals:", len(g))
+                return g
+        # 2) трансляция
+        html2 = fetch_url(f"https://www.sports.ru/hockey/match/{slug}/")
+        if html2:
+            g2 = parse_matchpage_goals(html2)
+            if g2:
+                dbg("sports.ru matched matchpage:", slug, "goals:", len(g2))
+                return g2
+    dbg("sports.ru no goals for pair", away_tri, home_tri)
+    return []
 
 def attach_ru_names_to_pbp(pbp_events, ru_events):
     # матчим по ближайшему времени ±2 сек
@@ -279,16 +377,15 @@ def attach_ru_names_to_pbp(pbp_events, ru_events):
             e["scorer_ru"]  = ""
             e["assists_ru"] = ""
 
-# ---------- Формирование текста ----------
-def fmt_team_line(tri_home, tri_away, home_score, away_score, rec_home, rec_away):
+# ---------------- вывод ----------------
+def fmt_team_line(tri_home, tri_away, home_score, away_score, rec_map):
     eh = TEAM_EMOJI.get(tri_home,"🏒"); ea = TEAM_EMOJI.get(tri_away,"🏒")
     th = TEAM_RU.get(tri_home, tri_home); ta = TEAM_RU.get(tri_away, tri_away)
-    hbold = home_score>away_score; abold = away_score>home_score
-    sh = f"**{home_score}**" if hbold else f"{home_score}"
-    sa = f"**{away_score}**" if abold else f"{away_score}"
-    rec_h = f" ({rec_home})" if rec_home else ""
-    rec_a = f" ({rec_away})" if rec_away else ""
-    return f"{eh} {th}: {sh}{rec_h}\n{ea} {ta}: {sa}{rec_a}\n"
+    wlh_home = rec_map.get(tri_home)
+    wlh_away = rec_map.get(tri_away)
+    rec_h = f" ({wlh_home[0]}-{wlh_home[1]}-{wlh_home[2]}, {wlh_home[3]} о.)" if wlh_home else ""
+    rec_a = f" ({wlh_away[0]}-{wlh_away[1]}-{wlh_away[2]}, {wlh_away[3]} о.)" if wlh_away else ""
+    return f"{eh} {th}: {home_score}{rec_h}\n{ea} {ta}: {away_score}{rec_a}\n"
 
 def build_match_block(ev, goals, has_shootout, rec_map):
     tri_home = (ev.get("homeTeam") or {}).get("abbrev")
@@ -296,8 +393,7 @@ def build_match_block(ev, goals, has_shootout, rec_map):
     home_score = int((ev.get("homeTeam") or {}).get("score") or 0)
     away_score = int((ev.get("awayTeam") or {}).get("score") or 0)
 
-    lines = [ fmt_team_line(tri_home, tri_away, home_score, away_score,
-                            rec_map.get(tri_home,""), rec_map.get(tri_away,"")) ]
+    lines = [ fmt_team_line(tri_home, tri_away, home_score, away_score, rec_map) ]
 
     if not goals:
         lines.append("— события матча недоступны\n")
@@ -313,7 +409,6 @@ def build_match_block(ev, goals, has_shootout, rec_map):
         who = g.get("scorer_ru") or "—"
         ass = g.get("assists_ru") or ""
         a = f" ({ass})" if ass else ""
-        # ВАЖНО: всегда распечатываем счёт как "дома:в гостях"
         score_str = f"{g['home_score']}:{g['away_score']}"
         lines.append(f"{score_str} – {t} {who}{a}")
 
@@ -322,7 +417,7 @@ def build_match_block(ev, goals, has_shootout, rec_map):
     lines.append("")
     return "\n".join(lines)
 
-# ---------- Основной поток ----------
+# ---------------- основной поток ----------------
 def build_report():
     report_d = resolve_report_date_msk()
     games = collect_games_for_msk_day(report_d)
@@ -339,34 +434,26 @@ def build_report():
         gid = ev.get("id") or ev.get("gameId")
         tri_home = (ev.get("homeTeam") or {}).get("abbrev")
         tri_away = (ev.get("awayTeam") or {}).get("abbrev")
-        dbg(f"Game {gid}: {tri_home} vs {tri_away}")
+        id_home = int((ev.get("homeTeam") or {}).get("id") or 0)
+        id_away = int((ev.get("awayTeam") or {}).get("id") or 0)
+
+        dbg(f"Game {gid}: {tri_home} (id:{id_home}) vs {tri_away} (id:{id_away})")
 
         goals=[]; has_so=False
         try:
             pbp = load_pbp(gid)
-            goals = extract_goal_events(pbp, tri_home, tri_away)
+            goals = extract_goal_events(pbp, tri_home, tri_away, id_home, id_away)
             has_so = detect_shootout(pbp)
-            dbg(f"PBP goals: {len(goals)} shootout:{has_so}")
+            dbg(f"PBP goals: {len(goals)} shootout:{has_so} "
+                f"sample_has_score_fields={any(g.get('home_score_event') is not None for g in goals)}")
         except Exception as e:
             dbg("PBP error:", repr(e))
 
-        # Sports.ru имена
-        ru_events=[]
         try:
-            slug_a = slug_b = None
-            if tri_away and tri_home:
-                slug_a, slug_b = sports_slug_for_pair(tri_away, tri_home)
-            for slug in (slug_a, slug_b):
-                if not slug: continue
-                html = fetch_sports_lineups(slug)
-                if not html: 
-                    continue
-                ru_events = parse_sports_lineups_goals(html)
-                if ru_events:
-                    dbg("sports.ru matched:", slug, "goals:", len(ru_events))
-                    break
+            ru_events = get_ru_goals_for_pair(tri_away, tri_home)
         except Exception as e:
             dbg("Sports.ru parse error:", repr(e))
+            ru_events = []
 
         if goals and ru_events:
             attach_ru_names_to_pbp(goals, ru_events)
