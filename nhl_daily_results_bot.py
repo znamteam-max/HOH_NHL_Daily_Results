@@ -183,28 +183,58 @@ def to_msk(utc_iso: str) -> dt.datetime:
 
 # ───── NHL schedule + PBP
 def pick_games(d: dt.date) -> List[dict]:
+    section("NHL: расписание")
     start, end = window_msk(d)
     games: List[dict] = []
     for day in (d - dt.timedelta(days=1), d):
-        js = get_json(f"{API}/v1/schedule/{day.isoformat()}")
-        lst = js.get("games") or js.get("gameWeek",[{}])[0].get("games",[])
-        games.extend(lst)
+        url = f"{API}/v1/schedule/{day.isoformat()}"
+        dbg(f"Fetch schedule {url}")
+        js = get_json(url)
+        lst = js.get("games")
+        if lst is None:
+            week = js.get("gameWeek") or []
+            lst = []
+            for w in week:
+                lst.extend(w.get("games") or [])
+        dbg(f"  schedule {day}: {len(lst or [])} items")
+        games.extend(lst or [])
+
+    def _is_final(g) -> bool:
+        st = (g.get("gameState") or "").upper()
+        return st in ("FINAL", "OFF")
+
     picked, seen = [], set()
+    future_cnt = 0
+    in_window_cnt = 0
+    final_cnt = 0
+
     for g in games:
         gid = int(g.get("id") or 0)
-        if not gid or gid in seen: continue
+        if not gid or gid in seen:
+            continue
         seen.add(gid)
         utc = g.get("startTimeUTC") or g.get("startTime")
-        if not utc: continue
+        if not utc:
+            continue
         msk = to_msk(utc)
         if start <= msk <= end:
-            picked.append({
-                "id": gid,
-                "msk": msk,
-                "home": g["homeTeam"]["abbrev"],
-                "away": g["awayTeam"]["abbrev"],
-            })
+            in_window_cnt += 1
+            if _is_final(g):
+                final_cnt += 1
+                picked.append({
+                    "id": gid,
+                    "msk": msk,
+                    "home": g["homeTeam"]["abbrev"],
+                    "away": g["awayTeam"]["abbrev"],
+                })
+            else:
+                future_cnt += 1
+
     picked.sort(key=lambda x: x["msk"])
+    dbg(f"in_window={in_window_cnt}, finals={final_cnt}, not_final_yet={future_cnt}")
+    dbg(f"Picked FINAL/OFF within MSK window: {len(picked)}")
+    for p in picked:
+        dbg(f"  game {p['id']}: {p['away']}@{p['home']} start_msk={p['msk']}")
     return picked
 
 def nhl_play_by_play(gid: int) -> dict:
@@ -682,6 +712,8 @@ def build_match_block(g: dict) -> str:
             so_winner = (re.findall(r"[А-ЯЁ][а-яё\-]+", so2) or [so2])[-1]
 
     rows = attach_scores_from_nhl(nhl_goals, ru_live) if ru_live else []
+    if not rows:
+        dbg(" sports.ru goals missing → no rows after attach; will show placeholder")
 
     # Заголовок (жирным победителя)
     home_line = f"{h_emoji} «{h_ru}»: {final_home}"
@@ -700,6 +732,19 @@ def build_match_block(g: dict) -> str:
         if r["assists"]:
             line += f" ({', '.join(r['assists'])})"
         by_p.setdefault(r["period"], []).append(line)
+
+    if not by_p:
+        parts.append("— события матча недоступны")
+        return "\n".join(parts)
+
+    for p in sorted(by_p.keys()):
+        parts.append(f"<i>{p}-й период</i>" if p <= 3 else f"<i>Овертайм №{p-3}</i>")
+        lines = []
+        for ln in by_p[p]:
+            ln = re.sub(r"(\d{1,3}):(\d{2})(\s+)", lambda m: f"{int(m.group(1))}.{m.group(2)}{m.group(3)}", ln, count=1)
+            lines.append(ln)
+        parts.extend(lines)
+
 
     for p in sorted(by_p.keys()):
         parts.append(f"<i>{p}-й период</i>" if p <= 3 else f"<i>Овертайм №{p-3}</i>")
