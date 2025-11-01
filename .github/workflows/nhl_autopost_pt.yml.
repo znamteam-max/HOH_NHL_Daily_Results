@@ -1,0 +1,174 @@
+name: NHL Auto Post (PT day complete)
+
+on:
+  schedule:
+    # Проверяем каждые 10 минут (UTC)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      pt_date:
+        description: "Принудительная PT-дата YYYY-MM-DD (опционально)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # чтобы коммитить маркер .posted/nhl-pt-YYYYMMDD.done
+
+concurrency:
+  group: nhl-autopost-pt
+  cancel-in-progress: true
+
+jobs:
+  autopost:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      FORCE_PT_DATE:      ${{ github.event.inputs.pt_date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4
+
+      - name: Resolve PT day and check NHL completeness
+        id: check
+        run: |
+          python - << 'PY'
+          import os, sys, requests
+          from datetime import datetime, timedelta, date, time
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+
+          API = "https://api-web.nhle.com"
+
+          tz_pt = ZoneInfo("America/Los_Angeles")
+
+          # 1) Определяем PT-день (ручной ввод или авто: до 06:00 PT считаем вчера)
+          force = os.getenv("FORCE_PT_DATE","").strip()
+          if force:
+            try:
+              base_pt = date.fromisoformat(force)
+            except Exception:
+              print("Invalid pt_date input, must be YYYY-MM-DD"); sys.exit(1)
+          else:
+            now_pt = datetime.now(tz_pt)
+            base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
+
+          ymd_pt = base_pt.strftime("%Y-%m-%d")
+          print("PT day:", ymd_pt)
+
+          # 2) Маркер «уже отправлено»
+          marker_dir = Path(".posted")
+          marker_dir.mkdir(parents=True, exist_ok=True)
+          marker = marker_dir / f"nhl-pt-{base_pt.strftime('%Y%m%d')}.done"
+          if marker.exists():
+            print(f"Already posted for NHL PT {ymd_pt}, skip.")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("ready=false\n")
+              fh.write(f"pt_ymd={ymd_pt}\n")
+            sys.exit(0)
+
+          # 3) Окно дня PT
+          start_pt = datetime.combine(base_pt, time(0,0), tzinfo=tz_pt)
+          end_pt   = datetime.combine(base_pt, time(23,59,59), tzinfo=tz_pt)
+
+          # 4) Грузим расписание за base_pt и base_pt-1 (как в нашем боте),
+          #    фильтруем игры, старт которых попадает в окно PT-дня
+          def fetch_sched(d):
+            url = f"{API}/v1/schedule/{d.isoformat()}"
+            r = requests.get(url, timeout=25); r.raise_for_status()
+            js = r.json()
+            games = js.get("games")
+            if games is None:
+              weeks = js.get("gameWeek") or []
+              games = []
+              for w in weeks:
+                games.extend(w.get("games") or [])
+            return games or []
+
+          dates_to_check = [base_pt - timedelta(days=1), base_pt]
+          raw = []
+          for d in dates_to_check:
+            raw.extend(fetch_sched(d))
+
+          def start_pt_date(g):
+            utc = g.get("startTimeUTC") or g.get("startTime")
+            if not utc: return None
+            dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
+            return dt
+
+          games_pt = []
+          for g in raw:
+            dt_pt = start_pt_date(g)
+            if dt_pt is None: continue
+            if start_pt <= dt_pt <= end_pt:
+              games_pt.append(g)
+
+          print("Games within PT window:", len(games_pt))
+
+          # 5) Все завершены?
+          #    На schedule у НХЛ есть поле gameState: FUT/LIVE/CRIT/FINAL/OFF.
+          def is_completed(g):
+            st = (g.get("gameState") or "").upper()
+            return st in ("FINAL", "OFF")
+
+          all_done = bool(games_pt) and all(is_completed(g) for g in games_pt)
+          print("all_completed:", all_done)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"ready={'true' if all_done else 'false'}\n")
+            fh.write(f"pt_ymd={ymd_pt}\n")
+          PY
+
+      - name: Run NHL bot for that PT day
+        if: steps.check.outputs.ready == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Если в боте поддержите PT-даты, прокиньте REPORT_DATE_PT:
+          REPORT_DATE_PT:     ${{ steps.check.outputs.pt_ymd }}
+        run: python3 nhl_daily_results_bot.py
+
+      - name: Mark PT day as posted (with rebase & retry)
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          set -e
+          mkdir -p .posted
+          PTYMD="${{ steps.check.outputs.pt_ymd }}"
+          MARK=".posted/nhl-pt-${PTYMD//-/}.done"
+          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > "$MARK"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git add "$MARK"
+
+          attempt=0
+          until [ $attempt -ge 3 ]
+          do
+            git fetch origin "$BRANCH" || true
+            git pull --rebase origin "$BRANCH" || true
+            if git commit -m "NHL posted for PT $PTYMD"; then
+              if git push origin "HEAD:$BRANCH"; then
+                echo "Marker pushed"; exit 0
+              fi
+            else
+              echo "Nothing to commit (marker may already exist)"; exit 0
+            fi
+            attempt=$((attempt+1))
+            echo "Retry push ($attempt)..."
+            sleep 2
+          done
+
+          echo "Failed to push marker after retries" >&2
+          exit 1
