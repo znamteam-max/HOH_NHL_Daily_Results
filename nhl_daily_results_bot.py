@@ -186,68 +186,173 @@ def _str(x) -> str:
     if isinstance(x, dict): return _val(x)
     return str(x)
 
-def extract_names_from_play(p: Dict[str, Any]) -> Tuple[str, List[str]]:
+# === NEW: более цепкий разбор имён из одного события PBP ===
+NAME_RX = re.compile(
+    r"""(?ix)
+    ^\s*
+    (?P<scorer>[A-Z][A-Za-z.'` -]+?)
+    (?:\s*\(\d+\))?
+    (?:\s*assists?\s*:\s*
+        (?P<a1>[A-Z][A-Za-z.'` -]+?)
+        (?:\s*\(\d+\))?
+        (?:\s*,\s*
+            (?P<a2>[A-Z][A-Za-z.'` -]+?)
+            (?:\s*\(\d+\))?
+        )?
+    )?
+    \s*$
     """
-    Пытаемся извлечь EN-имена автора и ассистентов из разных схем полей NHL PBP.
-    Возвращаем ('Full Name', ['Assist1','Assist2']) — могут быть пустые строки.
+)
+
+def extract_names_from_play(p: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Возвращает ('Full Name EN', ['Assist1 EN','Assist2 EN']) или ('', []).
+       Перебираем ВСЕ известные схемы NHL + парсим описательный текст, если нужно.
     """
     d = p.get("details") or {}
     scorer_en = ""
     assists_en: List[str] = []
 
-    # 1) Варианты, где scorer — строка/объект в details
-    keys_scorer = ["scorerName","scorerFullName","scorer","playerName","player","goalScorer"]
-    for k in keys_scorer:
+    # 1) Наиболее частые поля в details
+    prim = [
+        "scorerFullName","scorerName","scoringPlayerName","goalScorerName",
+        "playerName","player","scorer"
+    ]
+    for k in prim:
         v = d.get(k)
         if isinstance(v, dict):
-            cand = v.get("fullName") or v.get("default") or (v.get("firstName","")+" "+v.get("lastName","")).strip()
-            if cand: scorer_en = cand; break
+            nm = v.get("fullName") or v.get("default") or (v.get("firstName","")+" "+v.get("lastName","")).strip()
+            if nm: scorer_en = nm; break
         elif isinstance(v, str) and v.strip():
             scorer_en = v.strip(); break
 
-    # 2) Список players внутри события
-    if not scorer_en:
+    # 2) Игроки внутри события
+    if not scorer_en or not assists_en:
         for pl in (p.get("players") or []):
             pt = _str(pl.get("playerType")).lower()
-            nm = ""
             pv = pl.get("player")
+            nm = ""
             if isinstance(pv, dict):
-                nm = pv.get("fullName") or pv.get("lastName") or ""
+                nm = pv.get("fullName") or pv.get("default") or pv.get("lastName") or ""
             else:
                 nm = _str(pv)
-            if pt == "scorer" and nm:
-                scorer_en = nm
-            elif pt.startswith("assist") and nm:
+            if not nm:
+                # отдельные поля
+                nm = _str(pl.get("fullName") or pl.get("name") or pl.get("playerName"))
+            if not nm:
+                continue
+            if pt in ("scorer","goal-scorer","goalie_goal","goalscorer"):
+                scorer_en = scorer_en or nm
+            elif pt.startswith("assist"):
                 assists_en.append(nm)
 
-    # 3) Ассистенты из details
-    if not assists_en:
-        # как массив объектов
-        if isinstance(d.get("assists"), list):
-            for a in d["assists"]:
-                if isinstance(a, dict):
-                    nm = a.get("fullName") or a.get("default") or ""
-                    if nm: assists_en.append(nm)
-        # как разрозненные поля
-        for k in ("assist1PlayerName","assist2PlayerName","assist1Name","assist2Name"):
-            v = d.get(k)
-            if isinstance(v, str) and v.strip():
-                assists_en.append(v.strip())
-            elif isinstance(v, dict):
-                nm = v.get("fullName") or v.get("default") or ""
-                if nm: assists_en.append(nm)
+    # 3) Ассистенты как отдельные ключи
+    for k in ("assist1PlayerName","assist2PlayerName","assist1Name","assist2Name"):
+        v = d.get(k)
+        if isinstance(v, dict):
+            nm = v.get("fullName") or v.get("default") or ""
+        else:
+            nm = _str(v)
+        if nm:
+            assists_en.append(nm)
 
-    # ограничим до 2 ассистов
-    if len(assists_en) > 2: assists_en = assists_en[:2]
-    return scorer_en, assists_en
+    # 4) Иногда NHL кладёт весь текст в строку описания
+    #    Ищем в details.eventDescription / details.desc.* / p.eventDescription.*
+    texts = []
+    for key in ("eventDescription","desc","description","eventDetails","resultDescription"):
+        v = d.get(key) or p.get(key)
+        if isinstance(v, dict):
+            texts.append(v.get("default") or v.get("en") or "")
+        elif isinstance(v, str):
+            texts.append(v)
+    texts = [t for t in texts if t]
 
+    if (not scorer_en) and texts:
+        # Часто формат: "Sam Reinhart (10) Assists: Verhaeghe (12), Rodrigues (9)"
+        for t in texts:
+            m = NAME_RX.search(t)
+            if m:
+                scorer_en = m.group("scorer").strip()
+                if m.group("a1"): assists_en.append(m.group("a1").strip())
+                if m.group("a2"): assists_en.append(m.group("a2").strip())
+                break
+
+    # Нормализуем
+    assists_en = [a for a in assists_en if a]
+    # max два ассиста
+    assists_en = assists_en[:2]
+    return scorer_en.strip(), assists_en
+
+# === NEW: запасной источник имён — game-summary ===
+def fetch_summary(game_id: int) -> Dict[str, Any]:
+    return http_json(f"https://api-web.nhle.com/v1/gamecenter/{game_id}/game-summary")
+
+def extract_goals_from_summary(summ: Dict[str, Any], home_id: int, away_id: int) -> List[Dict[str, Any]]:
+    """Достаём список голов с именами из game-summary, если PBP не дал имён."""
+    out: List[Dict[str, Any]] = []
+    # В разных сезонах структура чуть меняется, пробуем популярные варианты
+    # 1) summ["scoring"] = [{"periodNumber":1,"goals":[{timeInPeriod, teamId, scorerName, assists:[...]}]}]
+    scoring = summ.get("scoring") or summ.get("goalSummary") or []
+    def add_goal(period, ptype, gobj, home_cnt, away_cnt):
+        t = gobj.get("timeInPeriod") or gobj.get("timeRemaining") or gobj.get("time") or "00:00"
+        if ":" not in t and "." in t: t = t.replace(".", ":")
+        try:
+            mm, ss = t.split(":"); t = f"{int(mm):02d}:{int(ss):02d}"
+        except Exception:
+            t = "00:00"
+        team_id = gobj.get("teamId") or (gobj.get("team") or {}).get("id")
+        side = "HOME" if team_id == home_id else ("AWAY" if team_id == away_id else "")
+        if side == "HOME": home_cnt += 1
+        elif side == "AWAY": away_cnt += 1
+        sc = gobj.get("scorerFullName") or gobj.get("scorerName") or _val(gobj.get("scorer")) or ""
+        asts = []
+        alist = gobj.get("assists") or []
+        for a in alist:
+            if isinstance(a, dict):
+                nm = a.get("fullName") or a.get("name") or a.get("default") or ""
+            else:
+                nm = _str(a)
+            if nm: asts.append(nm)
+        out.append({
+            "period": int(period),
+            "periodType": ptype,
+            "mmss": t,
+            "side": side or "",
+            "home": home_cnt,
+            "away": away_cnt,
+            "en_scorer": sc,
+            "en_assists": asts[:2],
+        })
+        return home_cnt, away_cnt
+
+    if isinstance(scoring, list) and scoring:
+        home, away = 0, 0
+        for per in scoring:
+            pnum = per.get("periodNumber") or per.get("number") or per.get("period") or 0
+            ptype = (per.get("periodType") or "REG").upper()
+            for g in (per.get("goals") or per.get("events") or []):
+                home, away = add_goal(pnum, ptype, g, home, away)
+        return out
+
+    # 2) запасной бэкап — если есть плоский список summ["goals"]
+    goals = summ.get("goals") or []
+    if isinstance(goals, list) and goals:
+        home, away = 0, 0
+        for g in goals:
+            pnum = g.get("periodNumber") or g.get("period") or 0
+            ptype = (g.get("periodType") or "REG").upper()
+            home, away = add_goal(pnum, ptype, g, home, away)
+        return out
+
+    return out
+
+# === REPLACE: извлечение голов из PBP + бэкап к summary, если имён нет ===
 def extract_goals_from_pbp(pbp: Dict[str, Any], home_id: int, away_id: int) -> Tuple[List[Dict[str, Any]], bool]:
     plays = pbp.get("plays") or []
     goals, home, away, shootout = [], 0, 0, False
     for p in plays:
         ty = (p.get("typeDescKey") or p.get("typeCode") or "").lower()
-        period = int((p.get("periodDescriptor") or {}).get("number") or 0)
-        ptype  = ((p.get("periodDescriptor") or {}).get("periodType") or "").upper()
+        period = int((p.get("periodDescriptor") or {}).get("number") or p.get("period") or 0)
+        ptype  = ((p.get("periodDescriptor") or {}).get("periodType") or p.get("periodType") or "").upper()
         t = p.get("timeInPeriod") or p.get("timeRemaining") or "00:00"
         team_id = (p.get("details") or {}).get("eventOwnerTeamId") or p.get("teamId") or (p.get("details") or {}).get("teamId")
 
@@ -276,6 +381,31 @@ def extract_goals_from_pbp(pbp: Dict[str, Any], home_id: int, away_id: int) -> T
             "en_scorer": scorer_en,
             "en_assists": assists_en,
         })
+
+    # Если НИ у одного гола нет имён — подтянем из game-summary
+    if goals and not any(g.get("en_scorer") or g.get("en_assists") for g in goals):
+        try:
+            summ = fetch_summary(int((pbp.get("gameId") or 0)))
+        except Exception:
+            summ = {}
+        if not summ:
+            # иногда gameId нет в pbp — достанем из пути, если доступен
+            pass
+        if summ:
+            # берём имена по времени/порядку
+            by_time = {}
+            for g in extract_goals_from_summary(summ, home_id, away_id):
+                by_time.setdefault((g["period"], g["mmss"]), []).append(g)
+            new_goals = []
+            for g in goals:
+                key = (g["period"], g["mmss"])
+                cand = (by_time.get(key) or [None])[0]
+                if cand:
+                    g["en_scorer"]  = cand.get("en_scorer") or g["en_scorer"]
+                    g["en_assists"] = cand.get("en_assists") or g["en_assists"]
+                new_goals.append(g)
+            goals = new_goals
+
     return goals, shootout
 
 # ----------------------- SPORTS.RU (опционально) -----------------------
