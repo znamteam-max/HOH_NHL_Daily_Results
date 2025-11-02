@@ -177,25 +177,88 @@ def ru_player(name_en: str) -> str:
 
 # --------------------- NHL helpers ---------------------
 
-def fetch_standings_now() -> Dict[str, Dict[str,int]]:
-    """Возвращает map abbrev -> {w,l,otl,pts}"""
+def _pick_str(x):
+    """Берёт строку из значения или словаря локализаций (default/en/любой первый str)."""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        for k in ("default", "en", "en_US", "eng", "us", "USA"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in x.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+def _to_int(x, default=0):
+    """Надёжно приводит к int, даже если пришёл dict/str."""
+    try:
+        if isinstance(x, dict):
+            # попробуем вытащить любое числовое значение
+            for v in x.values():
+                try:
+                    return int(v)
+                except Exception:
+                    continue
+            s = _pick_str(x)
+            return int(s) if s else int(default)
+        return int(x)
+    except Exception:
+        return int(default)
+
+def _get_abbrev(rec):
+    """Достаёт трёхбуквенную аббревиатуру из разных вариантов полей/вложенностей."""
+    for key in ("teamAbbrev", "teamAbbrevTricode", "teamTricode", "tricode"):
+        s = _pick_str(rec.get(key))
+        if s:
+            return s.upper()
+    team = rec.get("team") or {}
+    for key in ("abbrev", "abbrevTricode", "tricode"):
+        s = _pick_str(team.get(key))
+        if s:
+            return s.upper()
+    return ""
+
+def fetch_standings_now() -> dict:
+    """abbr -> {w,l,otl,pts}, устойчиво к dict-полям в JSON."""
     url = "https://api-web.nhle.com/v1/standings/now"
     data = http_json(url)
-    out: Dict[str, Dict[str,int]] = {}
-    recs = data if isinstance(data, list) else data.get("standings", [])
-    if not isinstance(recs, list): recs = []
-    dbg("records loaded:", len(recs))
-    for r in recs:
-        abbr = (r.get("teamAbbrev") or r.get("teamAbbrevTricode") or "").upper()
+    rows = data if isinstance(data, list) else data.get("standings", [])
+    out = {}
+
+    dbg("records loaded:", len(rows) if isinstance(rows, list) else 0)
+
+    for r in (rows or []):
+        abbr = _get_abbrev(r)
+        if not abbr:
+            continue
+        w   = _to_int(r.get("wins"), 0)
+        l   = _to_int(r.get("losses"), 0)
+        otl = _to_int(r.get("otLosses") or r.get("overtimeLosses"), 0)
+        pts = _to_int(r.get("points"), 0)
+        out[abbr] = {"w": w, "l": l, "otl": otl, "pts": pts}
+
+    # Фолбэк на датированный эндпоинт, если что-то пошло не так
+    if not out:
         try:
-            w = int(r.get("wins") or 0)
-            l = int(r.get("losses") or 0)
-            otl = int(r.get("otLosses") or r.get("overtimeLosses") or 0)
-            pts = int(r.get("points") or 0)
-        except Exception:
-            w=l=otl=pts=0
-        if abbr:
-            out[abbr] = {"w":w,"l":l,"otl":otl,"pts":pts}
+            today = msk_now().date().isoformat()
+            dbg("standings empty; fallback to", today)
+            data = http_json(f"https://api-web.nhle.com/v1/standings/{today}")
+            rows = data if isinstance(data, list) else data.get("standings", [])
+            for r in (rows or []):
+                abbr = _get_abbrev(r)
+                if not abbr:
+                    continue
+                out[abbr] = {
+                    "w": _to_int(r.get("wins"), 0),
+                    "l": _to_int(r.get("losses"), 0),
+                    "otl": _to_int(r.get("otLosses") or r.get("overtimeLosses"), 0),
+                    "pts": _to_int(r.get("points"), 0),
+                }
+        except Exception as e:
+            dbg("standings fallback failed:", repr(e))
+
     return out
 
 def fetch_schedule_for_dates(dates: List[str]) -> List[Dict[str,Any]]:
