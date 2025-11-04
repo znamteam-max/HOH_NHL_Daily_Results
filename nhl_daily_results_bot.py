@@ -6,7 +6,7 @@ HOH · NHL Daily Results Bot — Official chronology + sports.ru scorers
 
 Данные:
 - Расписание FINAL:        https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
-- Livefeed (счёт/время):  https://statsapi.web.nhl.com/api/v1/game/{gamePk}/feed/live
+- Play-by-Play (официально): https://api-web.nhle.com/v1/gamecenter/{gamePk}/play-by-play
 - Турнирная таблица:       https://api-web.nhle.com/v1/standings/now
 - Авторы голов/ассисты:    https://www.sports.ru/hockey/match/{home-slug}-vs-{away-slug}/
     • ul.match-summary__goals-list--home
@@ -14,17 +14,13 @@ HOH · NHL Daily Results Bot — Official chronology + sports.ru scorers
 
 Логика:
 1) Берём FINAL-матчи в «окне» (вчера+сегодня по UTC) — настраивается через DAYS_BACK/DAYS_FWD.
-2) Из livefeed строим ХРОНОЛОГИЮ: период, время «MM.SS», какая команда забила, текущий счёт.
-3) Загружаем страницу спортив.ру, парсим списки голов Хозяев/Гостей (в порядке на странице):
+2) Из play-by-play строим ХРОНОЛОГИЮ: период, время «MM.SS», какая команда забила, текущий счёт.
+3) Загружаем страницу sports.ru, парсим списки голов Хозяев/Гостей (в порядке на странице):
    time (если есть на странице), scorer_ru, assists_ru[].
 4) Сопоставляем: для каждого события official берём «следующий» элемент из списка соответствующей
    команды на sports.ru и подставляем scorer/assists на кириллице. Если элементов не хватает —
    остаётся official (англ.) как фолбэк.
 5) Собираем аккуратный пост с группировкой по периодам и отправляем в Telegram.
-
-Зависимости:
-- requests (есть по умолчанию)
-- beautifulsoup4 (рекомендуется). Если нет — включён «упругий» regex-парсинг как запасной вариант.
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
@@ -45,9 +41,9 @@ try:
 except Exception:
     BeautifulSoup = None  # fallback на regex
 
-TG_API   = "https://api.telegram.org"
-NHLE_BASE = "https://api-web.nhle.com/v1"
-STATS_BASE = "https://statsapi.web.nhl.com/api/v1"
+TG_API     = "https://api.telegram.org"
+NHLE_BASE  = "https://api-web.nhle.com/v1"
+PBP_FMT    = NHLE_BASE + "/gamecenter/{gamePk}/play-by-play"
 
 # ---------- ENV ----------
 def _env_str(name: str, default: str = "") -> str:
@@ -114,19 +110,31 @@ UA_HEADERS = {
     "Accept-Language": "ru,en;q=0.8",
 }
 
+def _get_with_retries(url: str, timeout: int = 30, tries: int = 3, backoff: float = 0.75, as_text: bool = False):
+    last = None
+    for attempt in range(1, tries+1):
+        try:
+            r = requests.get(url, headers=UA_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            if as_text:
+                r.encoding = r.apparent_encoding or "utf-8"
+                return r.text
+            return r.json()
+        except Exception as e:
+            last = e
+            if attempt < tries:
+                sleep_s = backoff * (2 ** (attempt-1))
+                print(f"[DBG] retry {attempt}/{tries} for {url} after {sleep_s:.2f}s: {repr(e)}")
+                time.sleep(sleep_s)
+            else:
+                raise
+    raise last  # на всякий случай
+
 def http_get_json(url: str, timeout: int = 30) -> Any:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        return json.loads(r.text or "{}")
+    return _get_with_retries(url, timeout=timeout, tries=3, backoff=0.75, as_text=False)
 
 def http_get_text(url: str, timeout: int = 30) -> str:
-    r = requests.get(url, headers=UA_HEADERS, timeout=timeout)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or "utf-8"
-    return r.text
+    return _get_with_retries(url, timeout=timeout, tries=3, backoff=0.75, as_text=True)
 
 # ---------- СТРУКТУРЫ ----------
 @dataclass
@@ -161,7 +169,7 @@ class ScoringEvent:
 
 @dataclass
 class SRUGoal:
-    time: Optional[str]     # может быть None, если на странице нет времени
+    time: Optional[str]
     scorer_ru: Optional[str]
     assists_ru: List[str]
 
@@ -179,11 +187,12 @@ def fetch_standings_map() -> Dict[str, TeamRecord]:
     elif isinstance(data, list):
         nodes = data
     for r in nodes:
-        # teamAbbrev может быть строкой или объектом
         abbr = ""
         ta = r.get("teamAbbrev")
-        if isinstance(ta, str): abbr = ta.upper()
-        elif isinstance(ta, dict): abbr = (ta.get("default") or ta.get("tricode") or "").upper()
+        if isinstance(ta, str):
+            abbr = ta.upper()
+        elif isinstance(ta, dict):
+            abbr = (ta.get("default") or ta.get("tricode") or "").upper()
         if not abbr:
             abbr = (r.get("teamAbbrevTricode") or r.get("teamTriCode") or "").upper()
 
@@ -235,43 +244,59 @@ def list_final_games_window(days_back: int = 1, days_fwd: int = 0) -> List[GameM
     print(f"[DBG] Collected FINAL games: {len(games)}")
     return games
 
-# ---------- OFFICIAL LIVEFEED ----------
+# ---------- OFFICIAL PLAY-BY-PLAY ----------
+def _normalize_period_type(t: str) -> str:
+    t = (t or "").upper()
+    if t == "REG": return "REGULAR"
+    if t == "OT":  return "OVERTIME"
+    if t == "SO":  return "SHOOTOUT"
+    return t or "REGULAR"
+
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
-    url = f"{STATS_BASE}/game/{gamePk}/feed/live"
+    """
+    Берём все события с typeDescKey == 'goal' из нового эндпоинта gamecenter/{gamePk}/play-by-play.
+    """
+    url = PBP_FMT.format(gamePk=gamePk)
     data = http_get_json(url)
-    plays = (data.get("liveData", {}).get("plays", {}) or {})
-    allPlays = plays.get("allPlays", []) or []
-    idxs = plays.get("scoringPlays", []) or []
+    plays = data.get("plays", []) or []
     events: List[ScoringEvent] = []
     h=a=0
-    for i in idxs:
-        if not (0 <= i < len(allPlays)): continue
-        p = allPlays[i]
-        res = p.get("result", {}) or {}
-        if (res.get("eventTypeId") or "").upper() != "GOAL": continue
-        about = p.get("about", {}) or {}
-        period = int(about.get("period") or 0)
-        ptype  = (about.get("periodType") or "REGULAR").upper()
-        t = (about.get("periodTime") or "00:00").replace(":", ".")
-        team = ((p.get("team", {}) or {}).get("triCode") or "").upper()
 
-        h_goals = about.get("goals", {}).get("home")
-        a_goals = about.get("goals", {}).get("away")
+    for p in plays:
+        if (p.get("typeDescKey") or "").lower() != "goal":
+            continue
+
+        pd = p.get("periodDescriptor", {}) or {}
+        period = int(pd.get("number") or 0)
+        ptype  = _normalize_period_type(pd.get("periodType") or "REG")
+
+        t = (p.get("timeInPeriod") or "00:00").replace(":", ".")
+        team = (p.get("teamAbbrev") or "").upper()
+
+        det = p.get("details", {}) or {}
+        # В новых данных счёт часто лежит здесь:
+        h_goals = det.get("homeScore")
+        a_goals = det.get("awayScore")
         if isinstance(h_goals, int) and isinstance(a_goals, int):
             h, a = h_goals, a_goals
         else:
-            if team == home_tri: h += 1
-            elif team == away_tri: a += 1
+            score_obj = p.get("score", {}) or {}
+            if isinstance(score_obj.get("home"), int) and isinstance(score_obj.get("away"), int):
+                h, a = score_obj["home"], score_obj["away"]
+            else:
+                # крайний фолбэк — наращиваем сами
+                if team == home_tri: h += 1
+                elif team == away_tri: a += 1
 
-        scorer = ""
+        scorer = det.get("scoringPlayerName") or det.get("shootingPlayerName") or ""
         assists: List[str] = []
-        for pp in p.get("players", []) or []:
-            role = (pp.get("playerType") or "").upper()
-            name = (pp.get("player", {}) or {}).get("fullName") or ""
-            if role == "SCORER": scorer = name
-            elif role == "ASSIST": assists.append(name)
+        for k in ("assist1PlayerName", "assist2PlayerName", "assist3PlayerName"):
+            v = det.get(k)
+            if v: assists.append(v)
 
         events.append(ScoringEvent(period, ptype, t, team, h, a, scorer, assists))
+
+    print(f"[DBG] PBP goals parsed: {len(events)} for game {gamePk}")
     return events
 
 # ---------- SPORTSRU PARSER ----------
@@ -293,26 +318,18 @@ def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
         soup = BeautifulSoup(html, "lxml" if "lxml" in globals() else "html.parser")
         ul = soup.select_one(f"ul.match-summary__goals-list--{side}")
         if not ul:
-            # резерв: иногда нет mobile-версии; попробуем общий список
             ul = soup.select_one(f"ul.match-summary__goals-list.match-summary__goals-list--{side}")
         if ul:
             for li in ul.find_all("li", recursive=False):
-                # пропускаем заголовки периодов, если таковые есть
-                if li.get("class") and any("period" in " ".join(li.get("class")) for _ in [0]):
-                    # бывают служебные элементы — не обрабатываем
-                    pass
-                # Вытягиваем имена: чаще всего это <a ...>игрок</a>
                 anchors = [a.get_text(strip=True) for a in li.find_all("a")]
                 scorer_ru = anchors[0] if anchors else None
                 assists_ru = anchors[1:] if len(anchors) > 1 else []
-                # Время — по тексту элемента
                 raw_text = li.get_text(" ", strip=True)
                 time_ru = _extract_time(raw_text)
                 results.append(SRUGoal(time_ru, scorer_ru, assists_ru))
         return results
 
-    # --- Regex fallback (грубый, но рабочий) ---
-    # Берём кусок UL нужной стороны
+    # --- Regex fallback ---
     ul_pat = re.compile(
         r'<ul[^>]*class="[^"]*match-summary__goals-list[^"]*--%s[^"]*"[^>]*>(.*?)</ul>' % side,
         re.S | re.I
@@ -325,10 +342,8 @@ def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
     ul_html = ul_m.group(1)
 
     for li_html in li_pat.findall(ul_html):
-        # Время
         text = re.sub(r"<[^>]+>", " ", li_html)
         time_ru = _extract_time(text)
-        # Игроки (первый — автор)
         names = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m)).strip()
                  for m in a_pat.findall(li_html)]
         scorer_ru = names[0] if names else None
@@ -363,7 +378,6 @@ def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], L
         home_goals = parse_sportsru_goals_html(html, home_side)
         away_goals = parse_sportsru_goals_html(html, away_side)
 
-        # если на странице пусто — возможно матч ещё не оформлен; пробуем следующий
         if home_goals or away_goals:
             print(f"[DBG] sports.ru goals ok for {url}: home={len(home_goals)} away={len(away_goals)}")
             return home_goals, away_goals, url
@@ -396,7 +410,6 @@ def merge_official_with_sportsru(
             ev.scorer  = g.scorer_ru or ev.scorer or ""
             ev.assists = g.assists_ru or ev.assists
         out.append(ev)
-    # Логирование расхождений
     if h_i != len(sru_home) or a_i != len(sru_away):
         print(f"[DBG] used sports.ru: home_used={h_i}/{len(sru_home)} away_used={a_i}/{len(sru_away)}")
     return out
@@ -434,7 +447,8 @@ def build_match_block(meta: GameMeta, standings: Dict[str,TeamRecord], events: L
 
     body: List[str] = []
     otc = {"n":0}
-    for key in sorted(groups.keys(), key=lambda x: (x[0], 0 if x[1].upper()=="REGULAR" else 1 if x[1].upper()=="OVERTIME" else 2)):
+    sort_key = lambda x: (x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
+    for key in sorted(groups.keys(), key=sort_key):
         body.append("\n" + period_title(key[0], key[1], otc))
         for ev in groups[key]:
             body.append(line_goal(ev))
@@ -511,7 +525,7 @@ def header_ru(n_games: int) -> str:
 def make_post_text(games: List[GameMeta], standings: Dict[str,TeamRecord]) -> str:
     blocks: List[str] = [header_ru(len(games)), "", "Результаты надёжно спрятаны 👇", ""]
     for meta in games:
-        # 1) official chronology
+        # 1) official chronology (новый эндпоинт)
         evs = fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
         # 2) sports.ru scorers
         sru_home, sru_away, url = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
