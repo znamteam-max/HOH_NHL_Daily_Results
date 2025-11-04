@@ -4,13 +4,13 @@
 """
 HOH · NHL Daily Results — daily summary with spoilers
 
-Изменения:
-- В шапке: одна разделительная линия, корректное склонение «матч/матча/матчей».
-- Внутри матча снаружи видны только эмодзи + названия команд (без счёта).
-- Все детали матча (включая счёт) спрятаны в <tg-spoiler>...</tg-spoiler>.
-- Заголовки периодов/ОТ/буллитов — курсивом.
-- «Овертайм» без №, пока он один; нумерация появляется только если их несколько.
-- Рекорд команды: только (W-L-OT).
+Что делает:
+- За окно «вчера + сегодня» по UTC собирает все матчи в статусе FINAL.
+- Печатает один общий пост: снаружи видны только эмодзи + названия команд (без счёта).
+- Весь контент матча (включая счёт и авторов голов) спрятан в <tg-spoiler>…</tg-spoiler>.
+- Заголовки периодов/ОТ/буллитов — курсивом; «Овертайм» без №, если он один.
+- Рекорд команды — только (W-L-OT), без очков.
+- Шапка: одна разделительная линия, корректное склонение «матч/матча/матчей».
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
@@ -224,8 +224,7 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
         if _upper_str(p.get("typeDescKey")) != "GOAL": continue
         pd = p.get("periodDescriptor", {}) or {}
         period = _first_int(pd.get("number")); ptype = _normalize_period_type(pd.get("periodType") or "REG")
-        t = str(p.get("timeInPeriod") or "00:00").replace(":", ".")
-        det = p.get("details", {}) or {}
+        t = str(p.get("timeInPeriod") or "00:00").replace(":", "."); det = p.get("details", {}) or {}
         h = det.get("homeScore"); a = det.get("awayScore")
         if not (isinstance(h,int) and isinstance(a,int)):
             sc = p.get("score", {}) or {}
@@ -315,7 +314,7 @@ def line_goal(ev: ScoringEvent) -> str:
     return f"{score} – {ev.time} {who}{assists}"
 
 def build_match_block_with_spoiler(meta: GameMeta, standings: Dict[str,TeamRecord], events: List[ScoringEvent]) -> str:
-    # Видимая «шапка матча»: только эмодзи + название (без счёта)
+    # Видимая «шапка матча»: только эмодзи + названия (без счёта)
     he = TEAM_EMOJI.get(meta.home_tri, ""); ae = TEAM_EMOJI.get(meta.away_tri, "")
     hn = TEAM_RU.get(meta.home_tri, meta.home_tri); an = TEAM_RU.get(meta.away_tri, meta.away_tri)
     visible = f"{he} <b>«{hn}»</b>\n{ae} <b>«{an}»</b>"
@@ -332,11 +331,12 @@ def build_match_block_with_spoiler(meta: GameMeta, standings: Dict[str,TeamRecor
     ot_keys = sorted([k for k in groups if (k[1] or "").upper()=="OVERTIME"], key=lambda x:x[0])
     ot_total = len(ot_keys); ot_order = {k:i+1 for i,k in enumerate(ot_keys)}
 
-    body_lines: List[str] = [head_hidden, ""]
+    body_lines: List[str] = [head_hidden]
     sort_key = lambda x:(x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
     for key in sorted(groups.keys(), key=sort_key):
         pnum, ptype = key; ot_idx = ot_order.get(key)
         title = period_title_text(pnum, ptype, ot_idx, ot_total)
+        body_lines.append("")  # пустая строка перед заголовком периода
         body_lines.append(_italic(title))
         period_events = groups[key]
         if not period_events:
