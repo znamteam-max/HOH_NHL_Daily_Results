@@ -1,0 +1,95 @@
+name: NHL Bots
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Отдельные посты по каждому финальному матчу: каждые 5 минут (UTC)
+    - cron: "*/5 * * * *"
+    # Дневной общий пост: раз в день, после окончания игрового дня NHL.
+    # Выбери удобное время под свой канал — здесь 12:30 UTC.
+    - cron: "30 12 * * *"
+
+jobs:
+  single-results:
+    if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
+    name: Per-game final posts
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nhl-single-results
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Восстанавливаем последнее состояние (posted_games.json) из кэша
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: nhl-single-state-${{ github.run_id }}
+          restore-keys: |
+            nhl-single-state-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run single-result bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          STATE_PATH: state/posted_games.json
+          DRY_RUN: "0"
+          DEBUG_VERBOSE: "0"
+        run: |
+          python nhl_single_result_bot.py
+
+      # Сохраняем обновлённое состояние как новый cache-слой,
+      # чтобы следующая итерация восстановила самое свежее
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: nhl-single-state-${{ github.run_id }}
+
+  daily-summary:
+    if: github.event.schedule == '30 12 * * *' || github.event_name == 'workflow_dispatch'
+    name: Daily summary post
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nhl-daily-summary
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run daily results bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          DAYS_BACK: "1"
+          DAYS_FWD: "0"
+          DRY_RUN: "0"
+          DEBUG_VERBOSE: "0"
+        run: |
+          python nhl_daily_results_bot.py
