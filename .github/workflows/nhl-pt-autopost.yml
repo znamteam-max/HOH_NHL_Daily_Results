@@ -24,6 +24,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
       FORCE_PT_DATE:      ${{ github.event.inputs.pt_date }}
     steps:
       - name: Checkout
@@ -37,7 +38,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests beautifulsoup4
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
 
       - name: Resolve PT day and check NHL completeness
         id: check
@@ -100,23 +103,20 @@ jobs:
           for d in dates_to_check:
             raw.extend(fetch_sched(d))
 
-          def start_pt_date(g):
+          def start_pt_dt(g):
             utc = g.get("startTimeUTC") or g.get("startTime")
             if not utc: return None
-            dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
-            return dt
+            return datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
 
           games_pt = []
           for g in raw:
-            dt_pt = start_pt_date(g)
+            dt_pt = start_pt_dt(g)
             if dt_pt is None: continue
             if start_pt <= dt_pt <= end_pt:
               games_pt.append(g)
 
           print("Games within PT window:", len(games_pt))
 
-          # 5) Все завершены?
-          #    На schedule у НХЛ есть поле gameState: FUT/LIVE/CRIT/FINAL/OFF.
           def is_completed(g):
             st = (g.get("gameState") or "").upper()
             return st in ("FINAL", "OFF")
@@ -129,14 +129,18 @@ jobs:
             fh.write(f"pt_ymd={ymd_pt}\n")
           PY
 
-      - name: Run NHL bot for that PT day
+      - name: Run daily results bot (spoilered)
         if: steps.check.outputs.ready == 'true'
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Если в боте поддержите PT-даты, прокиньте REPORT_DATE_PT:
-          REPORT_DATE_PT:     ${{ steps.check.outputs.pt_ymd }}
-        run: python3 nhl_daily_results_bot.py
+          TELEGRAM_BOT_TOKEN: ${{ env.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ env.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ env.TELEGRAM_THREAD_ID }}
+          DAYS_BACK: "1"
+          DAYS_FWD:  "0"
+          DRY_RUN:   "0"
+          DEBUG_VERBOSE: "0"
+        run: |
+          python nhl_daily_results_bot.py
 
       - name: Mark PT day as posted (with rebase & retry)
         if: steps.check.outputs.ready == 'true'
