@@ -5,9 +5,12 @@
 HOH · NHL Single Result Bot — per-game instant posts (no repeats)
 
 Что делает:
-- Каждые N минут (cron) проверяет игры вчера/сегодня по UTC.
-- Для тех, что в статусе FINAL и ещё не отправлены — формирует сообщение и отправляет.
-- Ведёт локальный файл состояния (по умолчанию state/posted_games.json), чтобы не было повторов.
+- Каждые N минут (cron) проверяет игры за вчера и сегодня по UTC.
+- Для матчей в статусе FINAL, которых ещё не постили, формирует сообщение и отправляет.
+- Формат: жирным — «Команда»: счёт; рекорд в скобках (W-L-OT);
+  заголовки периодов курсивом, «Овертайм» без №, если он один; «Буллиты» если были.
+- Перед каждым заголовком периода добавляется пустая строка.
+- Ведёт локальный STATE_PATH (JSON), чтобы не дублировать посты.
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
@@ -17,14 +20,18 @@ ENV:
 """
 
 from __future__ import annotations
-import os, re, json, time, textwrap
+import os, re, json, time, textwrap, pathlib
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-import pathlib, requests
 
-# --- Импортируем общую логику напрямую из дневного файла (скопировано для автономности) ---
-# Можно вынести в общий модуль, но здесь — самодостаточно.
+import requests
+
+try:
+    from bs4 import BeautifulSoup as BS  # type: ignore
+    HAS_BS = True
+except Exception:
+    HAS_BS = False
 
 TG_API     = "https://api.telegram.org"
 NHLE_BASE  = "https://api-web.nhle.com/v1"
@@ -80,7 +87,6 @@ UA_HEADERS = {
     "Accept-Language":"ru,en;q=0.8",
 }
 def _get_with_retries(url: str, timeout: int = 30, tries: int = 3, backoff: float = 0.75, as_text: bool = False):
-    import requests, time
     last=None
     for attempt in range(1, tries+1):
         try:
@@ -102,8 +108,6 @@ def http_get_json(url: str, timeout: int = 30) -> Any: return _get_with_retries(
 def http_get_text(url: str, timeout: int = 30) -> str: return _get_with_retries(url, timeout=timeout, as_text=True)
 
 # --- Models ---
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Any
 @dataclass
 class TeamRecord:
     wins:int; losses:int; ot:int; points:int
@@ -140,7 +144,7 @@ def _extract_name(obj_or_str: Any)->Optional[str]:
             if isinstance(v,str) and v.strip(): return v.strip()
     return None
 
-# --- Standings / schedule / PBP / sports.ru (как в daily) ---
+# --- Standings / schedule / PBP / sports.ru ---
 def fetch_standings_map()->Dict[str,TeamRecord]:
     url=f"{NHLE_BASE}/standings/now"; data=http_get_json(url); teams:Dict[str,TeamRecord]={}; nodes=[]
     if isinstance(data,dict):
@@ -219,10 +223,10 @@ TIME_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
 def _extract_time(text: str)->Optional[str]:
     m=TIME_RE.search(text or ""); 
     return f"{int(m.group(1)):02d}.{m.group(2)}" if m else None
+
 def parse_sportsru_goals_html(html: str, side: str)->List[SRUGoal]:
-    res=[]
-    if BeautifulSoup:
-        from bs4 import BeautifulSoup as BS
+    res: List[SRUGoal] = []
+    if HAS_BS:
         soup=BS(html,"lxml" if "lxml" in globals() else "html.parser")
         ul=soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(f"ul.match-summary__goals-list.match-summary__goals-list--{side}")
         if ul:
@@ -233,6 +237,7 @@ def parse_sportsru_goals_html(html: str, side: str)->List[SRUGoal]:
                 raw=li.get_text(" ", strip=True); time_ru=_extract_time(raw)
                 res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
     return res
+
 def fetch_sportsru_goals(home_tri:str, away_tri:str)->Tuple[List[SRUGoal],List[SRUGoal],str]:
     hs=SPORTSRU_SLUG.get(home_tri); as_=SPORTSRU_SLUG.get(away_tri)
     if not hs or not as_: return [], [], ""
@@ -282,12 +287,13 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     ot_keys=sorted([k for k in groups if (k[1] or "").upper()=="OVERTIME"], key=lambda x:x[0])
     ot_total=len(ot_keys); ot_order={k:i+1 for i,k in enumerate(ot_keys)}
 
-    lines=[head,""]
+    lines=[head]
     sort_key=lambda x:(x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key; ot_idx=ot_order.get(key)
         title=period_title_text(pnum,ptype,ot_idx,ot_total)
-        lines.append(_italic(title))
+        lines.append("")              # пустая строка перед заголовком периода
+        lines.append(_italic(title))  # курсивный заголовок
         per=groups[key]
         if not per: lines.append("Голов не было")
         else:
@@ -330,7 +336,7 @@ def send_telegram_text(text:str)->None:
     if resp.status_code!=200 or not data.get("ok",False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
 
-# --- Main loop (single run) ---
+# --- Main (single run) ---
 def main():
     state=load_state(STATE_PATH)
     posted:Dict[str,bool]=state.get("posted",{}) or {}
@@ -342,10 +348,9 @@ def main():
     new_posts=0
     for meta in games:
         key=str(meta.gamePk)
-        if posted.get(key): 
+        if posted.get(key):
             if DEBUG_VERBOSE: print(f"[DBG] skip already posted {key}")
             continue
-        # build message
         evs=fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
         sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
         merged=merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
