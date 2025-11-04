@@ -16,6 +16,7 @@ ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
 - DAYS_BACK=1, DAYS_FWD=0
 - DRY_RUN=0/1
+- DEBUG_VERBOSE=0/1  (подробный лог)
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ def _env_bool(name: str, default: bool=False) -> bool:
 DAYS_BACK = _env_int("DAYS_BACK", 1)
 DAYS_FWD  = _env_int("DAYS_FWD", 0)
 DRY_RUN   = _env_bool("DRY_RUN", False)
+DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", True)  # включил по умолчанию, можно выключить
 
 # ---------- RU/Naming ----------
 MONTHS_RU = {
@@ -182,6 +184,18 @@ def _first_int(*vals) -> int:
             continue
     return 0
 
+def _extract_name(obj_or_str: Any) -> Optional[str]:
+    if not obj_or_str:
+        return None
+    if isinstance(obj_or_str, str):
+        return obj_or_str.strip() or None
+    if isinstance(obj_or_str, dict):
+        for k in ("name","default","fullName","firstLastName","lastFirstName"):
+            v = obj_or_str.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
 # ---------- STANDINGS ----------
 def fetch_standings_map() -> Dict[str, TeamRecord]:
     url = f"{NHLE_BASE}/standings/now"
@@ -199,7 +213,6 @@ def fetch_standings_map() -> Dict[str, TeamRecord]:
         nodes = data
 
     for r in nodes:
-        # team abbrev can be string OR dict with "default"/"tricode"
         abbr = ""
         ta = r.get("teamAbbrev")
         if isinstance(ta, str): 
@@ -267,28 +280,18 @@ def _normalize_period_type(t: str) -> str:
     if t == "SO":  return "SHOOTOUT"
     return t or "REGULAR"
 
-def _extract_name(obj_or_str: Any) -> Optional[str]:
-    if not obj_or_str:
-        return None
-    if isinstance(obj_or_str, str):
-        return obj_or_str.strip() or None
-    if isinstance(obj_or_str, dict):
-        # иногда имя лежит в name/default/fullName
-        for k in ("name","default","fullName","firstLastName","lastFirstName"):
-            v = obj_or_str.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return None
-
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
     """
-    Берём события 'goal' из gamecenter/{gamePk}/play-by-play с широкими фолбэками по полям.
+    Берём события 'goal' из gamecenter/{gamePk}/play-by-play.
+    Команду-автора определяем надёжно по изменению счёта.
     """
     url = PBP_FMT.format(gamePk=gamePk)
     data = http_get_json(url)
     plays = data.get("plays", []) or []
     events: List[ScoringEvent] = []
-    h=a=0
+
+    prev_h = 0
+    prev_a = 0
 
     for p in plays:
         if _upper_str(p.get("typeDescKey")) != "GOAL":
@@ -301,14 +304,6 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
         t = str(p.get("timeInPeriod") or "00:00").replace(":", ".")
         det = p.get("details", {}) or {}
 
-        # Какая команда забила
-        team = _upper_str(
-            det.get("eventOwnerTeamAbbrev") or
-            p.get("teamAbbrev") or
-            det.get("teamAbbrev") or
-            det.get("scoringTeamAbbrev")
-        )
-
         # Счёт после гола
         h_goals = det.get("homeScore")
         a_goals = det.get("awayScore")
@@ -319,20 +314,43 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             if isinstance(score_obj.get("home"), int) and isinstance(score_obj.get("away"), int):
                 h, a = score_obj["home"], score_obj["away"]
             else:
-                if team == home_tri: h += 1
-                elif team == away_tri: a += 1
+                # Если даже здесь нет — используем прошлые (редко бывает)
+                h, a = prev_h, prev_a
 
-        # Автор
-        scorer = (
-            _extract_name(det.get("scoringPlayerName")) or
-            _extract_name(det.get("scorerName")) or
-            _extract_name(det.get("shootingPlayerName")) or
-            _extract_name(det.get("scoringPlayer")) or
-            _extract_name(p.get("scoringPlayerName")) or
-            ""
+        # Кто забил — надёжно по дельте счёта:
+        team_by_delta = None
+        if h > prev_h:
+            team_by_delta = home_tri
+        elif a > prev_a:
+            team_by_delta = away_tri
+
+        # Доп. фолбэки из полей события
+        team_fallback = _upper_str(
+            det.get("eventOwnerTeamAbbrev") or
+            p.get("teamAbbrev") or
+            det.get("teamAbbrev") or
+            det.get("scoringTeamAbbrev")
         )
+        team = team_by_delta or team_fallback
 
-        # Ассисты
+        # Автор и ассисты — перебором известных ключей
+        def _name_chain(*keys) -> Optional[str]:
+            for k in keys:
+                v = det.get(k)
+                name = _extract_name(v)
+                if name: 
+                    return name
+            # иногда имя прямо на верхнем уровне
+            for k in ("scoringPlayerName","scorerName","shootingPlayerName"):
+                v = p.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return None
+
+        scorer = _name_chain(
+            "scoringPlayerName", "scorerName", "shootingPlayerName", "scoringPlayer"
+        ) or ""
+
         assists: List[str] = []
         for k in ("assist1PlayerName","assist2PlayerName","assist3PlayerName","assist1","assist2","assist3"):
             v = det.get(k)
@@ -340,6 +358,12 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             if name: assists.append(name)
 
         events.append(ScoringEvent(period, ptype, t, team, h, a, scorer, assists))
+
+        if DEBUG_VERBOSE:
+            print(f"[DBG] PBP ev: P{period} {t} team={team or '?'} score={h}:{a} "
+                  f"scorer={'?' if not scorer else scorer} a={len(assists)}")
+
+        prev_h, prev_a = h, a
 
     print(f"[DBG] PBP goals parsed: {len(events)} for game {gamePk}")
     return events
@@ -367,28 +391,31 @@ def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
                 raw_text = li.get_text(" ", strip=True)
                 time_ru = _extract_time(raw_text)
                 results.append(SRUGoal(time_ru, scorer_ru, assists_ru))
-        return results
+    else:
+        # --- Regex fallback ---
+        ul_pat = re.compile(
+            r'<ul[^>]*class="[^"]*match-summary__goals-list[^"]*--%s[^"]*"[^>]*>(.*?)</ul>' % side,
+            re.S | re.I
+        )
+        li_pat = re.compile(r"<li\b[^>]*>(.*?)</li>", re.S|re.I)
+        a_pat  = re.compile(r"<a\b[^>]*>(.*?)</a>", re.S|re.I)
 
-    # --- Regex fallback ---
-    ul_pat = re.compile(
-        r'<ul[^>]*class="[^"]*match-summary__goals-list[^"]*--%s[^"]*"[^>]*>(.*?)</ul>' % side,
-        re.S | re.I
-    )
-    li_pat = re.compile(r"<li\b[^>]*>(.*?)</li>", re.S|re.I)
-    a_pat  = re.compile(r"<a\b[^>]*>(.*?)</a>", re.S|re.I)
+        ul_m = ul_pat.search(html)
+        if not ul_m: return results
+        ul_html = ul_m.group(1)
 
-    ul_m = ul_pat.search(html)
-    if not ul_m: return results
-    ul_html = ul_m.group(1)
+        for li_html in li_pat.findall(ul_html):
+            text = re.sub(r"<[^>]+>", " ", li_html)
+            time_ru = _extract_time(text)
+            names = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m)).strip()
+                     for m in a_pat.findall(li_html)]
+            scorer_ru = names[0] if names else None
+            assists_ru = names[1:] if len(names) > 1 else []
+            results.append(SRUGoal(time_ru, scorer_ru, assists_ru))
 
-    for li_html in li_pat.findall(ul_html):
-        text = re.sub(r"<[^>]+>", " ", li_html)
-        time_ru = _extract_time(text)
-        names = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m)).strip()
-                 for m in a_pat.findall(li_html)]
-        scorer_ru = names[0] if names else None
-        assists_ru = names[1:] if len(names) > 1 else []
-        results.append(SRUGoal(time_ru, scorer_ru, assists_ru))
+    if DEBUG_VERBOSE and results:
+        sample = ", ".join([(g.scorer_ru or "?") + (f" @{g.time}" if g.time else "") for g in results[:3]])
+        print(f"[DBG] sports.ru {side} sample: {sample} (+{max(0,len(results)-3)} more)")
     return results
 
 def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], List[SRUGoal], str]:
@@ -431,7 +458,7 @@ def merge_official_with_sportsru(
     h_i = 0
     a_i = 0
     out: List[ScoringEvent] = []
-    for ev in evs:
+    for idx, ev in enumerate(evs, start=1):
         if ev.team_for == home_tri and h_i < len(sru_home):
             g = sru_home[h_i]; h_i += 1
             ev.scorer  = g.scorer_ru or ev.scorer or ""
@@ -440,8 +467,12 @@ def merge_official_with_sportsru(
             g = sru_away[a_i]; a_i += 1
             ev.scorer  = g.scorer_ru or ev.scorer or ""
             ev.assists = g.assists_ru or ev.assists
+        else:
+            if DEBUG_VERBOSE and ev.team_for not in (home_tri, away_tri):
+                print(f"[DBG] merge-skip idx={idx}: team_for='{ev.team_for}' "
+                      f"not in {{{home_tri}/{away_tri}}}")
         out.append(ev)
-    if h_i != len(sru_home) or a_i != len(sru_away):
+    if DEBUG_VERBOSE:
         print(f"[DBG] used sports.ru: home_used={h_i}/{len(sru_home)} away_used={a_i}/{len(sru_away)}")
     return out
 
@@ -472,7 +503,6 @@ def build_match_block(meta: GameMeta, standings: Dict[str,TeamRecord], events: L
     arec = standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
     head = f"{he} «{hn}»: {meta.home_score} ({hrec})\n{ae} «{an}»: {meta.away_score} ({arec})"
 
-    # группируем по (period, type)
     groups: Dict[Tuple[int,str], List[ScoringEvent]] = {}
     for ev in events:
         groups.setdefault((ev.period, ev.period_type), []).append(ev)
@@ -491,7 +521,7 @@ def build_match_block(meta: GameMeta, standings: Dict[str,TeamRecord], events: L
         body.append("\n" + period_header)
         period_events = groups[key]
         if not period_events:
-            body.append("_Голов не было_")
+            body.append("Голов не было")  # <- без курсива
         else:
             for ev in period_events:
                 body.append(line_goal(ev))
