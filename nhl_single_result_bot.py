@@ -4,13 +4,11 @@
 """
 HOH · NHL Single Result Bot — per-game instant posts (no repeats)
 
-Что делает:
-- Каждые N минут (cron) проверяет игры за вчера и сегодня по UTC.
-- Для матчей в статусе FINAL, которых ещё не постили, формирует сообщение и отправляет.
-- Формат: жирным — «Команда»: счёт; рекорд в скобках (W-L-OT);
-  заголовки периодов курсивом, «Овертайм» без №, если он один; «Буллиты» если были.
-- Перед каждым заголовком периода добавляется пустая строка.
-- Ведёт локальный STATE_PATH (JSON), чтобы не дублировать посты.
+— Каждые N минут проверяет вчера+сегодня (UTC) и постит ИМЕННО те матчи, что стали FINAL и ещё не отправлялись.
+— Формат: жирным «Команда»: счёт; рекорд в скобках (W-L-OT).
+— Заголовки периодов/ОТ/буллитов — курсивом; «Овертайм» без №, если он один.
+— Перед каждым заголовком периода — пустая строка.
+— Фамилии буллитов подхватываются из PBP (fix), добавлена поддержка UTA.
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
@@ -60,13 +58,13 @@ TEAM_RU = {
     "FLA":"Флорида","LAK":"Лос-Анджелес","MIN":"Миннесота","MTL":"Монреаль","NSH":"Нэшвилл",
     "NJD":"Нью-Джерси","NYI":"Айлендерс","NYR":"Рейнджерс","OTT":"Оттава","PHI":"Филадельфия",
     "PIT":"Питтсбург","SJS":"Сан-Хосе","SEA":"Сиэтл","STL":"Сент-Луис","TBL":"Тампа-Бэй",
-    "TOR":"Торонто","VAN":"Ванкувер","VGK":"Вегас","WSH":"Вашингтон","WPG":"Виннипег",
+    "TOR":"Торонто","VAN":"Ванкувер","VGK":"Вегас","WSH":"Вашингтон","WPG":"Виннипег","UTA":"Юта",
 }
 TEAM_EMOJI = {
     "ANA":"🦆","ARI":"🦂","BOS":"🐻","BUF":"🦬","CGY":"🔥","CAR":"🌪️","CHI":"🦅","COL":"⛰️","CBJ":"💣",
     "DAL":"⭐️","DET":"🛡️","EDM":"🛢️","FLA":"🐆","LAK":"👑","MIN":"🌲","MTL":"🇨🇦","NSH":"🐯",
     "NJD":"😈","NYI":"🏝️","NYR":"🗽","OTT":"🛡","PHI":"🛩","PIT":"🐧","SJS":"🦈","SEA":"🦑","STL":"🎵",
-    "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️",
+    "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️","UTA":"🧊",
 }
 SPORTSRU_SLUG = {
     "ANA":"anaheim-ducks","ARI":"arizona-coyotes","BOS":"boston-bruins","BUF":"buffalo-sabres",
@@ -111,7 +109,7 @@ def http_get_text(url: str, timeout: int = 30) -> str: return _get_with_retries(
 @dataclass
 class TeamRecord:
     wins:int; losses:int; ot:int; points:int
-    def as_str(self)->str: return f"{self.wins}-{self.losses}-{self.ot}"  # без очков
+    def as_str(self)->str: return f"{self.wins}-{self.losses}-{self.ot}"
 @dataclass
 class GameMeta:
     gamePk:int; gameDateUTC:datetime; state:str; home_tri:str; away_tri:str; home_score:int; away_score:int
@@ -139,7 +137,7 @@ def _extract_name(obj_or_str: Any)->Optional[str]:
     if not obj_or_str: return None
     if isinstance(obj_or_str,str): return obj_or_str.strip() or None
     if isinstance(obj_or_str,dict):
-        for k in ("name","default","fullName","firstLastName","lastFirstName"):
+        for k in ("name","default","fullName","firstLastName","lastFirstName","shortName"):
             v=obj_or_str.get(k)
             if isinstance(v,str) and v.strip(): return v.strip()
     return None
@@ -174,7 +172,7 @@ def list_games_yesterday_today_final()->List[GameMeta]:
         for w in s.get("gameWeek",[]) or []:
             for g in w.get("games",[]) or []:
                 state=_upper_str(g.get("gameState") or g.get("gameStatus"))
-                if state!="FINAL": continue
+                if state not in ("FINAL","OFF"): continue
                 gid=_first_int(g.get("id"),g.get("gameId"),g.get("gamePk"))
                 if gid==0: continue
                 gd=g.get("startTimeUTC") or g.get("gameDate") or ""
@@ -187,36 +185,68 @@ def list_games_yesterday_today_final()->List[GameMeta]:
                 metas[gid]=GameMeta(gid,gdt,state,htri,atri,hscore,ascore)
     return sorted(metas.values(), key=lambda m:m.gameDateUTC)
 
+_SO_TYPES_GOAL = {"GOAL","SHOT"}
+_ASSIST_KEYS = (
+    "assist1PlayerName","assist2PlayerName","assist3PlayerName",
+    "assist1","assist2","assist3",
+    "primaryAssist","secondaryAssist","tertiaryAssist",
+)
+_SCORER_KEYS = (
+    "scoringPlayerName","scorerName","shootingPlayerName","scoringPlayer",
+    "goalScorer","primaryScorer","playerName","player",
+    "shooterName","shootoutShooterName","shooter",
+)
+def _normalize_period_type(t: str) -> str:
+    t=_upper_str(t)
+    if t in ("","REG"): return "REGULAR"
+    if t=="OT": return "OVERTIME"
+    if t=="SO": return "SHOOTOUT"
+    return t
+def _is_shootout_goal(type_key: str, details: dict, period_type: str) -> bool:
+    if period_type != "SHOOTOUT": return False
+    if type_key not in _SO_TYPES_GOAL: return False
+    for k in ("wasGoal","shotWasGoal","isGoal","isScored","scored"):
+        v = details.get(k)
+        if isinstance(v, bool) and v: return True
+        if isinstance(v, str) and v.strip().lower() in ("1","true","yes"): return True
+    return type_key == "GOAL"
+
 def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[ScoringEvent]:
     data=http_get_json(PBP_FMT.format(gamePk=gamePk)); plays=data.get("plays",[]) or []
     events:List[ScoringEvent]=[]; prev_h=prev_a=0
     for p in plays:
-        if _upper_str(p.get("typeDescKey"))!="GOAL": continue
+        type_key=_upper_str(p.get("typeDescKey"))
         pd=p.get("periodDescriptor",{}) or {}
-        period=_first_int(pd.get("number")); ptype=_upper_str(pd.get("periodType") or "REG")
-        ptype = "REGULAR" if ptype in ("","REG","REGULAR") else ("OVERTIME" if ptype=="OT" else ("SHOOTOUT" if ptype=="SO" else ptype))
-        t=str(p.get("timeInPeriod") or "00:00").replace(":","."); det=p.get("details",{}) or {}
+        period=_first_int(pd.get("number")); ptype=_normalize_period_type(pd.get("periodType") or "REG")
+        det=p.get("details",{}) or {}
+        t=str(p.get("timeInPeriod") or "00:00").replace(":",".")
+        is_goal = (type_key=="GOAL") or _is_shootout_goal(type_key, det, ptype)
+        if not is_goal: continue
+
         h=det.get("homeScore"); a=det.get("awayScore")
         if not (isinstance(h,int) and isinstance(a,int)):
             sc=p.get("score",{}) or {}
             if isinstance(sc.get("home"),int) and isinstance(sc.get("away"),int): h,a=sc["home"],sc["away"]
             else: h,a=prev_h,prev_a
         team=home_tri if h>prev_h else (away_tri if a>prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
-        def _name_chain(*keys):
-            for k in keys:
-                v=det.get(k); nm=_extract_name(v)
-                if nm: return nm
+
+        scorer=""
+        for k in _SCORER_KEYS:
+            nm=_extract_name(det.get(k))
+            if nm: scorer=nm; break
+        if not scorer:
             for k in ("scoringPlayerName","scorerName","shootingPlayerName"):
                 v=p.get(k)
-                if isinstance(v,str) and v.strip(): return v.strip()
-            return None
-        scorer=_name_chain("scoringPlayerName","scorerName","shootingPlayerName","scoringPlayer") or ""
+                if isinstance(v,str) and v.strip(): scorer=v.strip(); break
+
         assists=[]
-        for k in ("assist1PlayerName","assist2PlayerName","assist3PlayerName","assist1","assist2","assist3"):
-            v=det.get(k); nm=_extract_name(v)
+        for k in _ASSIST_KEYS:
+            nm=_extract_name(det.get(k))
             if nm: assists.append(nm)
+
         events.append(ScoringEvent(period,ptype,t,team,h,a,scorer,assists))
-        prev_h,prev_a=h,a
+        if ptype!="SHOOTOUT":
+            prev_h,prev_a=h,a
     return events
 
 TIME_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
@@ -251,7 +281,6 @@ def fetch_sportsru_goals(home_tri:str, away_tri:str)->Tuple[List[SRUGoal],List[S
         if h or a: return h,a,url
     return [],[], ""
 
-# --- Merge & format ---
 def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home: List[SRUGoal], sru_away: List[SRUGoal], home_tri:str, away_tri:str)->List[ScoringEvent]:
     h_i=a_i=0; out=[]
     for ev in evs:
@@ -292,8 +321,8 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key; ot_idx=ot_order.get(key)
         title=period_title_text(pnum,ptype,ot_idx,ot_total)
-        lines.append("")              # пустая строка перед заголовком периода
-        lines.append(_italic(title))  # курсивный заголовок
+        lines.append("")              # пустая строка
+        lines.append(_italic(title))  # курсивом
         per=groups[key]
         if not per: lines.append("Голов не было")
         else:
@@ -336,7 +365,6 @@ def send_telegram_text(text:str)->None:
     if resp.status_code!=200 or not data.get("ok",False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
 
-# --- Main (single run) ---
 def main():
     state=load_state(STATE_PATH)
     posted:Dict[str,bool]=state.get("posted",{}) or {}
