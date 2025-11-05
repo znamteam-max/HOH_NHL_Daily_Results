@@ -1,78 +1,20 @@
-name: NHL Daily Summary
-
-on:
-  schedule:
-    - cron: "30 12 * * *"   # 12:30 UTC, подстрой под канал
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-jobs:
-  daily-summary:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: nhl-daily-summary
-      cancel-in-progress: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Check PT marker (skip if already posted)
         id: ptmarker
+        shell: python
         run: |
-          PYMD=$(python - <<'PY'
+          import os
           from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
+          from pathlib import Path
+
           now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
           base = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
-          print(base.strftime("%Y%m%d"))
-          PY
-          )
-          echo "ptymd=$PYMD" >> $GITHUB_OUTPUT
-          if [ -f ".posted/nhl-pt-${PYMD}.done" ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "PT marker exists, skipping daily-summary post."
-          else
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
+          pymd = base.strftime("%Y%m%d")
+          print("ptymd:", pymd)
 
-      - name: Setup Python
-        if: steps.ptmarker.outputs.skip != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+          marker = Path(f".posted/nhl-pt-{pymd}.done")
+          os.makedirs(".posted", exist_ok=True)
 
-      - name: Install deps
-        if: steps.ptmarker.outputs.skip != 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
-
-      - name: Run daily results bot (spoilered)
-        if: steps.ptmarker.outputs.skip != 'true'
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-        run: |
-          python nhl_daily_results_bot.py
-
-      - name: Update RU name cache from sports.ru (optional)
-        if: steps.ptmarker.outputs.skip != 'true' && hashFiles('update_ru_cache.py') != ''
-        run: |
-          python update_ru_cache.py || true
-
-      - name: Commit RU cache changes (if any)
-        if: steps.ptmarker.outputs.skip != 'true'
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain -- ru_map.json ru_pending.json)" ]; then
-            git add ru_map.json ru_pending.json
-            git commit -m "chore(cache): update RU name map"
-            git push
-          else
-            echo "No cache changes to commit."
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"ptymd={pymd}\n")
+              fh.write(f"skip={'true' if marker.exists() else 'false'}\n")
