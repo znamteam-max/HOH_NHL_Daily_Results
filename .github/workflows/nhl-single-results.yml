@@ -1,0 +1,51 @@
+name: NHL Single Results (every 5 min)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  single-results:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nhl-single-results
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: nhl-single-state-${{ github.run_id }}
+          restore-keys: |
+            nhl-single-state-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run single-result bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          STATE_PATH: state/posted_games.json
+        run: |
+          python nhl_single_result_bot.py
+
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: nhl-single-state-${{ github.run_id }}
