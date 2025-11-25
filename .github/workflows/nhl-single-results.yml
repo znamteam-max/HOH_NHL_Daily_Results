@@ -81,7 +81,7 @@ jobs:
               return aliases.get(x, x)
 
           if gpk:
-              with open(out, "a") as fh:
+              with open(out, "a", encoding="utf-8") as fh:
                   fh.write(f"game_pk={gpk}\n")
                   if gdt: fh.write(f"game_date={gdt}\n")
               sys.exit(0)
@@ -127,7 +127,7 @@ jobs:
               print(f"Game not found for {date} {home} - {away}")
               sys.exit(1)
 
-          with open(out, "a") as fh:
+          with open(out, "a", encoding="utf-8") as fh:
               fh.write(f"game_pk={found}\n")
               fh.write(f"game_date={date}\n")
           print("Resolved GAME_PK:", found)
@@ -136,6 +136,6 @@ jobs:
       - name: Run single result bot
         env:
           GAME_PK:  ${{ steps.resolve.outputs.game_pk }}
-          GAME_DATE:${{ steps.resolve.outputs.game_date }}
+          GAME_DATE: ${{ steps.resolve.outputs.game_date }}
           DRY_RUN:  ${{ env.IN_DRY_RUN }}
         run: python nhl_single_result_bot.py
