@@ -47,27 +47,21 @@ jobs:
         run: |
           python - << 'PY'
           import os, sys, re, requests
-          from datetime import datetime, timedelta
-          try:
-            from zoneinfo import ZoneInfo
-          except Exception:
-            ZoneInfo = None
 
           pk = (os.getenv("IN_PK") or "").strip()
           if pk:
             print(f"GAME_PK provided: {pk}")
-            print(f"::set-output name=pk::{pk}")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"pk={pk}\n")
             sys.exit(0)
 
           date_str = (os.getenv("IN_DATE") or "").strip()
           teams_raw = (os.getenv("IN_TEAMS") or "").strip()
-          tz = (os.getenv("IN_TZ") or "UTC").strip()
 
           if not date_str or not teams_raw:
             print("Provide either game_pk OR both date and teams (e.g. '2025-11-24' + 'NSH - DET').")
             sys.exit(1)
 
-          # normalize teams
           m = re.match(r"^\s*([A-Za-z]{2,3})\s*[-@]\s*([A-Za-z]{2,3})\s*$", teams_raw)
           if not m:
             print("Teams must look like 'NSH - DET' or 'NSH@DET'")
@@ -76,13 +70,11 @@ jobs:
 
           alias = {
             "NAS":"NSH","PHX":"ARI","LA":"LAK","NJ":"NJD","TB":"TBL","SJ":"SJS",
-            "LV":"VGK","MTL":"MTL","MON":"MTL","NYR":"NYR","NYI":"NYI","WSH":"WSH",
-            "WAS":"WSH","ANH":"ANA","CLS":"CBJ","PHI":"PHI","UTAH":"UTA","UTA":"UTA"
+            "LV":"VGK","MON":"MTL","WAS":"WSH","ANH":"ANA","CLS":"CBJ","UTAH":"UTA","UTA":"UTA"
           }
           t1 = alias.get(t1, t1)
           t2 = alias.get(t2, t2)
 
-          # fetch day schedule (api-web)
           API = "https://api-web.nhle.com"
           url = f"{API}/v1/schedule/{date_str}"
           r = requests.get(url, timeout=25); r.raise_for_status()
@@ -93,27 +85,23 @@ jobs:
             for w in js.get("gameWeek") or []:
               games.extend(w.get("games") or [])
 
-          # find match by triCodes (home-away OR away-home)
           def tri(g, side):
             x = g.get(f"{side}Team") or {}
             return (x.get("abbrev") or x.get("triCode") or x.get("teamAbbrev") or "").upper()
 
-          found = None
+          gid = None
           for g in games:
             h = tri(g,"home"); a = tri(g,"away")
-            if {h,a}=={t1,t2}:
-              found = g; break
+            if {h,a} == {t1,t2}:
+              gid = int(g.get("id") or g.get("gameId") or g.get("gamePk") or 0)
+              break
 
-          if not found:
-            print("Game not found for provided date/teams")
-            sys.exit(1)
-
-          gid = int(found.get("id") or found.get("gameId") or found.get("gamePk") or 0)
-          if gid <= 0:
-            print("Invalid game id in schedule"); sys.exit(1)
+          if not gid:
+            print("Game not found for provided date/teams"); sys.exit(1)
 
           print(f"Resolved GAME_PK: {gid}")
-          print(f"::set-output name=pk::{gid}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"pk={gid}\n")
           PY
 
       - name: Post single match

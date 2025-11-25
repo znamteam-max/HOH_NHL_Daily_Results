@@ -71,23 +71,22 @@ jobs:
               print("Invalid report_date, must be YYYY-MM-DD"); sys.exit(1)
           else:
             now_local = datetime.now(tzinfo)
-            # берём ВЧЕРА в локальной таймзоне
             base_local = (now_local.date() - timedelta(days=1))
 
           ymd_local = base_local.strftime("%Y-%m-%d")
-          print("Local day:", ymd_local, "TZ:", tz)
-
-          # маркер для локальной даты
           marker_name = f"nhl-local-{base_local.strftime('%Y%m%d')}.done"
-          print("marker_name=", marker_name)
 
-          print(f"::set-output name=ymd::{ymd_local}")
-          print(f"::set-output name=tz::{tz}")
-          print(f"::set-output name=marker::{marker_name}")
+          print("Local day:", ymd_local, "TZ:", tz)
+          print("marker_name:", marker_name)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"ymd={ymd_local}\n")
+            fh.write(f"tz={tz}\n")
+            fh.write(f"marker={marker_name}\n")
           PY
 
       - name: Check posted marker (skip if exists)
-        if: ${{ github.event.inputs.force_republish != 'true' && github.event.inputs.force_republish != true }}
+        if: ${{ !inputs.force_republish }}
         run: |
           mkdir -p .posted
           if [ -f ".posted/${{ steps.date.outputs.marker }}" ]; then
@@ -121,7 +120,7 @@ jobs:
           fi
 
       - name: Mark local day as posted
-        if: ${{ github.event.inputs.force_republish != 'true' && github.event.inputs.force_republish != true }}
+        if: ${{ !inputs.force_republish }}
         run: |
           mkdir -p .posted
           echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/${{ steps.date.outputs.marker }}"
