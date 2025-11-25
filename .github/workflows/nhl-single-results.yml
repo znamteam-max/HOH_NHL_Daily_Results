@@ -1,4 +1,4 @@
-name: NHL single result to Telegram
+name: NHL single results to Telegram
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       game_date:
-        description: "YYYY-MM-DD — дата матча для фолбэка (опц.)"
+        description: "YYYY-MM-DD — дата матча (опц., когда указываешь PK)"
         required: false
         default: ""
       date:
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       home:
-        description: "Если PK не указан: хозяева (три-код или синоним, напр. NSH/NAS)"
+        description: "Если PK не указан: хозяева (три-код/алиас, напр. NSH/NAS)"
         required: false
         default: ""
       away:
@@ -72,9 +72,9 @@ jobs:
           away = (os.getenv("IN_AWAY") or "").strip().upper()
 
           aliases = {
-              "NAS":"NSH","PHX":"ARI","MTL":"MTL","LA":"LAK","TB":"TBL",
-              "UTAH":"UTA","NJ":"NJD","NYI":"NYI","NYR":"NYR","WSH":"WSH",
-              "CBJ":"CBJ","SJ":"SJS","VGK":"VGK","TBAY":"TBL","LAK":"LAK"
+              "NAS":"NSH","PHX":"ARI","LA":"LAK","TB":"TBL","UTAH":"UTA",
+              "NJ":"NJD","NYI":"NYI","NYR":"NYR","WSH":"WSH","SJ":"SJS",
+              "TBAY":"TBL","LAK":"LAK"
           }
           def norm(x):
               x = x.replace(" ","").upper()
@@ -93,7 +93,7 @@ jobs:
           home = norm(home)
           away = norm(away)
 
-          # попробуем scoreboard
+          # 1) scoreboard
           url = f"{API}/scoreboard/{date}"
           r = requests.get(url, timeout=25); r.raise_for_status()
           js = r.json()
@@ -106,8 +106,8 @@ jobs:
                   found = int(g.get("id") or g.get("gamePk") or 0)
                   break
 
+          # 2) fallback schedule
           if not found:
-              # fallback schedule
               url = f"{API}/schedule/{date}"
               r = requests.get(url, timeout=25); r.raise_for_status()
               js = r.json()
