@@ -1,8 +1,9 @@
-name: NHL Auto Post (PT day complete)
+name: NHL AutoPost (PT day complete)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут (UTC)
+    # Проверяем каждые 10 минут (UTC)
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       pt_date:
@@ -38,7 +39,7 @@ jobs:
       - name: Install deps
         run: pip install requests beautifulsoup4
 
-      - name: Resolve PT day and check completeness
+      - name: Resolve PT day and check NHL completeness
         id: check
         run: |
           python - << 'PY'
@@ -50,72 +51,60 @@ jobs:
           API = "https://api-web.nhle.com"
 
           tz_pt = ZoneInfo("America/Los_Angeles")
-
           force = os.getenv("FORCE_PT_DATE","").strip()
           if force:
-            try:
-              base_pt = date.fromisoformat(force)
-            except Exception:
-              print("Invalid pt_date input, must be YYYY-MM-DD"); sys.exit(1)
+              try:
+                  base_pt = date.fromisoformat(force)
+              except Exception:
+                  print("Invalid pt_date input, must be YYYY-MM-DD")
+                  sys.exit(1)
           else:
-            now_pt = datetime.now(tz_pt)
-            base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
+              now_pt = datetime.now(tz_pt)
+              base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
 
           ymd_pt = base_pt.strftime("%Y-%m-%d")
           print("PT day:", ymd_pt)
 
-          marker_dir = Path(".posted"); marker_dir.mkdir(parents=True, exist_ok=True)
-          marker = marker_dir / f"nhl-pt-{base_pt.strftime('%Y%m%d')}.done"
-          if marker.exists():
-            print(f"Already posted for NHL PT {ymd_pt}, skip.")
-            with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write("ready=false\n")
-              fh.write(f"pt_ymd={ymd_pt}\n")
-            sys.exit(0)
-
-          def fetch_sched(d):
-            url = f"{API}/v1/schedule/{d.isoformat()}"
-            r = requests.get(url, timeout=25); r.raise_for_status()
-            js = r.json()
-            games = js.get("games")
-            if games is None:
-              weeks = js.get("gameWeek") or []
-              games = []
-              for w in weeks:
-                games.extend(w.get("games") or [])
-            return games or []
-
           start_pt = datetime.combine(base_pt, time(0,0), tzinfo=tz_pt)
           end_pt   = datetime.combine(base_pt, time(23,59,59), tzinfo=tz_pt)
 
-          def start_dt_pt(g):
-            utc = g.get("startTimeUTC") or g.get("startTime")
-            if not utc: return None
-            from_dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
-            return from_dt
+          def fetch_sched(d):
+              url = f"{API}/v1/schedule/{d.isoformat()}"
+              r = requests.get(url, timeout=25); r.raise_for_status()
+              js = r.json()
+              games = js.get("games")
+              if games is None:
+                  weeks = js.get("gameWeek") or []
+                  games = []
+                  for w in weeks:
+                      games.extend(w.get("games") or [])
+              return games or []
 
           raw = []
-          for d in (base_pt - timedelta(days=1), base_pt, base_pt + timedelta(days=1)):
-            raw.extend(fetch_sched(d))
+          for d in (base_pt - timedelta(days=1), base_pt):
+              raw.extend(fetch_sched(d))
 
-          games_pt = []
-          for g in raw:
-            dt_pt = start_dt_pt(g)
-            if dt_pt and start_pt <= dt_pt <= end_pt:
-              games_pt.append(g)
+          def start_pt_dt(g):
+              utc = g.get("startTimeUTC") or g.get("startTime") or g.get("gameDate")
+              if not utc: return None
+              try:
+                  return datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
+              except Exception:
+                  return None
 
+          games_pt = [g for g in raw if (dt:=start_pt_dt(g)) and start_pt <= dt <= end_pt]
           print("Games within PT window:", len(games_pt))
 
           def is_completed(g):
-            st = (g.get("gameState") or "").upper()
-            return st in ("FINAL", "OFF")
+              st = (g.get("gameState") or g.get("gameStatus") or "").upper()
+              return st in ("FINAL","OFF")
 
           all_done = bool(games_pt) and all(is_completed(g) for g in games_pt)
           print("all_completed:", all_done)
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"ready={'true' if all_done else 'false'}\n")
-            fh.write(f"pt_ymd={ymd_pt}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"ready={'true' if all_done else 'false'}\n")
+              fh.write(f"pt_ymd={ymd_pt}\n")
           PY
 
       - name: Run daily summary for that PT day
@@ -125,7 +114,7 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           REPORT_DATE_LOCAL:  ${{ steps.check.outputs.pt_ymd }}
           REPORT_DATE_TZ:     America/Los_Angeles
-        run: python3 nhl_daily_results_bot.py
+        run: python nhl_daily_results_bot.py
 
       - name: Mark PT day as posted (with rebase & retry)
         if: steps.check.outputs.ready == 'true'
@@ -147,7 +136,7 @@ jobs:
           do
             git fetch origin "$BRANCH" || true
             git pull --rebase origin "$BRANCH" || true
-            if git commit -m "NHL posted for PT $PTYMD"; then
+            if git commit -m "NHL posted for PT ${PTYMD}"; then
               if git push origin "HEAD:$BRANCH"; then
                 echo "Marker pushed"; exit 0
               fi

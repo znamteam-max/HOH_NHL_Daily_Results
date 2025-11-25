@@ -1,24 +1,39 @@
-name: NHL Single Match to Telegram
+name: NHL single result to Telegram
 
 on:
   workflow_dispatch:
     inputs:
       game_pk:
-        description: "Прямой GAME_PK (опционально)"
+        description: "GAME_PK (если знаешь), напр. 2025020355"
+        required: false
+        default: ""
+      game_date:
+        description: "YYYY-MM-DD — дата матча для фолбэка (опц.)"
         required: false
         default: ""
       date:
-        description: "Дата матча YYYY-MM-DD (если не указываете game_pk)"
+        description: "Если PK не указан: дата матча YYYY-MM-DD"
         required: false
         default: ""
-      teams:
-        description: "Пара команд, например: NSH - DET (опционально)"
+      home:
+        description: "Если PK не указан: хозяева (три-код или синоним, напр. NSH/NAS)"
         required: false
         default: ""
-      tz:
-        description: "IANA TZ для интерпретации date (по умолчанию UTC)"
+      away:
+        description: "Если PK не указан: гости (три-код, напр. DET)"
         required: false
-        default: "UTC"
+        default: ""
+      dry_run:
+        description: "Только предпросмотр (не отправлять в TG)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nhl-single-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   single:
@@ -26,14 +41,14 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      IN_PK:    ${{ github.event.inputs.game_pk }}
-      IN_DATE:  ${{ github.event.inputs.date }}
-      IN_TEAMS: ${{ github.event.inputs.teams }}
-      IN_TZ:    ${{ github.event.inputs.tz }}
+      IN_GAME_PK:         ${{ github.event.inputs.game_pk }}
+      IN_GAME_DATE:       ${{ github.event.inputs.game_date }}
+      IN_DATE:            ${{ github.event.inputs.date }}
+      IN_HOME:            ${{ github.event.inputs.home }}
+      IN_AWAY:            ${{ github.event.inputs.away }}
+      IN_DRY_RUN:         ${{ github.event.inputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -43,74 +58,84 @@ jobs:
         run: pip install requests beautifulsoup4
 
       - name: Resolve GAME_PK if needed
-        id: res
+        id: resolve
         run: |
           python - << 'PY'
-          import os, sys, re, requests
+          import os, sys, requests
+          API = "https://api-web.nhle.com/v1"
+          out = os.environ["GITHUB_OUTPUT"]
 
-          pk = (os.getenv("IN_PK") or "").strip()
-          if pk:
-            print(f"GAME_PK provided: {pk}")
-            with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"pk={pk}\n")
-            sys.exit(0)
+          gpk  = (os.getenv("IN_GAME_PK") or "").strip()
+          gdt  = (os.getenv("IN_GAME_DATE") or "").strip()
+          date = (os.getenv("IN_DATE") or "").strip()
+          home = (os.getenv("IN_HOME") or "").strip().upper()
+          away = (os.getenv("IN_AWAY") or "").strip().upper()
 
-          date_str = (os.getenv("IN_DATE") or "").strip()
-          teams_raw = (os.getenv("IN_TEAMS") or "").strip()
-
-          if not date_str or not teams_raw:
-            print("Provide either game_pk OR both date and teams (e.g. '2025-11-24' + 'NSH - DET').")
-            sys.exit(1)
-
-          m = re.match(r"^\s*([A-Za-z]{2,3})\s*[-@]\s*([A-Za-z]{2,3})\s*$", teams_raw)
-          if not m:
-            print("Teams must look like 'NSH - DET' or 'NSH@DET'")
-            sys.exit(1)
-          t1, t2 = m.group(1).upper(), m.group(2).upper()
-
-          alias = {
-            "NAS":"NSH","PHX":"ARI","LA":"LAK","NJ":"NJD","TB":"TBL","SJ":"SJS",
-            "LV":"VGK","MON":"MTL","WAS":"WSH","ANH":"ANA","CLS":"CBJ","UTAH":"UTA","UTA":"UTA"
+          aliases = {
+              "NAS":"NSH","PHX":"ARI","MTL":"MTL","LA":"LAK","TB":"TBL",
+              "UTAH":"UTA","NJ":"NJD","NYI":"NYI","NYR":"NYR","WSH":"WSH",
+              "CBJ":"CBJ","SJ":"SJS","VGK":"VGK","TBAY":"TBL","LAK":"LAK"
           }
-          t1 = alias.get(t1, t1)
-          t2 = alias.get(t2, t2)
+          def norm(x):
+              x = x.replace(" ","").upper()
+              return aliases.get(x, x)
 
-          API = "https://api-web.nhle.com"
-          url = f"{API}/v1/schedule/{date_str}"
+          if gpk:
+              with open(out, "a") as fh:
+                  fh.write(f"game_pk={gpk}\n")
+                  if gdt: fh.write(f"game_date={gdt}\n")
+              sys.exit(0)
+
+          if not (date and home and away):
+              print("Either provide game_pk or (date + home + away).")
+              sys.exit(1)
+
+          home = norm(home)
+          away = norm(away)
+
+          # попробуем scoreboard
+          url = f"{API}/scoreboard/{date}"
           r = requests.get(url, timeout=25); r.raise_for_status()
           js = r.json()
-          games = js.get("games")
-          if games is None:
-            games = []
-            for w in js.get("gameWeek") or []:
-              games.extend(w.get("games") or [])
-
-          def tri(g, side):
-            x = g.get(f"{side}Team") or {}
-            return (x.get("abbrev") or x.get("triCode") or x.get("teamAbbrev") or "").upper()
-
-          gid = None
+          games = js.get("games") or []
+          found = None
           for g in games:
-            h = tri(g,"home"); a = tri(g,"away")
-            if {h,a} == {t1,t2}:
-              gid = int(g.get("id") or g.get("gameId") or g.get("gamePk") or 0)
-              break
+              h = (g.get("homeTeam",{}) or {}).get("abbrev") or ""
+              a = (g.get("awayTeam",{}) or {}).get("abbrev") or ""
+              if h.upper()==home and a.upper()==away:
+                  found = int(g.get("id") or g.get("gamePk") or 0)
+                  break
 
-          if not gid:
-            print("Game not found for provided date/teams"); sys.exit(1)
+          if not found:
+              # fallback schedule
+              url = f"{API}/schedule/{date}"
+              r = requests.get(url, timeout=25); r.raise_for_status()
+              js = r.json()
+              games = js.get("games")
+              if games is None:
+                  games = []
+                  for w in js.get("gameWeek") or []:
+                      games.extend(w.get("games") or [])
+              for g in games:
+                  h = (g.get("homeTeam",{}) or {}).get("abbrev") or (g.get("homeTeam",{}) or {}).get("teamAbbrev") or ""
+                  a = (g.get("awayTeam",{}) or {}).get("abbrev") or (g.get("awayTeam",{}) or {}).get("teamAbbrev") or ""
+                  if h.upper()==home and a.upper()==away:
+                      found = int(g.get("id") or g.get("gameId") or g.get("gamePk") or 0)
+                      break
 
-          print(f"Resolved GAME_PK: {gid}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"pk={gid}\n")
+          if not found:
+              print(f"Game not found for {date} {home} - {away}")
+              sys.exit(1)
+
+          with open(out, "a") as fh:
+              fh.write(f"game_pk={found}\n")
+              fh.write(f"game_date={date}\n")
+          print("Resolved GAME_PK:", found)
           PY
 
-      - name: Post single match
+      - name: Run single result bot
         env:
-          GAME_PK:            ${{ steps.res.outputs.pk }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "${GAME_PK}" ]; then
-            echo "No GAME_PK resolved"; exit 1
-          fi
-          python nhl_single_result_bot.py
+          GAME_PK:  ${{ steps.resolve.outputs.game_pk }}
+          GAME_DATE:${{ steps.resolve.outputs.game_date }}
+          DRY_RUN:  ${{ env.IN_DRY_RUN }}
+        run: python nhl_single_result_bot.py

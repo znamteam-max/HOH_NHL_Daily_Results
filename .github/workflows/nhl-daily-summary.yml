@@ -2,22 +2,22 @@ name: NHL daily results to Telegram
 
 on:
   schedule:
-    - cron: "35 06 * * *"   # 06:35 UTC (07:35 CET/Amsterdam в ноябре)
+    # Пример: 06:35 Europe/London (подстрои под себя)
+    - cron: "35 5 * * *"
   workflow_dispatch:
     inputs:
-      report_date:
-        description: "Локальная дата игрового дня YYYY-MM-DD (в таймзоне tz)"
+      local_date:
+        description: "Дата локального дня YYYY-MM-DD (если пусто — авто: вчера в указанной TZ)"
         required: false
         default: ""
-      tz:
-        description: "IANA таймзона (по умолчанию Europe/Amsterdam)"
+      timezone:
+        description: "IANA TZ для локального дня (напр. Europe/Amsterdam)"
         required: false
         default: "Europe/Amsterdam"
-      force_republish:
-        description: "Игнорировать маркер .posted и переопубликовать"
-        type: boolean
+      dry_run:
+        description: "Только показать предпросмотр в логах (не отправлять в TG)"
         required: false
-        default: false
+        default: "false"
 
 permissions:
   contents: write
@@ -29,12 +29,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      IN_DATE:            ${{ github.event.inputs.report_date }}
-      IN_TZ:              ${{ github.event.inputs.tz }}
-      FORCE_REPUBLISH:    ${{ github.event.inputs.force_republish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,57 +43,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Compute local date & marker
-        id: date
-        run: |
-          python - << 'PY'
-          import os, sys
-          from datetime import datetime, timedelta, date
-          try:
-            from zoneinfo import ZoneInfo
-          except Exception:
-            print("Needs Python 3.9+ for zoneinfo"); sys.exit(1)
-
-          tz = os.getenv("IN_TZ") or "Europe/Amsterdam"
-          tzinfo = ZoneInfo(tz)
-
-          given = (os.getenv("IN_DATE") or "").strip()
-          if given:
-            try:
-              base_local = date.fromisoformat(given)
-            except Exception:
-              print("Invalid report_date, must be YYYY-MM-DD"); sys.exit(1)
-          else:
-            now_local = datetime.now(tzinfo)
-            base_local = (now_local.date() - timedelta(days=1))
-
-          ymd_local = base_local.strftime("%Y-%m-%d")
-          marker_name = f"nhl-local-{base_local.strftime('%Y%m%d')}.done"
-
-          print("Local day:", ymd_local, "TZ:", tz)
-          print("marker_name:", marker_name)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"ymd={ymd_local}\n")
-            fh.write(f"tz={tz}\n")
-            fh.write(f"marker={marker_name}\n")
-          PY
-
-      - name: Check posted marker (skip if exists)
-        if: ${{ !inputs.force_republish }}
-        run: |
-          mkdir -p .posted
-          if [ -f ".posted/${{ steps.date.outputs.marker }}" ]; then
-            echo "Already posted for ${{ steps.date.outputs.ymd }} — skip."
-            exit 0
-          fi
-
-      - name: Run daily summary
+      - name: Run bot
         env:
-          REPORT_DATE_LOCAL:  ${{ steps.date.outputs.ymd }}
-          REPORT_DATE_TZ:     ${{ steps.date.outputs.tz }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_DATE_LOCAL:  ${{ github.event.inputs.local_date }}
+          REPORT_DATE_TZ:     ${{ github.event.inputs.timezone }}
+          DRY_RUN:            ${{ github.event.inputs.dry_run }}
         run: |
           python nhl_daily_results_bot.py
 
@@ -111,21 +61,10 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain -- ru_map.json ru_pending.json)" ]; then
+          if [ -n "$(git status --porcelain -- ru_map.json ru_pending.json 2>/dev/null)" ]; then
             git add ru_map.json ru_pending.json
             git commit -m "chore(cache): update RU name map"
             git push
           else
             echo "No cache changes to commit."
           fi
-
-      - name: Mark local day as posted
-        if: ${{ !inputs.force_republish }}
-        run: |
-          mkdir -p .posted
-          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/${{ steps.date.outputs.marker }}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ".posted/${{ steps.date.outputs.marker }}"
-          git commit -m "NHL posted for local ${{ steps.date.outputs.ymd }}" || true
-          git push || true
