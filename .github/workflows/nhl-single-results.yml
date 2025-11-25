@@ -1,51 +1,128 @@
-name: NHL Single Results (every 5 min)
+name: NHL Single Match to Telegram
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      game_pk:
+        description: "Прямой GAME_PK (опционально)"
+        required: false
+        default: ""
+      date:
+        description: "Дата матча YYYY-MM-DD (если не указываете game_pk)"
+        required: false
+        default: ""
+      teams:
+        description: "Пара команд, например: NSH - DET (опционально)"
+        required: false
+        default: ""
+      tz:
+        description: "IANA TZ для интерпретации date (по умолчанию UTC)"
+        required: false
+        default: "UTC"
 
 jobs:
-  single-results:
+  single:
     runs-on: ubuntu-latest
-    concurrency:
-      group: nhl-single-results
-      cancel-in-progress: true
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      IN_PK:    ${{ github.event.inputs.game_pk }}
+      IN_DATE:  ${{ github.event.inputs.date }}
+      IN_TEAMS: ${{ github.event.inputs.teams }}
+      IN_TZ:    ${{ github.event.inputs.tz }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Restore state cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
+      - uses: actions/checkout@v4
         with:
-          path: state
-          key: nhl-single-state-${{ github.run_id }}
-          restore-keys: |
-            nhl-single-state-
+          fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4
 
-      - name: Run single-result bot
+      - name: Resolve GAME_PK if needed
+        id: res
+        run: |
+          python - << 'PY'
+          import os, sys, re, requests
+          from datetime import datetime, timedelta
+          try:
+            from zoneinfo import ZoneInfo
+          except Exception:
+            ZoneInfo = None
+
+          pk = (os.getenv("IN_PK") or "").strip()
+          if pk:
+            print(f"GAME_PK provided: {pk}")
+            print(f"::set-output name=pk::{pk}")
+            sys.exit(0)
+
+          date_str = (os.getenv("IN_DATE") or "").strip()
+          teams_raw = (os.getenv("IN_TEAMS") or "").strip()
+          tz = (os.getenv("IN_TZ") or "UTC").strip()
+
+          if not date_str or not teams_raw:
+            print("Provide either game_pk OR both date and teams (e.g. '2025-11-24' + 'NSH - DET').")
+            sys.exit(1)
+
+          # normalize teams
+          m = re.match(r"^\s*([A-Za-z]{2,3})\s*[-@]\s*([A-Za-z]{2,3})\s*$", teams_raw)
+          if not m:
+            print("Teams must look like 'NSH - DET' or 'NSH@DET'")
+            sys.exit(1)
+          t1, t2 = m.group(1).upper(), m.group(2).upper()
+
+          alias = {
+            "NAS":"NSH","PHX":"ARI","LA":"LAK","NJ":"NJD","TB":"TBL","SJ":"SJS",
+            "LV":"VGK","MTL":"MTL","MON":"MTL","NYR":"NYR","NYI":"NYI","WSH":"WSH",
+            "WAS":"WSH","ANH":"ANA","CLS":"CBJ","PHI":"PHI","UTAH":"UTA","UTA":"UTA"
+          }
+          t1 = alias.get(t1, t1)
+          t2 = alias.get(t2, t2)
+
+          # fetch day schedule (api-web)
+          API = "https://api-web.nhle.com"
+          url = f"{API}/v1/schedule/{date_str}"
+          r = requests.get(url, timeout=25); r.raise_for_status()
+          js = r.json()
+          games = js.get("games")
+          if games is None:
+            games = []
+            for w in js.get("gameWeek") or []:
+              games.extend(w.get("games") or [])
+
+          # find match by triCodes (home-away OR away-home)
+          def tri(g, side):
+            x = g.get(f"{side}Team") or {}
+            return (x.get("abbrev") or x.get("triCode") or x.get("teamAbbrev") or "").upper()
+
+          found = None
+          for g in games:
+            h = tri(g,"home"); a = tri(g,"away")
+            if {h,a}=={t1,t2}:
+              found = g; break
+
+          if not found:
+            print("Game not found for provided date/teams")
+            sys.exit(1)
+
+          gid = int(found.get("id") or found.get("gameId") or found.get("gamePk") or 0)
+          if gid <= 0:
+            print("Invalid game id in schedule"); sys.exit(1)
+
+          print(f"Resolved GAME_PK: {gid}")
+          print(f"::set-output name=pk::{gid}")
+          PY
+
+      - name: Post single match
         env:
+          GAME_PK:            ${{ steps.res.outputs.pk }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-          STATE_PATH: state/posted_games.json
         run: |
+          if [ -z "${GAME_PK}" ]; then
+            echo "No GAME_PK resolved"; exit 1
+          fi
           python nhl_single_result_bot.py
-
-      - name: Save state cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state
-          key: nhl-single-state-${{ github.run_id }}

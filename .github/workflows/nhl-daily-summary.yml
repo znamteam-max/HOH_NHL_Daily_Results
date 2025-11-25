@@ -1,76 +1,114 @@
-name: "NHL Daily Summary"
+name: NHL daily results to Telegram
 
 on:
   schedule:
-    - cron: "30 12 * * *"   # 12:30 UTC — подстрой под ваш канал
-  workflow_dispatch: {}
+    - cron: "35 06 * * *"   # 06:35 UTC (07:35 CET/Amsterdam в ноябре)
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: "Локальная дата игрового дня YYYY-MM-DD (в таймзоне tz)"
+        required: false
+        default: ""
+      tz:
+        description: "IANA таймзона (по умолчанию Europe/Amsterdam)"
+        required: false
+        default: "Europe/Amsterdam"
+      force_republish:
+        description: "Игнорировать маркер .posted и переопубликовать"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
 
-jobs:
-  daily-summary:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: nhl-daily-summary
-      cancel-in-progress: true
+concurrency:
+  group: nhl-daily-summary
+  cancel-in-progress: true
 
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      IN_DATE:            ${{ github.event.inputs.report_date }}
+      IN_TZ:              ${{ github.event.inputs.tz }}
+      FORCE_REPUBLISH:    ${{ github.event.inputs.force_republish }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Без heredoc, чтобы не ловить 'unexpected end of file'
-      - name: Check PT marker (skip if already posted)
-        id: ptmarker
-        shell: python
-        run: |
-          import os
-          from datetime import datetime, timedelta
-          from zoneinfo import ZoneInfo
-          from pathlib import Path
-
-          now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-          base = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
-          pymd = base.strftime("%Y%m%d")
-          print("ptymd:", pymd)
-
-          marker = Path(f".posted/nhl-pt-{pymd}.done")
-          os.makedirs(".posted", exist_ok=True)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"ptymd={pymd}\n")
-            fh.write(f"skip={'true' if marker.exists() else 'false'}\n")
-
-      - name: Setup Python
-        if: steps.ptmarker.outputs.skip != 'true'
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        if: steps.ptmarker.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests beautifulsoup4
 
-      - name: Run daily results bot (spoilered)
-        if: steps.ptmarker.outputs.skip != 'true'
+      - name: Compute local date & marker
+        id: date
+        run: |
+          python - << 'PY'
+          import os, sys
+          from datetime import datetime, timedelta, date
+          try:
+            from zoneinfo import ZoneInfo
+          except Exception:
+            print("Needs Python 3.9+ for zoneinfo"); sys.exit(1)
+
+          tz = os.getenv("IN_TZ") or "Europe/Amsterdam"
+          tzinfo = ZoneInfo(tz)
+
+          given = (os.getenv("IN_DATE") or "").strip()
+          if given:
+            try:
+              base_local = date.fromisoformat(given)
+            except Exception:
+              print("Invalid report_date, must be YYYY-MM-DD"); sys.exit(1)
+          else:
+            now_local = datetime.now(tzinfo)
+            # берём ВЧЕРА в локальной таймзоне
+            base_local = (now_local.date() - timedelta(days=1))
+
+          ymd_local = base_local.strftime("%Y-%m-%d")
+          print("Local day:", ymd_local, "TZ:", tz)
+
+          # маркер для локальной даты
+          marker_name = f"nhl-local-{base_local.strftime('%Y%m%d')}.done"
+          print("marker_name=", marker_name)
+
+          print(f"::set-output name=ymd::{ymd_local}")
+          print(f"::set-output name=tz::{tz}")
+          print(f"::set-output name=marker::{marker_name}")
+          PY
+
+      - name: Check posted marker (skip if exists)
+        if: ${{ github.event.inputs.force_republish != 'true' && github.event.inputs.force_republish != true }}
+        run: |
+          mkdir -p .posted
+          if [ -f ".posted/${{ steps.date.outputs.marker }}" ]; then
+            echo "Already posted for ${{ steps.date.outputs.ymd }} — skip."
+            exit 0
+          fi
+
+      - name: Run daily summary
         env:
+          REPORT_DATE_LOCAL:  ${{ steps.date.outputs.ymd }}
+          REPORT_DATE_TZ:     ${{ steps.date.outputs.tz }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
         run: |
           python nhl_daily_results_bot.py
 
-      - name: Update RU name cache from sports.ru (optional)
-        if: steps.ptmarker.outputs.skip != 'true' && hashFiles('update_ru_cache.py') != ''
+      - name: Update RU name cache from sports.ru
         run: |
           python update_ru_cache.py || true
 
-      - name: Commit RU cache changes (if any)
-        if: steps.ptmarker.outputs.skip != 'true'
+      - name: Commit cache changes (if any)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -81,3 +119,14 @@ jobs:
           else
             echo "No cache changes to commit."
           fi
+
+      - name: Mark local day as posted
+        if: ${{ github.event.inputs.force_republish != 'true' && github.event.inputs.force_republish != true }}
+        run: |
+          mkdir -p .posted
+          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/${{ steps.date.outputs.marker }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ".posted/${{ steps.date.outputs.marker }}"
+          git commit -m "NHL posted for local ${{ steps.date.outputs.ymd }}" || true
+          git push || true

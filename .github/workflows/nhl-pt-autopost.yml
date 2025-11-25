@@ -1,8 +1,8 @@
-name: "NHL Auto Post (PT day complete)"
+name: NHL Auto Post (PT day complete)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # проверка каждые 10 минут (UTC)
+    - cron: "*/10 * * * *"   # каждые 10 минут (UTC)
   workflow_dispatch:
     inputs:
       pt_date:
@@ -23,9 +23,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
       FORCE_PT_DATE:      ${{ github.event.inputs.pt_date }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,22 +36,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4
 
-      - name: Resolve PT day and check NHL completeness
+      - name: Resolve PT day and check completeness
         id: check
-        shell: python
         run: |
+          python - << 'PY'
           import os, sys, requests
           from datetime import datetime, timedelta, date, time
           from zoneinfo import ZoneInfo
           from pathlib import Path
 
           API = "https://api-web.nhle.com"
+
           tz_pt = ZoneInfo("America/Los_Angeles")
 
+          # 1) Базовая PT-дата: ручная или авто (до 06:00 PT считаем вчера)
           force = os.getenv("FORCE_PT_DATE","").strip()
           if force:
             try:
@@ -67,19 +65,18 @@ jobs:
           ymd_pt = base_pt.strftime("%Y-%m-%d")
           print("PT day:", ymd_pt)
 
-          marker_dir = Path(".posted")
-          marker_dir.mkdir(parents=True, exist_ok=True)
+          # 2) Маркер «уже отправлено»
+          marker_dir = Path(".posted"); marker_dir.mkdir(parents=True, exist_ok=True)
           marker = marker_dir / f"nhl-pt-{base_pt.strftime('%Y%m%d')}.done"
           if marker.exists():
             print(f"Already posted for NHL PT {ymd_pt}, skip.")
+            print(f"pt_ymd={ymd_pt}")
             with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("ready=false\n")
               fh.write(f"pt_ymd={ymd_pt}\n")
             sys.exit(0)
 
-          start_pt = datetime.combine(base_pt, time(0,0), tzinfo=tz_pt)
-          end_pt   = datetime.combine(base_pt, time(23,59,59), tzinfo=tz_pt)
-
+          # 3) Собираем игры, стартовавшие в пределах PT-дня
           def fetch_sched(d):
             url = f"{API}/v1/schedule/{d.isoformat()}"
             r = requests.get(url, timeout=25); r.raise_for_status()
@@ -92,25 +89,30 @@ jobs:
                 games.extend(w.get("games") or [])
             return games or []
 
-          raw = []
-          for d in (base_pt - timedelta(days=1), base_pt):
-            raw.extend(fetch_sched(d))
+          start_pt = datetime.combine(base_pt, time(0,0), tzinfo=tz_pt)
+          end_pt   = datetime.combine(base_pt, time(23,59,59), tzinfo=tz_pt)
 
-          def start_pt_dt(g):
+          def start_dt_pt(g):
             utc = g.get("startTimeUTC") or g.get("startTime")
             if not utc: return None
-            return datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
+            from_dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
+            return from_dt
+
+          raw = []
+          for d in (base_pt - timedelta(days=1), base_pt, base_pt + timedelta(days=1)):
+            raw.extend(fetch_sched(d))
 
           games_pt = []
           for g in raw:
-            dt_pt = start_pt_dt(g)
-            if dt_pt and (start_pt <= dt_pt <= end_pt):
+            dt_pt = start_dt_pt(g)
+            if dt_pt and start_pt <= dt_pt <= end_pt:
               games_pt.append(g)
 
           print("Games within PT window:", len(games_pt))
 
           def is_completed(g):
-            return (g.get("gameState","").upper() in ("FINAL","OFF"))
+            st = (g.get("gameState") or "").upper()
+            return st in ("FINAL", "OFF")
 
           all_done = bool(games_pt) and all(is_completed(g) for g in games_pt)
           print("all_completed:", all_done)
@@ -118,15 +120,17 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
             fh.write(f"ready={'true' if all_done else 'false'}\n")
             fh.write(f"pt_ymd={ymd_pt}\n")
+          PY
 
-      - name: Run daily results bot (spoilered)
+      - name: Run daily summary for that PT day
         if: steps.check.outputs.ready == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-        run: |
-          python nhl_daily_results_bot.py
+          # Для бота: локальная дата и часовой пояс
+          REPORT_DATE_LOCAL:  ${{ steps.check.outputs.pt_ymd }}
+          REPORT_DATE_TZ:     America/Los_Angeles
+        run: python3 nhl_daily_results_bot.py
 
       - name: Mark PT day as posted (with rebase & retry)
         if: steps.check.outputs.ready == 'true'
