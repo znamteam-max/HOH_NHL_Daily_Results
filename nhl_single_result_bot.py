@@ -4,32 +4,28 @@
 """
 HOH · NHL Single Result Bot — per-game instant posts (no repeats)
 
-— Можно запускать по расписанию (вчера+сегодня, FINAL и ещё не отправлялись)
-  или вручную на конкретный матч.
-— Ручной запуск:
-    * GAME_PK="2025020349"
-    * GAME_QUERY="YYYY-MM-DD NSH - DET"  (алиасы: NAS→NSH, LA→LAK, TB→TBL, MON→MTL, ARZ→ARI)
-— Формат: эмодзи вне «шапки», внутри — жирным «Команда»: счёт; рекорд в скобках (W-L-OT).
-— Заголовки периодов/ОТ/буллитов — курсивом; «Овертайм» без №, если он один.
-— Перед каждым заголовком периода — пустая строка.
-— Победный буллит: отдельный блок в конце:
+— Постит один выбранный матч (через GAME_PK или GAME_QUERY).
+— Шапка: «Команда»: счёт; рекорд (W-L-OT).
+— Периоды/ОТ/буллиты — курсивом; список событий.
+— Буллиты: выводим только одну строку «Победный буллит» в формате:
     Победный буллит
-    <итоговый счёт> – <Имя>
+    <итоговый счёт> - <Имя>
+— Имена: берём из official PBP (в т.ч. из players[]), где возможно подменяем на
+  sports.ru (кириллица). Добавлена поддержка Юты (UTA).
+— GAME_QUERY разрешается даже если порядок «HOME - AWAY» указан наоборот.
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
-- STATE_PATH="state/posted_games.json"
-- GAME_PK (опц.)
-- GAME_QUERY (опц.) — приоритет над автоматикой
-- DRY_RUN=0/1
-- DEBUG_VERBOSE=0/1
+- GAME_PK (опц.), GAME_QUERY (опц. строка вида "YYYY-MM-DD AAA - BBB" или "AAA@BBB")
+- SEARCH_BACK=1, SEARCH_FWD=1, REQUIRE_FINAL=1, FORCE_POST=1
+- DRY_RUN=0/1, DEBUG_VERBOSE=0/1
 """
 
 from __future__ import annotations
 import os, re, json, time, textwrap, pathlib
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -42,7 +38,10 @@ except Exception:
 TG_API     = "https://api.telegram.org"
 NHLE_BASE  = "https://api-web.nhle.com/v1"
 PBP_FMT    = NHLE_BASE + "/gamecenter/{gamePk}/play-by-play"
+SCHED_FMT  = NHLE_BASE + "/schedule/{day}"
+GAME_SUMMARY_FMT = NHLE_BASE + "/gamecenter/{gamePk}/game-summary"
 
+# ========= ENV =========
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None else default
@@ -59,9 +58,8 @@ def _env_int(name: str, default: int) -> int:
 DRY_RUN = _env_bool("DRY_RUN", False)
 DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", False)
 STATE_PATH = _env_str("STATE_PATH", "state/posted_games.json")
-GAME_PK_ENV = _env_str("GAME_PK","").strip()
-GAME_QUERY  = _env_str("GAME_QUERY","").strip()
 
+# ========= RU / TEAMS =========
 TEAM_RU = {
     "ANA":"Анахайм","ARI":"Аризона","BOS":"Бостон","BUF":"Баффало","CGY":"Калгари","CAR":"Каролина",
     "CHI":"Чикаго","COL":"Колорадо","CBJ":"Коламбус","DAL":"Даллас","DET":"Детройт","EDM":"Эдмонтон",
@@ -88,8 +86,10 @@ SPORTSRU_SLUG = {
     "STL":"st-louis-blues","TBL":"tampa-bay-lightning","TOR":"toronto-maple-leafs",
     "VAN":"vancouver-canucks","VGK":"vegas-golden-knights","WSH":"washington-capitals",
     "WPG":"winnipeg-jets",
+    # UTA (Юта) на sports.ru пока нестабильна
 }
 
+# ========= HTTP =========
 UA_HEADERS = {
     "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept-Language":"ru,en;q=0.8",
@@ -115,7 +115,7 @@ def _get_with_retries(url: str, timeout: int = 30, tries: int = 3, backoff: floa
 def http_get_json(url: str, timeout: int = 30) -> Any: return _get_with_retries(url, timeout=timeout, as_text=False)
 def http_get_text(url: str, timeout: int = 30) -> str: return _get_with_retries(url, timeout=timeout, as_text=True)
 
-# --- Models ---
+# ========= Models =========
 @dataclass
 class TeamRecord:
     wins:int; losses:int; ot:int; points:int
@@ -126,11 +126,8 @@ class GameMeta:
 @dataclass
 class ScoringEvent:
     period:int; period_type:str; time:str; team_for:str; home_goals:int; away_goals:int; scorer:str; assists:List[str]=field(default_factory=list)
-@dataclass
-class SRUGoal:
-    time:Optional[str]; scorer_ru:Optional[str]; assists_ru:List[str]
 
-# --- Helpers ---
+# ========= helpers =========
 def _upper_str(x: Any)->str:
     try: return str(x or "").upper()
     except: return ""
@@ -151,8 +148,14 @@ def _extract_name(obj_or_str: Any)->Optional[str]:
             v=obj_or_str.get(k)
             if isinstance(v,str) and v.strip(): return v.strip()
     return None
+def _clean_parens(s: str) -> str:
+    s = s.strip()
+    if s.startswith("(") and s.endswith(")") and s.count("(")==1 and s.count(")")==1:
+        s = s[1:-1]
+    s = s.replace("((", "(").replace("))", ")")
+    return s
 
-# --- Standings / schedule / PBP / sports.ru ---
+# ========= standings / schedule =========
 def fetch_standings_map()->Dict[str,TeamRecord]:
     url=f"{NHLE_BASE}/standings/now"; data=http_get_json(url); teams:Dict[str,TeamRecord]={}; nodes=[]
     if isinstance(data,dict):
@@ -173,72 +176,54 @@ def fetch_standings_map()->Dict[str,TeamRecord]:
         if abbr: teams[abbr]=TeamRecord(wins,losses,ot,pts)
     return teams
 
-def list_games_yesterday_today_final()->List[GameMeta]:
-    now_utc=datetime.now(timezone.utc)
-    dates=[(now_utc - timedelta(days=1)).date().isoformat(), now_utc.date().isoformat()]
-    metas:Dict[int,GameMeta]={}
-    for day in dates:
-        url=f"{NHLE_BASE}/schedule/{day}"; s=http_get_json(url)
-        for w in s.get("gameWeek",[]) or []:
-            for g in w.get("games",[]) or []:
-                state=_upper_str(g.get("gameState") or g.get("gameStatus"))
-                if state not in ("FINAL","OFF"): continue
-                gid=_first_int(g.get("id"),g.get("gameId"),g.get("gamePk"))
-                if gid==0: continue
-                gd=g.get("startTimeUTC") or g.get("gameDate") or ""
-                try: gdt=datetime.fromisoformat(str(gd).replace("Z","+00:00"))
-                except: gdt=now_utc
-                home=g.get("homeTeam",{}) or {}; away=g.get("awayTeam",{}) or {}
-                htri=_upper_str(home.get("abbrev") or home.get("triCode") or home.get("teamAbbrev"))
-                atri=_upper_str(away.get("abbrev") or away.get("triCode") or away.get("teamAbbrev"))
-                hscore=_first_int(home.get("score")); ascore=_first_int(away.get("score"))
-                metas[gid]=GameMeta(gid,gdt,state,htri,atri,hscore,ascore)
-    return sorted(metas.values(), key=lambda m:m.gameDateUTC)
+def fetch_schedule_day(day: str) -> List[dict]:
+    js = http_get_json(SCHED_FMT.format(day=day))
+    games = js.get("games")
+    if games is None:
+        games = []
+        for w in js.get("gameWeek") or []:
+            games += w.get("games") or []
+    return games or []
 
-# Aliases for convenience
-ALIAS = {"NAS":"NSH","LA":"LAK","TB":"TBL","MON":"MTL","ARZ":"ARI"}
-def _norm_tri(s: str)->str:
-    s = _upper_str(s.strip())
-    return ALIAS.get(s, s)
-
-def resolve_game_pk_by_query(q: str) -> Optional[int]:
+def resolve_game_pk_from_query(game_query: str, search_back:int=1, search_fwd:int=1, require_final:bool=True) -> Optional[int]:
     """
-    Формат: 'YYYY-MM-DD NSH - DET' (home - away).
-    Ищем в окне [date-1 .. date+1] по schedule.
+    GAME_QUERY: "YYYY-MM-DD AAA - BBB" (HOME-AWAY) ИЛИ "AAA@BBB" (AWAY@HOME)
+    Разрешаем и «перевёрнутый» порядок — матч ищется по множеству {AAA,BBB}.
     """
-    try:
-        day_str, teams = q.strip().split(" ", 1)
-        d = date.fromisoformat(day_str)
-        parts = re.split(r"\s*-\s*", teams)
-        if len(parts) != 2: return None
-        home = _norm_tri(parts[0])
-        away = _norm_tri(parts[1])
-    except Exception:
+    game_query = (game_query or "").strip()
+    if not game_query: return None
+    m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(.+)$", game_query)
+    if not m: return None
+    base_day, rest = m.group(1), m.group(2).strip().upper().replace(" ", "")
+    if "@" in rest:
+        away, home = rest.split("@",1)
+    elif "-" in rest:
+        left, right = rest.split("-",1)
+        home, away = left, right
+    else:
         return None
 
-    def fetch_sched(d: date) -> List[dict]:
-        js = http_get_json(f"{NHLE_BASE}/schedule/{d.isoformat()}")
-        out=[]
-        for w in js.get("gameWeek",[]) or []:
-            out.extend(w.get("games",[]) or [])
-        return out
-
-    pool=[]
-    for delta in (-1,0,1):
-        pool.extend(fetch_sched(d + timedelta(days=delta)))
-
-    for g in pool:
-        gid=_first_int(g.get("id"),g.get("gameId"),g.get("gamePk"))
-        if gid==0: continue
-        ht=_upper_str((g.get("homeTeam") or {}).get("abbrev") or (g.get("homeTeam") or {}).get("triCode") or (g.get("homeTeam") or {}).get("teamAbbrev"))
-        at=_upper_str((g.get("awayTeam") or {}).get("abbrev") or (g.get("awayTeam") or {}).get("triCode") or (g.get("awayTeam") or {}).get("teamAbbrev"))
-        st=_upper_str(g.get("gameState") or g.get("gameStatus"))
-        if ht==home and at==away and st in ("FINAL","OFF"):
-            print(f"[DBG] Resolved GAME_PK={gid} for {q}")
-            return gid
-    print(f"[DBG] Unable to resolve GAME_PK for {q}")
+    tri_set = {home, away}
+    # Окно поиска по календарю
+    base_dt = datetime.fromisoformat(base_day)
+    days = [(base_dt + timedelta(days=d)).date().isoformat() for d in range(-search_back, search_fwd+1)]
+    for d in days:
+        for g in fetch_schedule_day(d):
+            st = _upper_str(g.get("gameState") or g.get("gameStatus"))
+            if require_final and st not in ("FINAL","OFF"): 
+                continue
+            ht = _upper_str((g.get("homeTeam") or {}).get("abbrev") or (g.get("homeTeam") or {}).get("triCode") or (g.get("homeTeam") or {}).get("teamAbbrev"))
+            at = _upper_str((g.get("awayTeam") or {}).get("abbrev") or (g.get("awayTeam") or {}).get("triCode") or (g.get("awayTeam") or {}).get("teamAbbrev"))
+            if {ht, at} != tri_set:
+                continue
+            gid = _first_int(g.get("id"), g.get("gameId"), g.get("gamePk"))
+            if gid:
+                print(f"[DBG] Resolved GAME_PK={gid} for {game_query}")
+                return gid
+    print(f"[DBG] Unable to resolve GAME_PK for {game_query}")
     return None
 
+# ========= PBP parsing =========
 _SO_TYPES_GOAL = {"GOAL","SHOT"}
 _ASSIST_KEYS = (
     "assist1PlayerName","assist2PlayerName","assist3PlayerName",
@@ -265,22 +250,34 @@ def _is_shootout_goal(type_key: str, details: dict, period_type: str) -> bool:
         if isinstance(v, str) and v.strip().lower() in ("1","true","yes"): return True
     return type_key == "GOAL"
 
-def _name_from_player_obj(o: dict) -> Optional[str]:
-    for k in ("playerName","name","fullName","firstLastName","lastFirstName","default","shortName"):
-        v = o.get(k)
-        if isinstance(v, str) and v.strip(): return v.strip()
-    pl = o.get("player") or {}
-    for k in ("fullName","firstLastName","lastFirstName","name","default","shortName"):
-        v = pl.get(k)
-        if isinstance(v, str) and v.strip(): return v.strip()
-    f = (o.get("firstName") or "").strip()
-    l = (o.get("lastName") or "").strip()
-    if f or l: return (f + " " + l).strip()
-    return None
-
-_PAREN_CLEAN = re.compile(r'^[\(\s]+|[\)\s]+$')
-def _clean_paren(s: str) -> str:
-    return _PAREN_CLEAN.sub("", s or "").strip()
+def _names_from_players_list(p: dict) -> Tuple[Optional[str], List[str]]:
+    """
+    Универсальный разбор p['players'] NHL-web:
+    ищем Scorer/Shooter и Assist/Primary/Secondary.
+    """
+    scorer = None
+    assists: List[str] = []
+    arr = p.get("players") or []
+    if isinstance(arr, list):
+        for item in arr:
+            if not isinstance(item, dict): 
+                continue
+            ptype = _upper_str(item.get("playerType") or item.get("type"))
+            # Имя может лежать в разных полях:
+            nm = _extract_name(item) or _extract_name(item.get("player", {})) or _extract_name(item.get("name", {}))
+            if not nm:
+                first = item.get("firstName", {})
+                last  = item.get("lastName",  {})
+                fn = _extract_name(first) or first.get("default") if isinstance(first, dict) else first
+                ln = _extract_name(last) or last.get("default") if isinstance(last, dict) else last
+                nm = " ".join([x for x in [fn, ln] if x])
+            if not nm: 
+                continue
+            if ptype in ("SCORER","GOALSCORER","SHOOTER","SHOOTOUTSHOOTER"):
+                scorer = nm
+            elif "ASSIST" in ptype:
+                assists.append(nm)
+    return scorer, assists
 
 def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[ScoringEvent]:
     data=http_get_json(PBP_FMT.format(gamePk=gamePk)); plays=data.get("plays",[]) or []
@@ -301,46 +298,41 @@ def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[Scoring
             else: h,a=prev_h,prev_a
         team=home_tri if h>prev_h else (away_tri if a>prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
 
+        # ---- извлекаем имена
         scorer=""
         for k in _SCORER_KEYS:
             nm=_extract_name(det.get(k))
             if nm: scorer=nm; break
-
         assists=[]
         for k in _ASSIST_KEYS:
             nm=_extract_name(det.get(k))
-            if nm: assists.append(_clean_paren(nm))
+            if nm: assists.append(nm)
 
-        # Фоллбэк players[]
+        # fallback на players[]
         if not scorer or not assists:
-            players = p.get("players") or []
-            assists_by_order: Dict[int, str] = {}
-            for pl in players:
-                ptype_pl = (pl.get("playerType") or "").strip().lower()
-                nm = _name_from_player_obj(pl) or ""
-                if not nm: continue
-                if ptype_pl in ("scorer","shooter") and not scorer:
-                    scorer = nm
-                elif ptype_pl == "assist":
-                    order = _first_int(pl.get("assistOrder"), pl.get("orderNumber"), pl.get("sequence"))
-                    if order == 0: order = 99
-                    assists_by_order[order] = nm
-            if not assists and assists_by_order:
-                assists = [assists_by_order[k] for k in sorted(assists_by_order.keys())]
+            sc2, as2 = _names_from_players_list(p)
+            if not scorer and sc2: scorer = sc2
+            if not assists and as2: assists = as2
 
-        assists = [_clean_paren(x) for x in assists if _clean_paren(x)]
-        events.append(ScoringEvent(period,ptype,t,team,h,a,scorer or "—",assists))
+        # финальная чистка скобок у ассистов
+        assists = [_clean_parens(x) for x in assists]
+
+        events.append(ScoringEvent(period,ptype,t,team,h,a,scorer or "", assists))
         if ptype!="SHOOTOUT":
             prev_h,prev_a=h,a
     return events
 
+# ========= sports.ru =========
 TIME_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
 def _extract_time(text: str)->Optional[str]:
-    m=TIME_RE.search(text or "")
+    m=TIME_RE.search(text or ""); 
     return f"{int(m.group(1)):02d}.{m.group(2)}" if m else None
 
-def parse_sportsru_goals_html(html: str, side: str)->List[SRUGoal]:
-    res: List[SRUGoal] = []
+def parse_sportsru_goals_html(html: str, side: str)->List[Tuple[Optional[str], Optional[str], List[str]]]:
+    """
+    Возвращаем (time, scorer_ru, assists_ru[]). Буллиты sports.ru почти не отдают — не рассчитываем на них.
+    """
+    res: List[Tuple[Optional[str], Optional[str], List[str]]] = []
     if HAS_BS:
         soup=BS(html,"lxml" if "lxml" in globals() else "html.parser")
         ul=soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(f"ul.match-summary__goals-list.match-summary__goals-list--{side}")
@@ -348,56 +340,44 @@ def parse_sportsru_goals_html(html: str, side: str)->List[SRUGoal]:
             for li in ul.find_all("li", recursive=False):
                 anchors=[a.get_text(strip=True) for a in li.find_all("a")]
                 scorer_ru=anchors[0] if anchors else None
-                assists_ru=anchors[1:] if len(anchors)>1 else []
+                assists_ru=[_clean_parens(a) for a in (anchors[1:] if len(anchors)>1 else [])]
                 raw=li.get_text(" ", strip=True); time_ru=_extract_time(raw)
-                res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
+                res.append((time_ru, scorer_ru, assists_ru))
     return res
 
-def fetch_sportsru_goals(home_tri:str, away_tri:str)->Tuple[List[SRUGoal],List[SRUGoal],str]:
+def fetch_sportsru_goals(home_tri:str, away_tri:str):
     hs=SPORTSRU_SLUG.get(home_tri); as_=SPORTSRU_SLUG.get(away_tri)
     if not hs or not as_: return [], [], ""
     for order in [(hs,as_),(as_,hs)]:
         url=f"https://www.sports.ru/hockey/match/{order[0]}-vs-{order[1]}/"
         try: html=http_get_text(url, timeout=20)
-        except Exception as e:
+        except Exception as e: 
             print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}"); continue
         home_side="home" if order[0]==hs else "away"; away_side="away" if home_side=="home" else "home"
         h=parse_sportsru_goals_html(html, home_side); a=parse_sportsru_goals_html(html, away_side)
-        if h or a:
-            return h,a,url
+        if h or a: return h,a,url
     return [],[], ""
 
-def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home: List[SRUGoal], sru_away: List[SRUGoal], home_tri:str, away_tri:str)->List[ScoringEvent]:
-    def pick_by_time(side_list: List[SRUGoal], t: str, used: set) -> Optional[SRUGoal]:
-        for i, g in enumerate(side_list):
-            if i in used: continue
-            if g.time and g.time == t:
-                used.add(i); return g
-        if t and "." in t:
-            m = t.split(".")[0]
-            for i, g in enumerate(side_list):
-                if i in used: continue
-                if g.time and g.time.split(".")[0] == m:
-                    used.add(i); return g
-        return None
-
-    used_h, used_a = set(), set()
-    out=[]
+def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home, sru_away, home_tri:str, away_tri:str)->List[ScoringEvent]:
+    """
+    Идём по официальным событиям по порядку, подставляем кириллицу по индексу команды.
+    """
+    h_i=a_i=0; out=[]
     for ev in evs:
-        if ev.team_for==home_tri:
-            g=pick_by_time(sru_home, ev.time, used_h)
-            if g:
-                ev.scorer=g.scorer_ru or ev.scorer or ""
-                ev.assists=g.assists_ru or ev.assists
-        elif ev.team_for==away_tri:
-            g=pick_by_time(sru_away, ev.time, used_a)
-            if g:
-                ev.scorer=g.scorer_ru or ev.scorer or ""
-                ev.assists=g.assists_ru or ev.assists
-        ev.assists=[_clean_paren(x) for x in (ev.assists or []) if _clean_paren(x)]
+        if ev.period_type=="SHOOTOUT":
+            out.append(ev); continue  # буллиты не пытаемся биндить к sports.ru
+        if ev.team_for==home_tri and h_i<len(sru_home):
+            _, scorer_ru, assists_ru = sru_home[h_i]; h_i+=1
+            ev.scorer = scorer_ru or ev.scorer or ""
+            ev.assists = assists_ru or ev.assists
+        elif ev.team_for==away_tri and a_i<len(sru_away):
+            _, scorer_ru, assists_ru = sru_away[a_i]; a_i+=1
+            ev.scorer = scorer_ru or ev.scorer or ""
+            ev.assists = assists_ru or ev.assists
         out.append(ev)
     return out
 
+# ========= formatting =========
 def _italic(s:str)->str: return f"<i>{s}</i>"
 def period_title_text(num:int, ptype:str, ot_index:Optional[int], ot_total:int)->str:
     t=(ptype or "").upper()
@@ -405,20 +385,32 @@ def period_title_text(num:int, ptype:str, ot_index:Optional[int], ot_total:int)-
     if t=="OVERTIME": return "Овертайм" if ot_total<=1 else f"Овертайм №{ot_index or 1}"
     if t=="SHOOTOUT": return "Буллиты"
     return f"Период {num}"
-def line_goal(ev:ScoringEvent)->str:
-    score=f"{ev.home_goals}:{ev.away_goals}"; who=ev.scorer or "—"; assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
-    return f"{score} – {ev.time} {who}{assists}"
+def _line_goal(ev:ScoringEvent)->str:
+    score=f"{ev.home_goals}:{ev.away_goals}"
+    who=ev.scorer or "—"
+    assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
+    line = f"{score} – {ev.time} {who}{assists}"
+    return line.replace("((", "(").replace("))", ")")
+
+def _shootout_winner_line(meta: GameMeta, events: List[ScoringEvent]) -> Optional[str]:
+    so_goals = [e for e in events if e.period_type=="SHOOTOUT"]
+    if not so_goals:
+        return None
+    winner = meta.home_tri if meta.home_score > meta.away_score else meta.away_tri
+    # последний результативный удар победившей команды
+    winner_goals = [e for e in so_goals if e.team_for==winner and (e.scorer or "").strip()]
+    if not winner_goals:
+        return None
+    last = winner_goals[-1]
+    final = f"{meta.home_score}:{meta.away_score}"
+    return f"Победный буллит\n{final} - {last.scorer}"
 
 def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], events: List[ScoringEvent]) -> str:
     he=TEAM_EMOJI.get(meta.home_tri,""); ae=TEAM_EMOJI.get(meta.away_tri,"")
     hn=TEAM_RU.get(meta.home_tri,meta.home_tri); an=TEAM_RU.get(meta.away_tri,meta.away_tri)
-
-    # Вне «шапки» — только эмодзи (без дубля названий)
-    visible = f"{he}\n{ae}"
-
     hrec=standings.get(meta.home_tri).as_str() if meta.home_tri in standings else "?"
     arec=standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
-    head=f"<b>«{hn}»: {meta.home_score}</b> ({hrec})\n<b>«{an}»: {meta.away_score}</b> ({arec})"
+    head=f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
 
     groups:Dict[Tuple[int,str],List[ScoringEvent]]={}
     for ev in events: groups.setdefault((ev.period,ev.period_type),[]).append(ev)
@@ -426,10 +418,6 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
         if (pnum,"REGULAR") not in groups: groups[(pnum,"REGULAR")]=[]
     ot_keys=sorted([k for k in groups if (k[1] or "").upper()=="OVERTIME"], key=lambda x:x[0])
     ot_total=len(ot_keys); ot_order={k:i+1 for i,k in enumerate(ot_keys)}
-
-    # Победный буллит
-    so_goals = [ev for ev in events if (ev.period_type or "").upper()=="SHOOTOUT" and ev.scorer and ev.scorer != "—"]
-    winner = so_goals[-1].scorer if so_goals else None
 
     lines=[head]
     sort_key=lambda x:(x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
@@ -439,18 +427,17 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
         lines.append("")              # пустая строка
         lines.append(_italic(title))  # курсивом
         per=groups[key]
-        if not per: lines.append("Голов не было")
+        if ptype=="SHOOTOUT":
+            win_line = _shootout_winner_line(meta, per)
+            if win_line: lines.append(win_line)
+            else: lines.append("Буллиты не определили победителя")  # на всякий случай
+        elif not per:
+            lines.append("Голов не было")
         else:
-            for ev in per: lines.append(line_goal(ev))
+            for ev in per: lines.append(_line_goal(ev))
+    return "\n".join(lines).strip()
 
-    if winner:
-        lines.append("")
-        lines.append("Победный буллит")
-        lines.append(f"{meta.home_score}:{meta.away_score} – {winner}")
-
-    return (visible + "\n\n" + "\n".join(lines)).strip()
-
-# --- State & Telegram ---
+# ========= state & telegram =========
 def load_state(path:str)->Dict[str,Any]:
     p=pathlib.Path(path)
     if not p.exists(): p.parent.mkdir(parents=True, exist_ok=True); return {"posted":{}}
@@ -486,98 +473,48 @@ def send_telegram_text(text:str)->None:
     if resp.status_code!=200 or not data.get("ok",False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
 
+# ========= main =========
+def fetch_meta(gamePk:int)->GameMeta:
+    js = http_get_json(GAME_SUMMARY_FMT.format(gamePk=gamePk))
+    g = js.get("game", {}) if isinstance(js, dict) else {}
+    home = _upper_str(((g.get("homeTeam") or {}).get("abbrev")) or ((g.get("homeTeam") or {}).get("triCode")))
+    away = _upper_str(((g.get("awayTeam") or {}).get("abbrev")) or ((g.get("awayTeam") or {}).get("triCode")))
+    hsc = _first_int((g.get("homeTeam") or {}).get("score"))
+    asc = _first_int((g.get("awayTeam") or {}).get("score"))
+    gd  = g.get("startTimeUTC") or g.get("gameDate") or ""
+    try: gdt = datetime.fromisoformat(str(gd).replace("Z","+00:00"))
+    except: gdt = datetime.now(timezone.utc)
+    state = _upper_str(g.get("gameState") or g.get("gameStatus"))
+    return GameMeta(gamePk, gdt, state, home, away, hsc, asc)
+
 def main():
-    # Ручной режим: по GAME_QUERY → GAME_PK, иначе GAME_PK_ENV, иначе авто-постинг
-    gid: Optional[int] = None
-    if GAME_QUERY:
-        gid = resolve_game_pk_by_query(GAME_QUERY)
-        if not gid:
-            print(f"[ERR] GAME_QUERY not resolved: {GAME_QUERY}")
-            return
-    elif GAME_PK_ENV:
-        try:
-            gid = int(GAME_PK_ENV)
-        except Exception:
-            print("[ERR] GAME_PK is not a number"); return
+    game_pk = _env_str("GAME_PK").strip()
+    game_query = _env_str("GAME_QUERY").strip()
+    if not game_pk and game_query:
+        sb = _env_int("SEARCH_BACK", 1); sf = _env_int("SEARCH_FWD", 1)
+        rf = _env_bool("REQUIRE_FINAL", True)
+        gid = resolve_game_pk_from_query(game_query, sb, sf, rf)
+        if gid: game_pk = str(gid)
+        else:
+            print(f"[ERR] GAME_QUERY not resolved: {game_query}")
+            raise SystemExit(1)
 
-    if gid:
-        # Единичный матч по gid
-        meta = fetch_game_meta(gid)
-        if not meta:
-            print(f"[ERR] game meta not found for {gid}")
-            return
-        standings = fetch_standings_map()
-        evs=fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
-        sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
-        merged=merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
-        text=build_single_match_text(meta, standings, merged)
-        print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
-        send_telegram_text(text)
-        print("OK (posted 1 manual)")
-        return
+    if not game_pk:
+        print("[ERR] provide GAME_PK or GAME_QUERY")
+        raise SystemExit(1)
 
-    # Автоматический режим: вчера+сегодня (UTC), без повторов
-    state=load_state(STATE_PATH)
-    posted:Dict[str,bool]=state.get("posted",{}) or {}
-    games=list_games_yesterday_today_final()
-    if DEBUG_VERBOSE: print(f"[DBG] FINAL games (yesterday+today): {len(games)}")
-    if not games:
-        print("OK (no FINAL games)"); return
-    standings=fetch_standings_map()
-    new_posts=0
-    for meta in games:
-        key=str(meta.gamePk)
-        if posted.get(key):
-            if DEBUG_VERBOSE: print(f"[DBG] skip already posted {key}")
-            continue
-        evs=fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
-        sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
-        merged=merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
-        text=build_single_match_text(meta, standings, merged)
-        print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
-        send_telegram_text(text)
-        posted[key]=True; new_posts+=1
-    state["posted"]=posted; save_state(STATE_PATH, state)
-    print(f"OK (posted {new_posts})")
+    gid = int(game_pk)
+    meta = fetch_meta(gid)
+    standings = fetch_standings_map()
+    evs = fetch_scoring_official(gid, meta.home_tri, meta.away_tri)
+    # пробуем подменить на кириллицу (если есть)
+    sru_h, sru_a, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
+    merged = merge_official_with_sportsru(evs, sru_h, sru_a, meta.home_tri, meta.away_tri)
 
-def fetch_game_meta(gamePk:int) -> Optional[GameMeta]:
-    # game-summary нужен для рекордов счёта и команд
-    url_stats = f"https://statsapi.web.nhl.com/api/v1/game/{gamePk}/feed/live"
-    url_web   = f"{NHLE_BASE}/gamecenter/{gamePk}/game-summary"
-    # Пробуем сначала web (быстро падает 404 когда игра не найдена), затем stats
-    try:
-        js = http_get_json(url_web)
-    except Exception:
-        js = None
-    if not js:
-        try:
-            data = http_get_json(url_stats)
-        except Exception as e:
-            print(f"[ERR] fetch_game_meta: {repr(e)}"); return None
-        g  = data.get("gameData",{}) or {}
-        st = data.get("liveData",{}).get("linescore",{}) or {}
-        teams = g.get("teams",{}) or {}
-        ht = _upper_str(((teams.get("home") or {}).get("abbreviation")) or "")
-        at = _upper_str(((teams.get("away") or {}).get("abbreviation")) or "")
-        hscore = _first_int((st.get("teams") or {}).get("home",{}).get("goals"))
-        ascore = _first_int((st.get("teams") or {}).get("away",{}).get("goals"))
-        state  = _upper_str((data.get("gameData") or {}).get("status",{}).get("abstractGameState"))
-        dt_utc = datetime.now(timezone.utc)
-        return GameMeta(gamePk, dt_utc, state, ht, at, hscore, ascore)
-
-    # web-summary структура
-    try:
-        game = js.get("summary",{}) or js
-        ht = _upper_str((game.get("homeTeam") or {}).get("abbrev") or (game.get("homeTeam") or {}).get("triCode") or (game.get("homeTeam") or {}).get("teamAbbrev"))
-        at = _upper_str((game.get("awayTeam") or {}).get("abbrev") or (game.get("awayTeam") or {}).get("triCode") or (game.get("awayTeam") or {}).get("teamAbbrev"))
-        hscore = _first_int((game.get("homeTeam") or {}).get("score"))
-        ascore = _first_int((game.get("awayTeam") or {}).get("score"))
-        state = _upper_str(game.get("gameState") or game.get("gameStatus") or "FINAL")
-        start = (game.get("gameDate") or game.get("startTimeUTC") or "")
-        dt_utc = datetime.fromisoformat(str(start).replace("Z","+00:00")) if start else datetime.now(timezone.utc)
-        return GameMeta(gamePk, dt_utc, state, ht, at, hscore, ascore)
-    except Exception as e:
-        print(f"[ERR] parse web-summary: {repr(e)}"); return None
+    text = build_single_match_text(meta, standings, merged)
+    print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
+    send_telegram_text(text)
+    print("OK")
 
 if __name__=="__main__":
     main()
