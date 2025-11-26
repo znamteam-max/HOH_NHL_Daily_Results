@@ -8,27 +8,28 @@ on:
         required: false
         default: ""
       gameDate:
-        description: "YYYY-MM-DD (optional if using MATCH)"
+        description: "YYYY-MM-DD (optional if using gamePk)"
         required: false
         default: ""
       match:
-        description: "e.g. 'SEA - NYI' or 'SEA@NYI' (optional if using gamePk)"
+        description: "e.g. 'SEA - NYI' (HOME - AWAY) or 'SEA@NYI' (AWAY@HOME)"
         required: false
         default: ""
+      # Ниже параметры больше не используются скриптом, оставлены ради совместимости UI:
       searchBack:
-        description: "Days back from gameDate (default 1)"
+        description: "UNUSED"
         required: false
         default: "1"
       searchFwd:
-        description: "Days forward from gameDate (default 1)"
+        description: "UNUSED"
         required: false
         default: "1"
       requireFinal:
-        description: "Require FINAL/OFF (1=yes, 0=no)"
+        description: "UNUSED"
         required: false
         default: "1"
       forcePost:
-        description: "Ignore posted-state (1=yes, 0=no)"
+        description: "UNUSED"
         required: false
         default: "1"
 
@@ -50,20 +51,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
+      - name: Prepare inputs (build GAME_QUERY if needed)
+        env:
+          INPUT_GAMEPK:  ${{ inputs.gamePk }}
+          INPUT_DATE:    ${{ inputs.gameDate }}
+          INPUT_MATCH:   ${{ inputs.match }}
+        run: |
+          python - << 'PY'
+          import os, re
+          gp  = (os.getenv("INPUT_GAMEPK") or "").strip()
+          dt  = (os.getenv("INPUT_DATE") or "").strip()
+          mt  = (os.getenv("INPUT_MATCH") or "").strip()
+          q = ""
+          if not gp and dt and mt:
+              def tri(s): return re.sub(r"\s+","", s).upper()
+              home = away = ""
+              if "@" in mt:
+                  away, home = [tri(x) for x in mt.split("@",1)]
+              elif "-" in mt:
+                  left, right = [tri(x) for x in mt.split("-",1)]
+                  home, away = left, right
+              if home and away:
+                  q = f"{dt} {home} - {away}"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"GAME_PK={gp}\n")
+              fh.write(f"GAME_QUERY={q}\n")
+          print("GAME_QUERY:", q or "(empty)")
+          PY
+
       - name: Post single result
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          GAME_PK:     ${{ inputs.gamePk }}
-          GAME_DATE:   ${{ inputs.gameDate }}
-          MATCH:       ${{ inputs.match }}
-
-          SEARCH_BACK:   ${{ inputs.searchBack }}
-          SEARCH_FWD:    ${{ inputs.searchFwd }}
-          REQUIRE_FINAL: ${{ inputs.requireFinal }}
-          FORCE_POST:    ${{ inputs.forcePost }}
-
+          # GAME_PK и GAME_QUERY подставятся из $GITHUB_ENV шагом выше
           DEBUG_VERBOSE: "1"
         run: |
           python nhl_single_result_bot.py
