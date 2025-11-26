@@ -1,52 +1,43 @@
-name: NHL single results to Telegram
+name: NHL single result (manual)
 
 on:
   workflow_dispatch:
     inputs:
-      game_pk:
-        description: "GAME_PK (если знаешь), напр. 2025020355"
+      gamePk:
+        description: "Exact GAME_PK (optional)"
         required: false
         default: ""
-      game_date:
-        description: "YYYY-MM-DD — дата матча (опц., когда указываешь PK)"
+      gameDate:
+        description: "YYYY-MM-DD (optional if using MATCH)"
         required: false
         default: ""
-      date:
-        description: "Если PK не указан: дата матча YYYY-MM-DD"
+      match:
+        description: "e.g. 'SEA - NYI' or 'SEA@NYI' (optional if using gamePk)"
         required: false
         default: ""
-      home:
-        description: "Если PK не указан: хозяева (три-код/алиас, напр. NSH/NAS)"
+      searchBack:
+        description: "Days back from gameDate (default 1)"
         required: false
-        default: ""
-      away:
-        description: "Если PK не указан: гости (три-код, напр. DET)"
+        default: "1"
+      searchFwd:
+        description: "Days forward from gameDate (default 1)"
         required: false
-        default: ""
-      dry_run:
-        description: "Только предпросмотр (не отправлять в TG)"
+        default: "1"
+      requireFinal:
+        description: "Require FINAL/OFF (1=yes, 0=no)"
         required: false
-        default: "false"
+        default: "1"
+      forcePost:
+        description: "Ignore posted-state (1=yes, 0=no)"
+        required: false
+        default: "1"
 
 permissions:
   contents: read
 
-concurrency:
-  group: nhl-single-${{ github.run_id }}
-  cancel-in-progress: false
-
 jobs:
-  single:
+  run:
     runs-on: ubuntu-latest
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      IN_GAME_PK:         ${{ github.event.inputs.game_pk }}
-      IN_GAME_DATE:       ${{ github.event.inputs.game_date }}
-      IN_DATE:            ${{ github.event.inputs.date }}
-      IN_HOME:            ${{ github.event.inputs.home }}
-      IN_AWAY:            ${{ github.event.inputs.away }}
-      IN_DRY_RUN:         ${{ github.event.inputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,87 +46,24 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests beautifulsoup4
-
-      - name: Resolve GAME_PK if needed
-        id: resolve
         run: |
-          python - << 'PY'
-          import os, sys, requests
-          API = "https://api-web.nhle.com/v1"
-          out = os.environ["GITHUB_OUTPUT"]
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
-          gpk  = (os.getenv("IN_GAME_PK") or "").strip()
-          gdt  = (os.getenv("IN_GAME_DATE") or "").strip()
-          date = (os.getenv("IN_DATE") or "").strip()
-          home = (os.getenv("IN_HOME") or "").strip().upper()
-          away = (os.getenv("IN_AWAY") or "").strip().upper()
-
-          aliases = {
-              "NAS":"NSH","PHX":"ARI","LA":"LAK","TB":"TBL","UTAH":"UTA",
-              "NJ":"NJD","NYI":"NYI","NYR":"NYR","WSH":"WSH","SJ":"SJS",
-              "TBAY":"TBL","LAK":"LAK"
-          }
-          def norm(x):
-              x = x.replace(" ","").upper()
-              return aliases.get(x, x)
-
-          if gpk:
-              with open(out, "a", encoding="utf-8") as fh:
-                  fh.write(f"game_pk={gpk}\n")
-                  if gdt: fh.write(f"game_date={gdt}\n")
-              sys.exit(0)
-
-          if not (date and home and away):
-              print("Either provide game_pk or (date + home + away).")
-              sys.exit(1)
-
-          home = norm(home)
-          away = norm(away)
-
-          # 1) scoreboard
-          url = f"{API}/scoreboard/{date}"
-          r = requests.get(url, timeout=25); r.raise_for_status()
-          js = r.json()
-          games = js.get("games") or []
-          found = None
-          for g in games:
-              h = (g.get("homeTeam",{}) or {}).get("abbrev") or ""
-              a = (g.get("awayTeam",{}) or {}).get("abbrev") or ""
-              if h.upper()==home and a.upper()==away:
-                  found = int(g.get("id") or g.get("gamePk") or 0)
-                  break
-
-          # 2) fallback schedule
-          if not found:
-              url = f"{API}/schedule/{date}"
-              r = requests.get(url, timeout=25); r.raise_for_status()
-              js = r.json()
-              games = js.get("games")
-              if games is None:
-                  games = []
-                  for w in js.get("gameWeek") or []:
-                      games.extend(w.get("games") or [])
-              for g in games:
-                  h = (g.get("homeTeam",{}) or {}).get("abbrev") or (g.get("homeTeam",{}) or {}).get("teamAbbrev") or ""
-                  a = (g.get("awayTeam",{}) or {}).get("abbrev") or (g.get("awayTeam",{}) or {}).get("teamAbbrev") or ""
-                  if h.upper()==home and a.upper()==away:
-                      found = int(g.get("id") or g.get("gameId") or g.get("gamePk") or 0)
-                      break
-
-          if not found:
-              print(f"Game not found for {date} {home} - {away}")
-              sys.exit(1)
-
-          with open(out, "a", encoding="utf-8") as fh:
-              fh.write(f"game_pk={found}\n")
-              fh.write(f"game_date={date}\n")
-          print("Resolved GAME_PK:", found)
-          PY
-
-      - name: Run single result bot
+      - name: Post single result
         env:
-          GAME_PK:  ${{ steps.resolve.outputs.game_pk }}
-          GAME_DATE: ${{ steps.resolve.outputs.game_date }}
-          DRY_RUN:  ${{ env.IN_DRY_RUN }}
-        run: python nhl_single_result_bot.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          GAME_PK:     ${{ inputs.gamePk }}
+          GAME_DATE:   ${{ inputs.gameDate }}
+          MATCH:       ${{ inputs.match }}
+
+          SEARCH_BACK:   ${{ inputs.searchBack }}
+          SEARCH_FWD:    ${{ inputs.searchFwd }}
+          REQUIRE_FINAL: ${{ inputs.requireFinal }}
+          FORCE_POST:    ${{ inputs.forcePost }}
+
+          DEBUG_VERBOSE: "1"
+        run: |
+          python nhl_single_result_bot.py
