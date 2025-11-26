@@ -6,9 +6,11 @@ HOH · NHL Single Result Bot — manual game support (RU names + SO winner)
 
 — Ручной режим:
    * GAME_PK=2025020xxx  → постим ровно этот матч.
-   * или GAME_DATE=YYYY-MM-DD и MATCH="NYR - STL" (или "NYR@STL", регистр/пробелы не важны) → резолвим pk по расписанию дня.
-— Если ручные переменные не заданы, работает старый режим «вчера+сегодня (UTC)» и постит непостенные FINAL.
-— «Победный буллит»: без перечисления попыток, только одна строка "итоговый счёт – Имя".
+   * или GAME_DATE=YYYY-MM-DD и MATCH="NYR - STL" / "NAS@DET" → резолвим pk по расписанию дня и постим.
+— Если ручные переменные не заданы, работает режим «вчера+сегодня (UTC)» и постит непостенные FINAL.
+— «Победный буллит»: отдельным блоком, без перечисления попыток:
+      Победный буллит
+      итоговый счёт – Имя
 — Русские имена: подхватываем из sports.ru (если доступно), иначе — из официального PBP.
 
 ENV:
@@ -50,14 +52,14 @@ def _env_int(name: str, default: int) -> int:
     try: return int(str(v).strip())
     except: return default
 
-DRY_RUN     = _env_bool("DRY_RUN", False)
+DRY_RUN       = _env_bool("DRY_RUN", False)
 DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", False)
-STATE_PATH  = _env_str("STATE_PATH", "state/posted_games.json")
-FORCE_POST  = _env_bool("FORCE_POST", False)
+STATE_PATH    = _env_str("STATE_PATH", "state/posted_games.json")
+FORCE_POST    = _env_bool("FORCE_POST", False)
 
 GAME_PK_ENV   = _env_str("GAME_PK", "").strip()
 GAME_DATE_ENV = _env_str("GAME_DATE", "").strip()  # YYYY-MM-DD
-MATCH_ENV     = _env_str("MATCH", "").strip()      # e.g. "NYR - STL" или "NAS@DET"
+MATCH_ENV     = _env_str("MATCH", "").strip()      # e.g. "NYR - STL" / "NAS@DET"
 
 # ---------------- RU / Dictionaries ----------------
 TEAM_RU = {
@@ -73,6 +75,11 @@ TEAM_EMOJI = {
     "DAL":"⭐️","DET":"🛡️","EDM":"🛢️","FLA":"🐆","LAK":"👑","MIN":"🌲","MTL":"🇨🇦","NSH":"🐯",
     "NJD":"😈","NYI":"🏝️","NYR":"🗽","OTT":"🛡","PHI":"🛩","PIT":"🐧","SJS":"🦈","SEA":"🦑","STL":"🎵",
     "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️","UTA":"🧊",
+}
+# синонимы кодов из реального ввода (user-friendly)
+TRI_ALIASES = {
+    "NAS":"NSH", "TAM":"TBL", "PHX":"ARI", "LAK":"LAK", "NJD":"NJD", "NYR":"NYR", "NYI":"NYI",
+    "MON":"MTL", "WIN":"WPG", "TB":"TBL"  # на всякий случай
 }
 SPORTSRU_SLUG = {
     "ANA":"anaheim-ducks","ARI":"arizona-coyotes","BOS":"boston-bruins","BUF":"buffalo-sabres",
@@ -151,11 +158,14 @@ def _extract_name(obj_or_str: Any)->Optional[str]:
     return None
 
 def _clean_person(name: str) -> str:
-    # убираем возможные лишние скобки из источника
     n = (name or "").strip()
     n = re.sub(r"^[\(\s]+", "", n)
     n = re.sub(r"[\)\s]+$", "", n)
     return n
+
+def _norm_tri(code: str) -> str:
+    c = code.upper()
+    return TRI_ALIASES.get(c, c)
 
 # ---------------- Standings / schedule ----------------
 def fetch_standings_map()->Dict[str,TeamRecord]:
@@ -178,11 +188,6 @@ def fetch_standings_map()->Dict[str,TeamRecord]:
         if abbr: teams[abbr]=TeamRecord(wins,losses,ot,pts)
     return teams
 
-def list_games_yesterday_today_final()->List[GameMeta]:
-    now_utc=datetime.now(timezone.utc)
-    dates=[(now_utc - timedelta(days=1)).date().isoformat(), now_utc.date().isoformat()]
-    return list_games_for_dates(dates, final_only=True)
-
 def list_games_for_dates(date_list: List[str], final_only: bool)->List[GameMeta]:
     now_utc=datetime.now(timezone.utc)
     metas:Dict[int,GameMeta]={}
@@ -204,17 +209,79 @@ def list_games_for_dates(date_list: List[str], final_only: bool)->List[GameMeta]
                 metas[gid]=GameMeta(gid,gdt,state,htri,atri,hscore,ascore)
     return sorted(metas.values(), key=lambda m:m.gameDateUTC)
 
+def list_games_yesterday_today_final()->List[GameMeta]:
+    now_utc=datetime.now(timezone.utc)
+    dates=[(now_utc - timedelta(days=1)).date().isoformat(), now_utc.date().isoformat()]
+    return list_games_for_dates(dates, final_only=True)
+
 def resolve_game_pk_from_match(game_date: str, match_str: str)->Optional[int]:
-    """MATCH: 'NYR - STL' / 'NYR@STL' / 'NYR STL'"""
+    """MATCH: 'NYR - STL' / 'NYR@STL' / 'NYR STL' ; понимаем NAS->NSH и т.п."""
     codes = re.findall(r"\b[A-Za-z]{3}\b", match_str.upper())
     if len(codes) < 2: return None
-    a, b = codes[0], codes[1]
+    a, b = _norm_tri(codes[0]), _norm_tri(codes[1])
     games = list_games_for_dates([game_date], final_only=False)
     for g in games:
         pair = {g.home_tri, g.away_tri}
         if {a,b} == pair:
             return g.gamePk
     return None
+
+def fetch_meta_from_schedule(game_date: str, gid: int) -> Optional[GameMeta]:
+    arr = list_games_for_dates([game_date], final_only=False)
+    for g in arr:
+        if g.gamePk == gid:
+            return g
+    return None
+
+def fetch_meta_fallback(gid:int) -> Optional[GameMeta]:
+    # 1) api-web game-summary / boxscore / landing
+    for path in ("game-summary", "boxscore", "landing"):
+        url = f"{NHLE_BASE}/gamecenter/{gid}/{path}"
+        try:
+            js=http_get_json(url)
+        except Exception:
+            continue
+        def pick(obj, *keys):
+            for k in keys:
+                v = obj.get(k) if isinstance(obj, dict) else None
+                if v: return v
+            return None
+        home_tri = None; away_tri=None; home_score=None; away_score=None
+        for key in ("homeTeam","home","home_team"):
+            t = js.get(key) if isinstance(js, dict) else None
+            if isinstance(t, dict):
+                home_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
+                home_score = _first_int(pick(t,"score","goals"))
+        for key in ("awayTeam","away","away_team"):
+            t = js.get(key) if isinstance(js, dict) else None
+            if isinstance(t, dict):
+                away_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
+                away_score = _first_int(pick(t,"score","goals"))
+        teams = js.get("teams") if isinstance(js, dict) else None
+        if isinstance(teams, dict):
+            h = teams.get("home",{}) or {}; a = teams.get("away",{}) or {}
+            home_tri = home_tri or _upper_str(pick(h,"abbrev","triCode","teamAbbrev"))
+            away_tri = away_tri or _upper_str(pick(a,"abbrev","triCode","teamAbbrev"))
+            home_score = home_score if home_score is not None else _first_int(pick(h,"score","goals"))
+            away_score = away_score if away_score is not None else _first_int(pick(a,"score","goals"))
+        if home_tri and away_tri and (home_score is not None) and (away_score is not None):
+            return GameMeta(gid, datetime.now(timezone.utc), "FINAL", home_tri, away_tri, int(home_score), int(away_score))
+    # 2) statsapi fallback
+    try:
+        js=http_get_json(f"https://statsapi.web.nhl.com/api/v1/game/{gid}/feed/live")
+        game = js.get("gameData",{}) or {}
+        teams = game.get("teams",{}) or {}
+        home = teams.get("home",{}) or {}; away = teams.get("away",{}) or {}
+        home_tri=_upper_str(home.get("abbreviation") or home.get("triCode"))
+        away_tri=_upper_str(away.get("abbreviation") or away.get("triCode"))
+        lines=js.get("liveData",{}).get("linescore",{}) or {}
+        home_score=_first_int(lines.get("teams",{}).get("home",{}).get("goals"), lines.get("homeGoals"))
+        away_score=_first_int(lines.get("teams",{}).get("away",{}).get("goals"), lines.get("awayGoals"))
+        state=_upper_str(js.get("gameData",{}).get("status",{}).get("abstractGameState") or "FINAL")
+        return GameMeta(gid, datetime.now(timezone.utc), state, home_tri, away_tri, home_score, away_score)
+    except Exception as e:
+        print(f"[DBG] statsapi fallback failed: {repr(e)}")
+        return None
 
 # ---------------- PBP / sports.ru ----------------
 _SO_TYPES_GOAL = {"GOAL","SHOT"}
@@ -227,7 +294,6 @@ _SCORER_KEYS = (
     "scoringPlayerName","scorerName","shootingPlayerName","scoringPlayer",
     "goalScorer","primaryScorer","playerName","player",
     "shooterName","shootoutShooterName","shooter",
-    # запасные кейсы
     "by","goalBy","scoredBy",
 )
 
@@ -266,7 +332,6 @@ def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[Scoring
             else: h,a=prev_h,prev_a
         team=home_tri if h>prev_h else (away_tri if a>prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
 
-        # Автор
         scorer=""
         for k in _SCORER_KEYS:
             nm=_extract_name(det.get(k))
@@ -276,7 +341,6 @@ def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[Scoring
                 v=p.get(k)
                 if isinstance(v,str) and v.strip(): scorer=_clean_person(v.strip()); break
 
-        # Ассисты
         assists=[]
         for k in _ASSIST_KEYS:
             nm=_extract_name(det.get(k))
@@ -380,7 +444,7 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key
         if (ptype or "").upper()=="SHOOTOUT":
-            continue  # не расписываем попытки
+            continue  # попытки не расписываем
         ot_idx=ot_order.get(key)
         title=period_title_text(pnum,ptype,ot_idx,ot_total)
         lines.append("")              # пустая строка
@@ -390,7 +454,6 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
         else:
             for ev in per: lines.append(line_goal(ev))
 
-    # Блок буллитов
     so_line = shootout_winner_line(meta, events)
     if so_line:
         lines.append("")
@@ -435,122 +498,68 @@ def send_telegram_text(text:str)->None:
     if resp.status_code!=200 or not data.get("ok",False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
 
-# ---------------- Manual meta helpers ----------------
-def fetch_meta_from_schedule(game_date: str, gid: int) -> Optional[GameMeta]:
-    arr = list_games_for_dates([game_date], final_only=False)
-    for g in arr:
-        if g.gamePk == gid:
-            return g
-    return None
-
-def fetch_meta_fallback(gid:int) -> Optional[GameMeta]:
-    # 1) api-web game-summary
-    for path in ("game-summary", "boxscore", "landing"):
-        url = f"{NHLE_BASE}/gamecenter/{gid}/{path}"
-        try:
-            js=http_get_json(url)
-        except Exception:
-            continue
-        # Пытаемся извлечь базовые поля
-        def pick(obj, *keys):
-            for k in keys:
-                v = obj.get(k) if isinstance(obj, dict) else None
-                if v: return v
-            return None
-        # разные формы
-        home_tri = None; away_tri=None; home_score=None; away_score=None
-        # популярная структура: js["homeTeam"]["abbrev"]
-        for key in ("homeTeam","home","home_team"):
-            t = js.get(key) if isinstance(js, dict) else None
-            if isinstance(t, dict):
-                home_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
-                home_score = _first_int(pick(t,"score","goals"))
-        for key in ("awayTeam","away","away_team"):
-            t = js.get(key) if isinstance(js, dict) else None
-            if isinstance(t, dict):
-                away_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
-                away_score = _first_int(pick(t,"score","goals"))
-        # иной вариант — в корне teams:{home:{...},away:{...}}
-        teams = js.get("teams") if isinstance(js, dict) else None
-        if isinstance(teams, dict):
-            h = teams.get("home",{}) or {}; a = teams.get("away",{}) or {}
-            home_tri = home_tri or _upper_str(pick(h,"abbrev","triCode","teamAbbrev"))
-            away_tri = away_tri or _upper_str(pick(a,"abbrev","triCode","teamAbbrev"))
-            home_score = home_score if home_score is not None else _first_int(pick(h,"score","goals"))
-            away_score = away_score if away_score is not None else _first_int(pick(a,"score","goals"))
-        if home_tri and away_tri and (home_score is not None) and (away_score is not None):
-            return GameMeta(gid, datetime.now(timezone.utc), "FINAL", home_tri, away_tri, int(home_score), int(away_score))
-
-    # 2) statsapi fallback
-    try:
-        js=http_get_json(f"https://statsapi.web.nhl.com/api/v1/game/{gid}/feed/live")
-        game = js.get("gameData",{}) or {}
-        teams = game.get("teams",{}) or {}
-        home = teams.get("home",{}) or {}; away = teams.get("away",{}) or {}
-        home_tri=_upper_str(home.get("abbreviation") or home.get("triCode"))
-        away_tri=_upper_str(away.get("abbreviation") or away.get("triCode"))
-        lines=js.get("liveData",{}).get("linescore",{}) or {}
-        home_score=_first_int(lines.get("teams",{}).get("home",{}).get("goals"), lines.get("homeGoals"))
-        away_score=_first_int(lines.get("teams",{}).get("away",{}).get("goals"), lines.get("awayGoals"))
-        state=_upper_str(js.get("gameData",{}).get("status",{}).get("abstractGameState") or "FINAL")
-        return GameMeta(gid, datetime.now(timezone.utc), state, home_tri, away_tri, home_score, away_score)
-    except Exception as e:
-        print(f"[DBG] statsapi fallback failed: {repr(e)}")
-        return None
-
 # ---------------- Main ----------------
 def main():
     state=load_state(STATE_PATH)
     posted:Dict[str,bool]=state.get("posted",{}) or {}
 
-    manual_gid: Optional[int] = None
-    manual_meta: Optional[GameMeta] = None
-
-    # --- Manual selection ---
+    # --- Manual by GAME_PK ---
     if GAME_PK_ENV:
         try:
             manual_gid = int(GAME_PK_ENV)
         except:
             print(f"[ERR] GAME_PK is not int: {GAME_PK_ENV}")
-            manual_gid = None
-
-        if manual_gid:
-            if GAME_DATE_ENV:
-                manual_meta = fetch_meta_from_schedule(GAME_DATE_ENV, manual_gid)
-            if not manual_meta:
-                manual_meta = fetch_meta_fallback(manual_gid)
-
-            if not manual_meta:
-                print(f"[ERR] Cannot build meta for GAME_PK={manual_gid}")
-                return
-
-            # fetch events + names
-            evs=fetch_scoring_official(manual_gid, manual_meta.home_tri, manual_meta.away_tri)
-            sru_home, sru_away, _ = fetch_sportsru_goals(manual_meta.home_tri, manual_meta.away_tri)
-            merged=merge_official_with_sportsru(evs, sru_home, sru_away, manual_meta.home_tri, manual_meta.away_tri)
-
-            standings=fetch_standings_map()
-            text=build_single_match_text(manual_meta, standings, merged)
-            print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
-            send_telegram_text(text)
-
-            if not FORCE_POST:
-                posted[str(manual_gid)] = True
-                state["posted"]=posted; save_state(STATE_PATH, state)
-            print("OK (posted 1 manual)")
             return
 
-    # --- Manual by GAME_DATE + MATCH (resolve pk) ---
+        manual_meta = None
+        if GAME_DATE_ENV:
+            manual_meta = fetch_meta_from_schedule(GAME_DATE_ENV, manual_gid)
+        if not manual_meta:
+            manual_meta = fetch_meta_fallback(manual_gid)
+        if not manual_meta:
+            print(f"[ERR] Cannot build meta for GAME_PK={manual_gid}")
+            return
+
+        evs=fetch_scoring_official(manual_gid, manual_meta.home_tri, manual_meta.away_tri)
+        sru_home, sru_away, _ = fetch_sportsru_goals(manual_meta.home_tri, manual_meta.away_tri)
+        merged=merge_official_with_sportsru(evs, sru_home, sru_away, manual_meta.home_tri, manual_meta.away_tri)
+        standings=fetch_standings_map()
+        text=build_single_match_text(manual_meta, standings, merged)
+        print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
+        send_telegram_text(text)
+
+        if not FORCE_POST:
+            posted[str(manual_gid)] = True
+            state["posted"]=posted; save_state(STATE_PATH, state)
+        print("OK (posted 1 manual)")
+        return
+
+    # --- Manual by GAME_DATE + MATCH ---
     if GAME_DATE_ENV and MATCH_ENV:
         gid = resolve_game_pk_from_match(GAME_DATE_ENV, MATCH_ENV)
         if not gid:
             print(f"[ERR] Cannot resolve MATCH='{MATCH_ENV}' on {GAME_DATE_ENV}")
             return
-        os.environ["GAME_PK"] = str(gid)  # чтобы в логах было видно
-        # рекурсивно через тот же путь, но уже с pk
-        global GAME_PK_ENV
-        GAME_PK_ENV = str(gid)
-        return main()
+        print(f"[DBG] Resolved GAME_PK={gid} for {GAME_DATE_ENV} {MATCH_ENV}")
+
+        manual_meta = fetch_meta_from_schedule(GAME_DATE_ENV, gid) or fetch_meta_fallback(gid)
+        if not manual_meta:
+            print(f"[ERR] Cannot build meta for GAME_PK={gid}")
+            return
+
+        evs=fetch_scoring_official(gid, manual_meta.home_tri, manual_meta.away_tri)
+        sru_home, sru_away, _ = fetch_sportsru_goals(manual_meta.home_tri, manual_meta.away_tri)
+        merged=merge_official_with_sportsru(evs, sru_home, sru_away, manual_meta.home_tri, manual_meta.away_tri)
+        standings=fetch_standings_map()
+        text=build_single_match_text(manual_meta, standings, merged)
+        print("[DBG] Single match preview:\n"+text[:300].replace("\n","¶")+"…")
+        send_telegram_text(text)
+
+        if not FORCE_POST:
+            posted[str(gid)] = True
+            state["posted"]=posted; save_state(STATE_PATH, state)
+        print("OK (posted 1 manual)")
+        return
 
     # --- Legacy mode: yesterday+today FINAL unposted ---
     games=list_games_yesterday_today_final()
