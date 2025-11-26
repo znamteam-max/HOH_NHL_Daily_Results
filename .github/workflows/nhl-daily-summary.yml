@@ -19,7 +19,7 @@ on:
         default: "0"
 
 permissions:
-  contents: write  # не обязательно, но оставим как было (коммиты кэша)
+  contents: write
 
 jobs:
   run:
@@ -42,8 +42,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          REPORT_DATE_LOCAL:  ${{ github.event.inputs.local_date }}
-          REPORT_TZ:          ${{ github.event.inputs.tz }}
+          REPORT_DATE:        ${{ github.event.inputs.local_date }}  # <- было REPORT_DATE_LOCAL
+          REPORT_TZ:          ${{ github.event.inputs.tz }}          # тот же input, корректное имя env
           DRY_RUN:            ${{ github.event.inputs.dry_run }}
         run: |
           python nhl_daily_results_bot.py
