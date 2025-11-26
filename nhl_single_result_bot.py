@@ -6,18 +6,21 @@ HOH · NHL Single Result Bot — manual game support (RU names + SO winner)
 
 — Ручной режим:
    * GAME_PK=2025020xxx  → постим ровно этот матч.
-   * или GAME_DATE=YYYY-MM-DD и MATCH="NYR - STL" / "NAS@DET" → резолвим pk по расписанию дня и постим.
-— Если ручные переменные не заданы, работает режим «вчера+сегодня (UTC)» и постит непостенные FINAL.
-— «Победный буллит»: отдельным блоком, без перечисления попыток:
+   * или GAME_DATE=YYYY-MM-DD и MATCH="NYI - SEA"/"SEA@NYI"/"SEA NYI"
+     → резолвим pk в окне SEARCH_BACK/SEARCH_FWD дней и постим.
+— Если ручные переменные не заданы, режим «вчера+сегодня (UTC)» постит непостенные FINAL.
+— «Победный буллит»: отдельным блоком:
       Победный буллит
       итоговый счёт – Имя
-— Русские имена: подхватываем из sports.ru (если доступно), иначе — из официального PBP.
+— Русские имена: подхватываем из sports.ru, иначе — из официального PBP.
 
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
 - STATE_PATH="state/posted_games.json"
 - DRY_RUN=0/1, DEBUG_VERBOSE=0/1
 - GAME_PK (опц.), GAME_DATE (опц.), MATCH (опц.), FORCE_POST=0/1 (опц.)
+- SEARCH_BACK=1, SEARCH_FWD=1  — сколько дней вокруг GAME_DATE смотреть
+- REQUIRE_FINAL=1               — требовать ли FINAL/OFF при ручном выборе
 """
 
 from __future__ import annotations
@@ -59,7 +62,11 @@ FORCE_POST    = _env_bool("FORCE_POST", False)
 
 GAME_PK_ENV   = _env_str("GAME_PK", "").strip()
 GAME_DATE_ENV = _env_str("GAME_DATE", "").strip()  # YYYY-MM-DD
-MATCH_ENV     = _env_str("MATCH", "").strip()      # e.g. "NYR - STL" / "NAS@DET"
+MATCH_ENV     = _env_str("MATCH", "").strip()      # e.g. "SEA - NYI" / "SEA@NYI"
+
+SEARCH_BACK   = _env_int("SEARCH_BACK", 1)
+SEARCH_FWD    = _env_int("SEARCH_FWD", 1)
+REQUIRE_FINAL = _env_bool("REQUIRE_FINAL", True)
 
 # ---------------- RU / Dictionaries ----------------
 TEAM_RU = {
@@ -76,10 +83,10 @@ TEAM_EMOJI = {
     "NJD":"😈","NYI":"🏝️","NYR":"🗽","OTT":"🛡","PHI":"🛩","PIT":"🐧","SJS":"🦈","SEA":"🦑","STL":"🎵",
     "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️","UTA":"🧊",
 }
-# синонимы кодов из реального ввода (user-friendly)
+# синонимы кодов из реального ввода
 TRI_ALIASES = {
     "NAS":"NSH", "TAM":"TBL", "PHX":"ARI", "LAK":"LAK", "NJD":"NJD", "NYR":"NYR", "NYI":"NYI",
-    "MON":"MTL", "WIN":"WPG", "TB":"TBL"  # на всякий случай
+    "MON":"MTL", "WIN":"WPG", "TB":"TBL"
 }
 SPORTSRU_SLUG = {
     "ANA":"anaheim-ducks","ARI":"arizona-coyotes","BOS":"boston-bruins","BUF":"buffalo-sabres",
@@ -214,16 +221,38 @@ def list_games_yesterday_today_final()->List[GameMeta]:
     dates=[(now_utc - timedelta(days=1)).date().isoformat(), now_utc.date().isoformat()]
     return list_games_for_dates(dates, final_only=True)
 
-def resolve_game_pk_from_match(game_date: str, match_str: str)->Optional[int]:
-    """MATCH: 'NYR - STL' / 'NYR@STL' / 'NYR STL' ; понимаем NAS->NSH и т.п."""
-    codes = re.findall(r"\b[A-Za-z]{3}\b", match_str.upper())
+def _parse_match_codes(match_str: str) -> Optional[Tuple[str,str]]:
+    # допускаем "SEA - NYI", "SEA@NYI", "SEA NYI", смешанные тире/пробелы/эм-дэши
+    s = match_str.upper().replace("—", "-").replace("–", "-").replace("@", " ").replace("-", " ")
+    codes = re.findall(r"\b[A-Z]{3}\b", s)
     if len(codes) < 2: return None
-    a, b = _norm_tri(codes[0]), _norm_tri(codes[1])
-    games = list_games_for_dates([game_date], final_only=False)
+    return (_norm_tri(codes[0]), _norm_tri(codes[1]))
+
+def resolve_game_pk_from_match(game_date: str, match_str: str, back:int, fwd:int, require_final:bool)->Optional[int]:
+    parsed = _parse_match_codes(match_str)
+    if not parsed: return None
+    a, b = parsed
+    # соберём окно дат: GAME_DATE±N
+    try:
+        base = datetime.fromisoformat(game_date).date()
+    except Exception:
+        return None
+    dates = [(base + timedelta(days=delta)).isoformat() for delta in range(-abs(back), abs(fwd)+1)]
+    games = list_games_for_dates(dates, final_only=False)
+    # сначала строгий поиск: совпадает пара {a,b} и статус при необходимости FINAL
     for g in games:
-        pair = {g.home_tri, g.away_tri}
-        if {a,b} == pair:
+        if {a,b} == {g.home_tri, g.away_tri} and (not require_final or g.state in ("FINAL","OFF")):
             return g.gamePk
+    # если не нашли под FINAL — возьмём ближайший по времени матч из пары
+    if not require_final:
+        candidates = [g for g in games if {a,b} == {g.home_tri, g.away_tri}]
+        if candidates:
+            candidates.sort(key=lambda x: abs((x.gameDateUTC - datetime.combine(base, datetime.min.time(), tzinfo=timezone.utc)).total_seconds()))
+            return candidates[0].gamePk
+    # отладка
+    if DEBUG_VERBOSE:
+        pairs = [f"{g.away_tri}@{g.home_tri} {g.state} {g.gamePk} {g.gameDateUTC.isoformat()}" for g in games]
+        print("[DBG] candidates in window:\n  " + "\n  ".join(pairs))
     return None
 
 def fetch_meta_from_schedule(game_date: str, gid: int) -> Optional[GameMeta]:
@@ -234,7 +263,7 @@ def fetch_meta_from_schedule(game_date: str, gid: int) -> Optional[GameMeta]:
     return None
 
 def fetch_meta_fallback(gid:int) -> Optional[GameMeta]:
-    # 1) api-web game-summary / boxscore / landing
+    # api-web gamecenter (несколько файлов)
     for path in ("game-summary", "boxscore", "landing"):
         url = f"{NHLE_BASE}/gamecenter/{gid}/{path}"
         try:
@@ -250,13 +279,13 @@ def fetch_meta_fallback(gid:int) -> Optional[GameMeta]:
         for key in ("homeTeam","home","home_team"):
             t = js.get(key) if isinstance(js, dict) else None
             if isinstance(t, dict):
-                home_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
-                home_score = _first_int(pick(t,"score","goals"))
+                home_tri = home_tri or _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
+                home_score = home_score if home_score is not None else _first_int(pick(t,"score","goals"))
         for key in ("awayTeam","away","away_team"):
             t = js.get(key) if isinstance(js, dict) else None
             if isinstance(t, dict):
-                away_tri = _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
-                away_score = _first_int(pick(t,"score","goals"))
+                away_tri = away_tri or _upper_str(pick(t,"abbrev","triCode","teamAbbrev"))
+                away_score = away_score if away_score is not None else _first_int(pick(t,"score","goals"))
         teams = js.get("teams") if isinstance(js, dict) else None
         if isinstance(teams, dict):
             h = teams.get("home",{}) or {}; a = teams.get("away",{}) or {}
@@ -266,7 +295,7 @@ def fetch_meta_fallback(gid:int) -> Optional[GameMeta]:
             away_score = away_score if away_score is not None else _first_int(pick(a,"score","goals"))
         if home_tri and away_tri and (home_score is not None) and (away_score is not None):
             return GameMeta(gid, datetime.now(timezone.utc), "FINAL", home_tri, away_tri, int(home_score), int(away_score))
-    # 2) statsapi fallback
+    # statsapi fallback (может иногда не резолвиться DNS — не критично)
     try:
         js=http_get_json(f"https://statsapi.web.nhl.com/api/v1/game/{gid}/feed/live")
         game = js.get("gameData",{}) or {}
@@ -404,7 +433,10 @@ def period_title_text(num:int, ptype:str, ot_index:Optional[int], ot_total:int)-
 def line_goal(ev:ScoringEvent)->str:
     score=f"{ev.home_goals}:{ev.away_goals}"
     who=ev.scorer or "—"
-    assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
+    # одна скобка, без дубля «((…))»
+    assists = ""
+    if ev.assists:
+        assists = " (" + ", ".join([a for a in ev.assists if a]) + ")"
     return f"{score} – {ev.time} {who}{assists}"
 
 def shootout_winner_line(meta: GameMeta, events: List[ScoringEvent]) -> Optional[str]:
@@ -536,9 +568,9 @@ def main():
 
     # --- Manual by GAME_DATE + MATCH ---
     if GAME_DATE_ENV and MATCH_ENV:
-        gid = resolve_game_pk_from_match(GAME_DATE_ENV, MATCH_ENV)
+        gid = resolve_game_pk_from_match(GAME_DATE_ENV, MATCH_ENV, SEARCH_BACK, SEARCH_FWD, REQUIRE_FINAL)
         if not gid:
-            print(f"[ERR] Cannot resolve MATCH='{MATCH_ENV}' on {GAME_DATE_ENV}")
+            print(f"[ERR] Cannot resolve MATCH='{MATCH_ENV}' around {GAME_DATE_ENV} (±{SEARCH_BACK}/{SEARCH_FWD} days)")
             return
         print(f"[DBG] Resolved GAME_PK={gid} for {GAME_DATE_ENV} {MATCH_ENV}")
 
