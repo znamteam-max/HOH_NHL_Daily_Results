@@ -2,8 +2,7 @@ name: NHL AutoPost (PT day complete)
 
 on:
   schedule:
-    # Проверяем каждые 10 минут (UTC)
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"   # каждые 10 минут (UTC)
   workflow_dispatch:
     inputs:
       pt_date:
@@ -25,6 +24,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
       FORCE_PT_DATE:      ${{ github.event.inputs.pt_date }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,7 +46,6 @@ jobs:
           import os, sys, requests
           from datetime import datetime, timedelta, date, time
           from zoneinfo import ZoneInfo
-          from pathlib import Path
 
           API = "https://api-web.nhle.com"
 
@@ -65,9 +64,6 @@ jobs:
           ymd_pt = base_pt.strftime("%Y-%m-%d")
           print("PT day:", ymd_pt)
 
-          start_pt = datetime.combine(base_pt, time(0,0), tzinfo=tz_pt)
-          end_pt   = datetime.combine(base_pt, time(23,59,59), tzinfo=tz_pt)
-
           def fetch_sched(d):
               url = f"{API}/v1/schedule/{d.isoformat()}"
               r = requests.get(url, timeout=25); r.raise_for_status()
@@ -80,26 +76,13 @@ jobs:
                       games.extend(w.get("games") or [])
               return games or []
 
-          raw = []
-          for d in (base_pt - timedelta(days=1), base_pt):
-              raw.extend(fetch_sched(d))
-
-          def start_pt_dt(g):
-              utc = g.get("startTimeUTC") or g.get("startTime") or g.get("gameDate")
-              if not utc: return None
-              try:
-                  return datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(tz_pt)
-              except Exception:
-                  return None
-
-          games_pt = [g for g in raw if (dt:=start_pt_dt(g)) and start_pt <= dt <= end_pt]
-          print("Games within PT window:", len(games_pt))
-
+          # простая проверка: есть ли игры и все ли FINAL/OFF
+          raw = fetch_sched(base_pt)
           def is_completed(g):
               st = (g.get("gameState") or g.get("gameStatus") or "").upper()
               return st in ("FINAL","OFF")
 
-          all_done = bool(games_pt) and all(is_completed(g) for g in games_pt)
+          all_done = bool(raw) and all(is_completed(g) for g in raw)
           print("all_completed:", all_done)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -112,8 +95,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          REPORT_DATE_LOCAL:  ${{ steps.check.outputs.pt_ymd }}
-          REPORT_DATE_TZ:     America/Los_Angeles
+          REPORT_DATE:        ${{ steps.check.outputs.pt_ymd }}   # <- было REPORT_DATE_LOCAL
+          REPORT_TZ:          America/Los_Angeles                 # <- было REPORT_DATE_TZ
         run: python nhl_daily_results_bot.py
 
       - name: Mark PT day as posted (with rebase & retry)
