@@ -2,29 +2,24 @@ name: NHL daily results to Telegram
 
 on:
   schedule:
-    # Пример: 06:35 Europe/London (подстрои под себя)
-    - cron: "35 5 * * *"
+    - cron: "35 5 * * *"   # 06:35 Europe/London (как было)
   workflow_dispatch:
     inputs:
       local_date:
-        description: "Дата локального дня YYYY-MM-DD (если пусто — авто: вчера в указанной TZ)"
+        description: "Локальная дата YYYY-MM-DD (например 2025-11-24)"
         required: false
         default: ""
-      timezone:
-        description: "IANA TZ для локального дня (напр. Europe/Amsterdam)"
+      tz:
+        description: "Таймзона IANA (например America/Los_Angeles)"
         required: false
         default: "Europe/Amsterdam"
       dry_run:
-        description: "Только показать предпросмотр в логах (не отправлять в TG)"
+        description: "Только превью в логи (1) без отправки в TG"
         required: false
-        default: "false"
+        default: "0"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: nhl-daily-summary
-  cancel-in-progress: true
+  contents: write  # не обязательно, но оставим как было (коммиты кэша)
 
 jobs:
   run:
@@ -43,28 +38,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Run bot
+      - name: Run daily summary (explicit local day if provided)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           REPORT_DATE_LOCAL:  ${{ github.event.inputs.local_date }}
-          REPORT_DATE_TZ:     ${{ github.event.inputs.timezone }}
+          REPORT_TZ:          ${{ github.event.inputs.tz }}
           DRY_RUN:            ${{ github.event.inputs.dry_run }}
         run: |
           python nhl_daily_results_bot.py
-
-      - name: Update RU name cache from sports.ru
-        run: |
-          python update_ru_cache.py || true
-
-      - name: Commit cache changes (if any)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain -- ru_map.json ru_pending.json 2>/dev/null)" ]; then
-            git add ru_map.json ru_pending.json
-            git commit -m "chore(cache): update RU name map"
-            git push
-          else
-            echo "No cache changes to commit."
-          fi
