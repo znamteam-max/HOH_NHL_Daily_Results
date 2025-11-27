@@ -9,6 +9,154 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
+# === SPORTS.RU HELPERS (inline, no extra files) ==============================
+# Этот блок правит только слуг Юты (utah-mammoth) и даёт аккуратный список кандидатов URL.
+# Остальной пайплайн оставляем без изменений.
+
+import re
+import time
+import logging
+from typing import Dict, List, Optional, Tuple
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+log = logging.getLogger(__name__)
+
+_SLUG_SAFE = re.compile(r"[^a-z0-9]+")
+
+def _normalize(s: str) -> str:
+    return _SLUG_SAFE.sub(" ", s.lower()).strip()
+
+def _slugify_en(s: str) -> str:
+    s = s.lower().replace("&", " and ").replace("'", "").replace(".", "")
+    s = _SLUG_SAFE.sub("-", s).strip("-")
+    s = re.sub(r"-{2,}", "-", s)
+    return s
+
+# Алиасы → целевой sports.ru slug (главное — Юта)
+TEAM_SLUG_OVERRIDES: Dict[str, str] = {}
+def _add_alias(value: str, *aliases: str) -> None:
+    for a in aliases:
+        TEAM_SLUG_OVERRIDES[_normalize(a)] = value
+
+# NHL (короткий набор + ключевые кейсы, можно расширять при желании)
+_add_alias("montreal-canadiens", "montreal canadiens", "montreal", "mtl")
+_add_alias("utah-mammoth", "utah mammoth", "utah", "utah hc", "utah hockey club",
+           "utah-hc", "utah-hockey-club", "utah nhl", "utah mammoths", "uta")
+_add_alias("san-jose-sharks", "san jose sharks", "san jose", "san-jose", "sj", "sjs")
+_add_alias("tampa-bay-lightning", "tampa bay lightning", "tampa bay", "tampa-bay", "tampa", "tbl")
+_add_alias("st-louis-blues", "st louis blues", "st. louis blues", "st-louis", "st louis", "st. louis", "stl")
+_add_alias("new-york-islanders", "new york islanders", "ny islanders", "islanders", "nyi")
+_add_alias("new-york-rangers", "new york rangers", "ny rangers", "rangers", "nyr")
+
+# Фоллбэк «городских» слугов (когда sports.ru даёт короткие урлы)
+CITY_SLUG: Dict[str, str] = {}
+def _add_city(value: str, *aliases: str) -> None:
+    for a in aliases:
+        CITY_SLUG[_normalize(a)] = value
+
+_add_city("montreal", "montreal canadiens", "montreal", "mtl")
+_add_city("utah", "utah", "utah hc", "utah hockey club", "utah mammoth", "uta")
+_add_city("san-jose", "san jose", "san-jose", "san jose sharks", "sj", "sjs")
+_add_city("tampa-bay", "tampa", "tampa bay", "tampa-bay", "tampa-bay lightning", "tbl")
+_add_city("st-louis", "st louis", "st. louis", "st-louis", "st louis blues", "stl")
+_add_city("new-york", "new york", "new-york", "new york rangers", "new york islanders")
+
+def team_slug(name: str) -> str:
+    k = _normalize(name)
+    if k in TEAM_SLUG_OVERRIDES:
+        return TEAM_SLUG_OVERRIDES[k]
+    return _slugify_en(name)
+
+def city_slug(name: str) -> str:
+    k = _normalize(name)
+    if k in CITY_SLUG:
+        return CITY_SLUG[k]
+    full = team_slug(name)
+    parts = full.split("-")
+    if parts[:2] in (["new", "york"], ["st", "louis"]):
+        return "-".join(parts[:2])
+    if len(parts) >= 2 and parts[0] == "tampa" and parts[1] == "bay":
+        return "tampa-bay"
+    return parts[0]
+
+def _match_paths(home_slug: str, away_slug: str):
+    yield f"/hockey/match/{home_slug}-vs-{away_slug}/stat/"
+    yield f"/hockey/match/{away_slug}-vs-{home_slug}/stat/"
+    yield f"/hockey/match/{home_slug}-vs-{away_slug}/"
+    yield f"/hockey/match/{away_slug}-vs-{home_slug}/"
+
+def build_sports_ru_urls(home_team: str, away_team: str, base: str = "https://www.sports.ru") -> List[str]:
+    hs, as_ = team_slug(home_team), team_slug(away_team)
+    hc, ac = city_slug(home_team), city_slug(away_team)
+    tried: List[str] = []
+
+    # полные слуги
+    tried.extend(list(_match_paths(hs, as_)))
+    # короткие «городские»
+    if (hc, ac) != (hs, as_):
+        tried.extend(list(_match_paths(hc, ac)))
+    # смешанные варианты (на всякий)
+    if hs != hc:
+        tried.extend(list(_match_paths(hc, as_)))
+    if as_ != ac:
+        tried.extend(list(_match_paths(hs, ac)))
+
+    # дедуп
+    seen, uniq = set(), []
+    for p in tried:
+        if p not in seen:
+            uniq.append(base.rstrip("/") + p)
+            seen.add(p)
+    return uniq
+
+def _requests_session(timeout: float = 10.0, retries: int = 3, backoff: float = 0.4) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=retries, connect=retries, read=retries, status=retries,
+        backoff_factor=backoff,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False, respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; RNGN-NHL-Bot/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.sports.ru/",
+    })
+    session.request_timeout = timeout
+    return session
+
+def sports_ru_fetch(home_team: str, away_team: str, session: Optional[requests.Session] = None
+                   ) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Возвращает (html, used_url, tried_urls). Если html=None — ничего не нашли."""
+    own = session is None
+    session = session or _requests_session()
+    tried_full: List[str] = []
+
+    for url in build_sports_ru_urls(home_team, away_team):
+        tried_full.append(url)
+        try:
+            resp = session.get(url, timeout=getattr(session, "request_timeout", 10.0))
+            if resp.status_code == 200 and resp.text:
+                return resp.text, url, tried_full
+            else:
+                log.debug("sports.ru fetch fail %s: HTTPError('%s %s')",
+                          url, resp.status_code, resp.reason or "")
+        except requests.RequestException as e:
+            log.debug("sports.ru fetch fail %s: %s", url, f"{type(e).__name__}('{e}')")
+        time.sleep(0.15)
+
+    return None, None, tried_full
+# === /SPORTS.RU HELPERS ======================================================
+
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.6; +github)",
