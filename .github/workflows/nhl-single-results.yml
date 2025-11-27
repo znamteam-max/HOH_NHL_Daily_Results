@@ -1,8 +1,8 @@
-name: NHL single result (manual + autopost)
+name: NHL single result (auto + manual)
 
 on:
   schedule:
-    - cron: "*/3 * * * *"   # автопроверка каждые 3 минуты
+    - cron: "*/3 * * * *"   # каждые 3 минуты — авто-режим (постит FINAL из вчера+сегодня без повторов)
   workflow_dispatch:
     inputs:
       gamePk:
@@ -10,45 +10,24 @@ on:
         required: false
         default: ""
       gameDate:
-        description: "YYYY-MM-DD (optional if using gamePk)"
+        description: "YYYY-MM-DD (optional if using MATCH)"
         required: false
         default: ""
       match:
         description: "e.g. 'SEA - NYI' (HOME - AWAY) or 'SEA@NYI' (AWAY@HOME)"
         required: false
         default: ""
-      # Ниже параметры больше не используются скриптом, оставлены ради совместимости UI:
-      searchBack:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      searchFwd:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      requireFinal:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      forcePost:
-        description: "UNUSED"
-        required: false
-        default: "1"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: nhl-single-results
-  cancel-in-progress: true
+  contents: write  # для state/posted_games.json на push не требуется, но пусть будет
 
 jobs:
-  # ===== РУЧНОЙ ЗАПУСК =====
-  manual:
-    if: github.event_name == 'workflow_dispatch'
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -59,7 +38,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Prepare inputs (build GAME_QUERY if needed)
+      - name: Prepare inputs (manual only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           INPUT_GAMEPK:  ${{ inputs.gamePk }}
           INPUT_DATE:    ${{ inputs.gameDate }}
@@ -87,99 +67,12 @@ jobs:
           print("GAME_QUERY:", q or "(empty)")
           PY
 
-      - name: Post single result
+      - name: Run single result (auto or manual)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_VERBOSE: "1"
+          GAME_PK:            ${{ env.GAME_PK }}
+          GAME_QUERY:         ${{ env.GAME_QUERY }}
+          DEBUG_VERBOSE:      "1"
         run: |
           python nhl_single_result_bot.py
-
-  # ===== АВТОПОСТ ПО РАСПИСАНИЮ =====
-  autopost:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: pip install requests
-
-      - name: Find FINAL games and post singles
-        run: |
-          set -e
-          python - << 'PY'
-          import os, requests
-          from datetime import datetime, timedelta, timezone
-          from pathlib import Path
-
-          API = "https://api-web.nhle.com/v1"
-          H = {"User-Agent":"Mozilla/5.0"}
-
-          def get(url):
-            r=requests.get(url, headers=H, timeout=25); r.raise_for_status(); return r.json()
-
-          today = datetime.utcnow().date()
-          days = [(today - timedelta(days=1)).isoformat(), today.isoformat(), (today + timedelta(days=1)).isoformat()]
-
-          games=[]
-          for d in days:
-            js=get(f"{API}/schedule/{d}")
-            arr = js.get("games")
-            if arr is None:
-              arr=[]
-              for w in js.get("gameWeek") or []:
-                arr += w.get("games") or []
-            for g in arr:
-              st=(g.get("gameState") or g.get("gameStatus") or "").upper()
-              if st not in ("FINAL","OFF"): continue
-              gid = g.get("id") or g.get("gameId") or g.get("gamePk")
-              if gid: games.append(int(gid))
-
-          games = sorted(set(games))
-          print("FINAL games:", games)
-
-          posted_dir = Path(".posted"); posted_dir.mkdir(parents=True, exist_ok=True)
-          to_post=[]
-          for gid in games:
-            mark = posted_dir / f"single-{gid}.done"
-            if not mark.exists():
-              to_post.append((gid, mark))
-
-          print("Need to post:", [g for g,_ in to_post])
-
-          for gid, mark in to_post:
-            env = os.environ.copy()
-            env["GAME_PK"] = str(gid)
-            code = os.system("python nhl_single_result_bot.py")
-            if code != 0:
-              print(f"[WARN] Single post failed for {gid}, skip marking")
-              continue
-            mark.write_text(f"posted {datetime.now(timezone.utc).isoformat()}Z\n", encoding="utf-8")
-          PY
-
-      - name: Commit markers
-        run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if [ -n "$(git status --porcelain .posted)" ]; then
-            git add .posted
-            git commit -m "mark posted singles"
-            BRANCH="${GITHUB_REF_NAME:-main}"
-            git pull --rebase origin "$BRANCH" || true
-            git push origin "HEAD:$BRANCH"
-          else
-            echo "No new markers to commit"
