@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.3; +github)",
+    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.4; +github)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -50,6 +50,44 @@ def http_get_json(url: str, timeout: int = 30) -> Any:
 def http_get_text(url: str, timeout: int = 30) -> str:
     return _get_with_retries(url, timeout=timeout, as_text=True)
 
+# ---------- helpers for weird API shapes ----------
+def _norm_str(x: Any) -> str:
+    """Return a reasonable string from NHL API field that may be str/dict/list/None."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        # Prefer typical keys
+        for k in ("default", "en", "eng", "English"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        # Any first stringy value
+        for v in x.values():
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+    if isinstance(x, (list, tuple, set)):
+        for v in x:
+            s = _norm_str(v)
+            if s:
+                return s
+        return ""
+    # Fallback
+    try:
+        s = str(x)
+        return s if s != "None" else ""
+    except Exception:
+        return ""
+
+def _slugify_en(s: Any) -> str:
+    s = _norm_str(s).strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s
+
 TEAM_RU = {
     "EDM":"Эдмонтон","DAL":"Даллас","DET":"Детройт","NSH":"Нэшвилл",
     "TBL":"Тампа-Бэй","CGY":"Калгари","FLA":"Флорида","PHI":"Филадельфия",
@@ -70,13 +108,6 @@ TEAM_EMOJI = {
 }
 
 # ---------- sports.ru URL генератор (Utah/Vegas, обе ориентации, /stat) ----------
-def _slugify_en(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^\w\s-]", "", s)
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"-+", "-", s)
-    return s
-
 SPORTSRU_TEAM_SLUGS = {
     "VGK": ["vegas","vegas-golden-knights"],
     "UTA": ["utah-mammoth","utah","utah-hc","utah-hockey-club","utah-hc-nhl"],
@@ -86,7 +117,7 @@ SPORTSRU_TEAM_SLUGS = {
 
 def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
     v: List[str] = []
-    abbr = (team.get("abbrev") or team.get("triCode") or "").upper()
+    abbr = _norm_str(team.get("abbrev") or team.get("triCode") or team.get("teamAbbrev")).upper()
     if abbr in SPORTSRU_TEAM_SLUGS:
         v.extend(SPORTSRU_TEAM_SLUGS[abbr])
     place = _slugify_en(team.get("placeName") or team.get("city") or "")
@@ -94,6 +125,7 @@ def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
     if place and nick: v.append(f"{place}-{nick}")
     if nick: v.append(nick)
     if place and place not in v: v.append(place)
+    # dedup
     seen=set(); out=[]
     for x in v:
         if x and x not in seen:
@@ -200,10 +232,8 @@ def is_final(g: Dict[str,Any]) -> bool:
 
 def team_block(g: Dict[str,Any], side: str) -> Dict[str,Any]:
     t = (g.get(f"{side}Team") or {})
-    ab = t.get("abbrev") or t.get("triCode")
-    if not ab and t.get("id"):
-        ab = t.get("teamAbbrev")
-    t["abbrev"] = (ab or "").upper()
+    ab = t.get("abbrev") or t.get("triCode") or t.get("teamAbbrev")
+    t["abbrev"] = _norm_str(ab).upper()
     return t
 
 def fetch_standings_map() -> Dict[str,Tuple[int,int,int]]:
@@ -216,7 +246,7 @@ def fetch_standings_map() -> Dict[str,Tuple[int,int,int]]:
     for conf in js.get("standings", []):
         for div in conf.get("divisions", []):
             for team in div.get("teams", []):
-                ab = (team.get("teamAbbrev") or team.get("abbrev") or "").upper()
+                ab = _norm_str(team.get("teamAbbrev") or team.get("abbrev")).upper()
                 rec = team.get("record") or {}
                 out[ab] = (rec.get("wins",0), rec.get("losses",0), rec.get("ot",0))
     dbg(f"standings map built: {len(out)}")
@@ -255,54 +285,46 @@ def _extract_team_abbrev(ev: Dict[str,Any]) -> str:
 def _extract_scorer_last(ev: Dict[str,Any]) -> str:
     sc = ev.get("scorer")
     if isinstance(sc, dict):
-        nm = (sc.get("lastName") or sc.get("name") or sc.get("fullName") or "").strip()
+        nm = _norm_str(sc.get("lastName") or sc.get("name") or sc.get("fullName"))
         if nm: return nm.split()[-1]
     for p in ev.get("players") or []:
-        if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
-            nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+        if ( _norm_str(p.get("type") or p.get("playerType")).lower() in ("scorer","shooter") ):
+            nm = _norm_str(p.get("lastName") or p.get("name") or p.get("fullName"))
             if nm: return nm.split()[-1]
     det = ev.get("details") or {}
     for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
-        nm = (det.get(k) or "").strip()
+        nm = _norm_str(det.get(k))
         if nm: return nm.split()[-1]
     return ""
 
 def _extract_assists_last_list(ev: Dict[str,Any]) -> List[str]:
     out=[]
     for a in ev.get("assists") or []:
-        nm = (a.get("lastName") or a.get("name") or a.get("fullName") or "").strip()
+        nm = _norm_str(a.get("lastName") or a.get("name") or a.get("fullName"))
         if nm: out.append(nm.split()[-1])
     if out: return out
     for p in ev.get("players") or []:
-        if (p.get("type") or p.get("playerType") or "").lower().startswith("assist"):
-            nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+        if _norm_str(p.get("type") or p.get("playerType")).lower().startswith("assist"):
+            nm = _norm_str(p.get("lastName") or p.get("name") or p.get("fullName"))
             if nm: out.append(nm.split()[-1])
     return out
 
 def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]]]:
     js = http_get_json(GAME_PBP_FMT.format(gamePk=game_pk))
 
-    # НОРМАЛИЗАЦИЯ: делаем plays_obj словарём при любом входе (dict/list/что угодно)
     plays_obj: Dict[str,Any] = {"scoringPlays": [], "allPlays": [], "shootoutPlays": []}
     if isinstance(js, dict):
         raw = js.get("plays")
         if isinstance(raw, dict):
-            # обычный вариант
             plays_obj = {"scoringPlays": raw.get("scoringPlays") or [],
                          "allPlays":     raw.get("allPlays")     or [],
                          "shootoutPlays":raw.get("shootoutPlays") or []}
         elif isinstance(raw, list):
-            # редкий вариант: "plays" это список
             plays_obj["allPlays"] = raw
         else:
-            # иногда нужные события лежат на верхнем уровне
             plays_obj["allPlays"] = js.get("allPlays") or []
     elif isinstance(js, list):
-        # полностью список
         plays_obj["allPlays"] = js
-    else:
-        # неизвестный формат — оставим пустым
-        pass
 
     scoring = plays_obj.get("scoringPlays") or []
     allplays = plays_obj.get("allPlays") or []
@@ -313,29 +335,27 @@ def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]
         per = _extract_period(ev)
         tm  = _extract_time(ev)
         owner = _extract_team_abbrev(ev)
-        scorer = _extract_scorer_last(ev)
-        assists = _extract_assists_last_list(ev)
+        scorer = _extract_scorer_last(ev).title()
+        assists = [a.title() for a in _extract_assists_last_list(ev)]
         goals.append({
             "period": per, "time": tm, "teamAbbrev": owner,
             "scorer": scorer, "assists": assists
         })
 
-    # Буллиты: если спец-список пуст, просканируем allPlays
-    raw_so = list(shootout_src)
-    if not raw_so:
+    if not shootout_src:
         for ev in allplays:
             per = _extract_period(ev)
             ptype = (ev.get("periodDescriptor") or {}).get("periodType") \
                     or (ev.get("about") or {}).get("ordinalNum") or ""
             if per >= 5 or str(ptype).upper() == "SO":
-                raw_so.append(ev)
+                shootout_src.append(ev)
 
     shootout: List[Dict[str,Any]] = []
     rnd = 0
-    for ev in raw_so:
+    for ev in shootout_src:
         team = _extract_team_abbrev(ev).upper()
-        shooter = _extract_scorer_last(ev)
-        tdk = (ev.get("typeDescKey") or "").lower()
+        shooter = _extract_scorer_last(ev).title()
+        tdk = _norm_str(ev.get("typeDescKey")).lower()
         det = ev.get("details") or {}
         is_goal = bool(det.get("isGoal"))
         if "goal" in tdk: is_goal = True
@@ -365,14 +385,15 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     h_emoji, a_emoji = TEAM_EMOJI.get(h_ab, "•"), TEAM_EMOJI.get(a_ab, "•")
     h_name, a_name   = TEAM_RU.get(h_ab, h_ab), TEAM_RU.get(a_ab, a_ab)
 
-    h_score = (g.get("homeTeam") or {}).get("score", 0)
-    a_score = (g.get("awayTeam") or {}).get("score", 0)
+    h_score = int((g.get("homeTeam") or {}).get("score", 0))
+    a_score = int((g.get("awayTeam") or {}).get("score", 0))
     h_rec = fmt_record(standings.get(h_ab, (0,0,0)))
     a_rec = fmt_record(standings.get(a_ab, (0,0,0)))
 
     goals, shootout = load_pbp_data(g["id"])
     ru_map = fetch_ru_name_map_for_match(home, away)
 
+    # Шапка без дублей: "эмодзи — название — счёт — рекорд"
     header = [
         f"{h_emoji} «{h_name}» — {h_score} ({h_rec})",
         f"{a_emoji} «{a_name}» — {a_score} ({a_rec})",

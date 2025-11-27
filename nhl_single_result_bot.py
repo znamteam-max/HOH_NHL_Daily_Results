@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NHLSingleBot/1.3; +github)",
+    "User-Agent": "Mozilla/5.0 (compatible; NHLSingleBot/1.4; +github)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -49,6 +49,33 @@ def http_get_json(url: str, timeout: int = 30) -> Any:
 def http_get_text(url: str, timeout: int = 30) -> str:
     return _get_with_retries(url, timeout=timeout, as_text=True)
 
+# ---------- normalization ----------
+def _norm_str(x: Any) -> str:
+    if x is None: return ""
+    if isinstance(x, str): return x
+    if isinstance(x, dict):
+        for k in ("default","en","eng","English"):
+            v = x.get(k)
+            if isinstance(v,str) and v.strip(): return v
+        for v in x.values():
+            if isinstance(v,str) and v.strip(): return v
+        return ""
+    if isinstance(x, (list,tuple,set)):
+        for v in x:
+            s = _norm_str(v)
+            if s: return s
+        return ""
+    try:
+        s = str(x)
+        return s if s != "None" else ""
+    except Exception:
+        return ""
+
+def _slugify_en(s: Any) -> str:
+    s = _norm_str(s).strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s); s = re.sub(r"\s+", "-", s); s = re.sub(r"-+", "-", s)
+    return s
+
 TEAM_RU = {
     "EDM":"Эдмонтон","DAL":"Даллас","DET":"Детройт","NSH":"Нэшвилл",
     "TBL":"Тампа-Бэй","CGY":"Калгари","FLA":"Флорида","PHI":"Филадельфия",
@@ -68,11 +95,6 @@ TEAM_EMOJI = {
     "SEA":"🦑","LAK":"👑",
 }
 
-def _slugify_en(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^\w\s-]", "", s); s = re.sub(r"\s+", "-", s); s = re.sub(r"-+", "-", s)
-    return s
-
 SPORTSRU_TEAM_SLUGS = {
     "VGK": ["vegas","vegas-golden-knights"],
     "UTA": ["utah-mammoth","utah","utah-hc","utah-hockey-club","utah-hc-nhl"],
@@ -81,7 +103,7 @@ SPORTSRU_TEAM_SLUGS = {
 }
 
 def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
-    v=[]; abbr=(team.get("abbrev") or team.get("triCode") or "").upper()
+    v=[]; abbr=_norm_str(team.get("abbrev") or team.get("triCode") or team.get("teamAbbrev")).upper()
     if abbr in SPORTSRU_TEAM_SLUGS: v += SPORTSRU_TEAM_SLUGS[abbr]
     place=_slugify_en(team.get("placeName") or team.get("city") or "")
     nick=_slugify_en(team.get("teamName") or team.get("name") or "")
@@ -141,20 +163,6 @@ def fetch_ru_name_map_for_match(home_team: Dict[str,Any], away_team: Dict[str,An
     dbg("sports.ru tried URLs (no data): " + " | ".join(tried[:8]))
     return {}
 
-def http_get_json(url: str, timeout: int = 30) -> Any:
-    return _get_with_retries(url, timeout=timeout, as_text=False)
-
-def http_get_text(url: str, timeout: int = 30) -> str:
-    return _get_with_retries(url, timeout=timeout, as_text=True)
-
-def fetch_json_safe(url: str) -> Optional[Dict[str,Any]]:
-    try:
-        js = http_get_json(url)
-        if isinstance(js, dict): return js
-    except Exception as e:
-        dbg(f"fetch fail {url}: {e!r}")
-    return None
-
 def resolve_game_pk_from_query(q: str) -> Optional[int]:
     try:
         ymd, pair = q.split(" ", 1)
@@ -177,8 +185,8 @@ def resolve_game_pk_from_query(q: str) -> Optional[int]:
             for w in (js.get("gameWeek") or []):
                 games.extend(w.get("games") or [])
         for g in games:
-            h = ((g.get("homeTeam") or {}).get("abbrev") or "").upper()
-            a = ((g.get("awayTeam") or {}).get("abbrev") or "").upper()
+            h = _norm_str((g.get("homeTeam") or {}).get("abbrev")).upper()
+            a = _norm_str((g.get("awayTeam") or {}).get("abbrev")).upper()
             if h == home and a == away:
                 return g.get("id")
         return None
@@ -228,29 +236,29 @@ def load_pbp_data(game_pk: int):
         def _scorer(ev):
             sc = ev.get("scorer")
             if isinstance(sc, dict):
-                nm = (sc.get("lastName") or sc.get("name") or sc.get("fullName") or "").strip()
+                nm = _norm_str(sc.get("lastName") or sc.get("name") or sc.get("fullName"))
                 if nm: return nm.split()[-1]
             for p in ev.get("players") or []:
-                if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
-                    nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                if (_norm_str(p.get("type") or p.get("playerType")).lower() in ("scorer","shooter")):
+                    nm = _norm_str(p.get("lastName") or p.get("name") or p.get("fullName"))
                     if nm: return nm.split()[-1]
             det = ev.get("details") or {}
             for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
-                nm = (det.get(k) or "").strip()
+                nm = _norm_str(det.get(k))
                 if nm: return nm.split()[-1]
             return ""
         def _assists(ev):
             out=[]
             for a in ev.get("assists") or []:
-                nm = (a.get("lastName") or a.get("name") or a.get("fullName") or "").strip()
+                nm = _norm_str(a.get("lastName") or a.get("name") or a.get("fullName"))
                 if nm: out.append(nm.split()[-1])
             if out: return out
             for p in ev.get("players") or []:
-                if (p.get("type") or p.get("playerType") or "").lower().startswith("assist"):
-                    nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                if _norm_str(p.get("type") or p.get("playerType")).lower().startswith("assist"):
+                    nm = _norm_str(p.get("lastName") or p.get("name") or p.get("fullName"))
                     if nm: out.append(nm.split()[-1])
             return out
-        goals.append({"period":per,"time":tm,"teamAbbrev":owner,"scorer":_scorer(ev),"assists":_assists(ev)})
+        goals.append({"period":per,"time":tm,"teamAbbrev":owner,"scorer":_scorer(ev).title(),"assists":[x.title() for x in _assists(ev)]})
 
     if not raw_so:
         for ev in allplays:
@@ -268,37 +276,34 @@ def load_pbp_data(game_pk: int):
     shootout=[]
     rnd=0
     for ev in raw_so:
-        team = ((ev.get("details") or {}).get("eventOwnerTeamAbbrev")
-                or ev.get("teamAbbrev")
-                or (ev.get("team") or {}).get("abbrev") or "").upper()
-        # shooter
+        team = (_norm_str((ev.get("details") or {}).get("eventOwnerTeamAbbrev"))
+                or _norm_str(ev.get("teamAbbrev"))
+                or _norm_str((ev.get("team") or {}).get("abbrev"))).upper()
         sc=""
         scd=ev.get("scorer")
         if isinstance(scd, dict):
-            nm=(scd.get("lastName") or scd.get("name") or scd.get("fullName") or "").strip()
+            nm=_norm_str(scd.get("lastName") or scd.get("name") or scd.get("fullName"))
             if nm: sc = nm.split()[-1]
         if not sc:
             for p in ev.get("players") or []:
-                if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
-                    nm=(p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                if _norm_str(p.get("type") or p.get("playerType")).lower() in ("scorer","shooter"):
+                    nm=_norm_str(p.get("lastName") or p.get("name") or p.get("fullName"))
                     if nm: sc = nm.split()[-1]; break
         if not sc:
             det = ev.get("details") or {}
             for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
-                nm = (det.get(k) or "").strip()
+                nm = _norm_str(det.get(k))
                 if nm: sc = nm.split()[-1]; break
-        tdk = (ev.get("typeDescKey") or "").lower()
+        tdk = _norm_str(ev.get("typeDescKey")).lower()
         det = ev.get("details") or {}
         is_goal = bool(det.get("isGoal"))
         if "goal" in tdk: is_goal = True
         if "miss" in tdk or "no_goal" in tdk: is_goal = False
         round_no = det.get("shootoutRound") or det.get("round") or rnd + 1
         rnd = int(round_no)
-        shootout.append({"round":rnd,"teamAbbrev":team,"shooter":sc,"result":"goal" if is_goal else "miss"})
+        shootout.append({"round":rnd,"teamAbbrev":team,"shooter":(sc.title() if sc else ""), "result":"goal" if is_goal else "miss"})
 
     return goals, shootout, (js_any.get("gameInfo") if isinstance(js_any, dict) else {})
-
-TEAM_EMOJI = TEAM_EMOJI  # reuse
 
 def send_telegram_text(text: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -327,13 +332,13 @@ def render_single(game_pk: int) -> str:
     else:
         home = (game_info.get("homeTeam") or {})
         away = (game_info.get("awayTeam") or {})
-        h_ab = (home.get("abbrev") or "").upper()
-        a_ab = (away.get("abbrev") or "").upper()
-        hscore = sum(1 for ev in goals if (ev.get("teamAbbrev") or "").upper()==h_ab)
-        ascore = sum(1 for ev in goals if (ev.get("teamAbbrev") or "").upper()==a_ab)
+        h_ab = _norm_str(home.get("abbrev")).upper()
+        a_ab = _norm_str(away.get("abbrev")).upper()
+        hscore = sum(1 for ev in goals if _norm_str(ev.get("teamAbbrev")).upper()==h_ab)
+        ascore = sum(1 for ev in goals if _norm_str(ev.get("teamAbbrev")).upper()==a_ab)
 
-    h_ab = (home.get("abbrev") or home.get("triCode") or "").upper()
-    a_ab = (away.get("abbrev") or away.get("triCode") or "").upper()
+    h_ab = _norm_str(home.get("abbrev") or home.get("triCode")).upper()
+    a_ab = _norm_str(away.get("abbrev") or away.get("triCode")).upper()
     h_name, a_name = TEAM_RU.get(h_ab, h_ab), TEAM_RU.get(a_ab, a_ab)
     h_emoji, a_emoji = TEAM_EMOJI.get(h_ab, "•"), TEAM_EMOJI.get(a_ab, "•")
 
@@ -344,7 +349,6 @@ def render_single(game_pk: int) -> str:
     h_rec = record_of(home)
     a_rec = record_of(away)
 
-    # sports.ru русские фамилии
     ru_map = fetch_ru_name_map_for_match(home, away)
 
     header = [
@@ -359,20 +363,14 @@ def render_single(game_pk: int) -> str:
 
     h_c = a_c = 0
     for ev in goals:
-        # period/time
-        per = (
-            (ev.get("periodDescriptor") or {}).get("number")
-            or (ev.get("period") or {}).get("number")
-            or (ev.get("about")  or {}).get("periodNumber")
-            or ev.get("period")
-            or 0
-        ) or 0
+        per = ( (ev.get("period") if isinstance(ev.get("period"), int) else 0)
+                or (ev.get("about") or {}).get("periodNumber") or 0 )
         tm  = mmss_to_ru(ev.get("time") if isinstance(ev.get("time"), str) else ev.get("time","00:00"))
-        owner = (ev.get("teamAbbrev") or "").upper()
+        owner = _norm_str(ev.get("teamAbbrev")).upper()
         if owner == h_ab: h_c += 1
         elif owner == a_ab: a_c += 1
-        scorer = ru_last_or_keep((ev.get("scorer") or "").title(), ru_map)
-        assists = [ru_last_or_keep(x.title(), ru_map) for x in (ev.get("assists") or [])]
+        scorer = ru_last_or_keep(_norm_str(ev.get("scorer")).title(), ru_map)
+        assists = [ru_last_or_keep(_norm_str(x).title(), ru_map) for x in (ev.get("assists") or [])]
         who = f"{scorer} ({', '.join(assists)})" if assists else (scorer or "—")
         line = f"{h_c}:{a_c} – {tm} {who}"
         if per in (1,2,3): per_goals[per].append(line)
@@ -382,7 +380,7 @@ def render_single(game_pk: int) -> str:
         so_h = so_a = 0
         for ev in shootout:
             team = ev["teamAbbrev"]
-            shooter = ru_last_or_keep((ev["shooter"] or "").title(), ru_map)
+            shooter = ru_last_or_keep(_norm_str(ev["shooter"]).title(), ru_map)
             res = ev["result"]
             if res == "goal":
                 if team == h_ab: so_h += 1
@@ -409,6 +407,25 @@ def render_single(game_pk: int) -> str:
     txt.extend(body)
     txt.append("</tg-spoiler>")
     return "\n".join(txt).replace("\n\n\n","\n\n").strip()
+
+def send_telegram_text(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("No TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    r = requests.post(url, json=data, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    if not js.get("ok"):
+        raise RuntimeError(f"Telegram error: {js}")
+
+def fetch_json_safe(url: str) -> Optional[Dict[str,Any]]:
+    try:
+        js = http_get_json(url)
+        if isinstance(js, dict): return js
+    except Exception as e:
+        dbg(f"fetch fail {url}: {e!r}")
+    return None
 
 def send(gid: int):
     text = render_single(gid)
