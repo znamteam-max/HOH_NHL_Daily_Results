@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.4; +github)",
+    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.5; +github)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -31,6 +31,7 @@ def dbg(msg: str):
     if DEBUG_VERBOSE:
         print(f"[DBG] {msg}", flush=True)
 
+# ---------- HTTP ----------
 def _get_with_retries(url: str, *, timeout: int = 30, as_text: bool = False) -> Any:
     last = None
     for i in range(3):
@@ -50,20 +51,17 @@ def http_get_json(url: str, timeout: int = 30) -> Any:
 def http_get_text(url: str, timeout: int = 30) -> str:
     return _get_with_retries(url, timeout=timeout, as_text=True)
 
-# ---------- helpers for weird API shapes ----------
+# ---------- normalization helpers ----------
 def _norm_str(x: Any) -> str:
-    """Return a reasonable string from NHL API field that may be str/dict/list/None."""
     if x is None:
         return ""
     if isinstance(x, str):
         return x
     if isinstance(x, dict):
-        # Prefer typical keys
         for k in ("default", "en", "eng", "English"):
             v = x.get(k)
             if isinstance(v, str) and v.strip():
                 return v
-        # Any first stringy value
         for v in x.values():
             if isinstance(v, str) and v.strip():
                 return v
@@ -74,7 +72,6 @@ def _norm_str(x: Any) -> str:
             if s:
                 return s
         return ""
-    # Fallback
     try:
         s = str(x)
         return s if s != "None" else ""
@@ -107,7 +104,7 @@ TEAM_EMOJI = {
     "SEA":"🦑","LAK":"👑",
 }
 
-# ---------- sports.ru URL генератор (Utah/Vegas, обе ориентации, /stat) ----------
+# ---------- sports.ru helpers ----------
 SPORTSRU_TEAM_SLUGS = {
     "VGK": ["vegas","vegas-golden-knights"],
     "UTA": ["utah-mammoth","utah","utah-hc","utah-hockey-club","utah-hc-nhl"],
@@ -125,7 +122,6 @@ def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
     if place and nick: v.append(f"{place}-{nick}")
     if nick: v.append(nick)
     if place and place not in v: v.append(place)
-    # dedup
     seen=set(); out=[]
     for x in v:
         if x and x not in seen:
@@ -187,7 +183,7 @@ def fetch_ru_name_map_for_match(home_team: Dict[str,Any], away_team: Dict[str,An
     dbg("sports.ru tried URLs (no data): " + " | ".join(tried[:8]))
     return {}
 
-# ---------- Телеграм ----------
+# ---------- Telegram ----------
 def send_telegram_text(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("No TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
@@ -197,12 +193,17 @@ def send_telegram_text(text: str):
         print("[DRY RUN] " + textwrap.shorten(text.replace("\n"," "), 200, placeholder="…"))
         return
     r = requests.post(url, json=data, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    if not js.get("ok"):
-        raise RuntimeError(f"Telegram error: {js}")
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        desc = ""
+        try:
+            desc = r.json().get("description","")
+        except Exception:
+            desc = r.text
+        raise requests.HTTPError(f"{e} | Telegram said: {desc}") from None
 
-# ---------- Вспомогательные ----------
+# ---------- misc ----------
 def parse_ymd_in_tz(ymd: str, tz: ZoneInfo) -> Tuple[datetime, datetime]:
     d = date.fromisoformat(ymd)
     start = datetime.combine(d, dtime(0,0), tzinfo=tz)
@@ -258,7 +259,7 @@ def fmt_record(rec: Tuple[int,int,int]) -> str:
 def mmss_to_ru(mmss: str) -> str:
     return (mmss or "00:00").replace(":", ".")
 
-# ---------- PBP загрузка (нормализация list/dict БЕЗУСЛОВНО) ----------
+# ---------- PBP ----------
 def _extract_period(ev: Dict[str,Any]) -> int:
     return (
         (ev.get("periodDescriptor") or {}).get("number")
@@ -371,13 +372,13 @@ def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]
 
     return goals, shootout
 
-# ---------- sports.ru имена ----------
+# ---------- name mapping ----------
 def ru_last_or_keep(en_last: str, ru_map: Dict[str,str]) -> str:
     if not en_last:
         return ""
     return ru_map.get(en_last, en_last)
 
-# ---------- Рендер одной игры ----------
+# ---------- render ----------
 def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]]) -> str:
     home = team_block(g, "home")
     away = team_block(g, "away")
@@ -393,7 +394,7 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     goals, shootout = load_pbp_data(g["id"])
     ru_map = fetch_ru_name_map_for_match(home, away)
 
-    # Шапка без дублей: "эмодзи — название — счёт — рекорд"
+    # Заголовок без дублей: эмодзи — название — счёт — рекорд
     header = [
         f"{h_emoji} «{h_name}» — {h_score} ({h_rec})",
         f"{a_emoji} «{a_name}» — {a_score} ({a_rec})",
@@ -402,8 +403,6 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
 
     per_goals: Dict[int, List[str]] = {1:[],2:[],3:[]}
     ot_goals: List[str] = []
-    so_lines: List[str] = []
-
     h_c, a_c = 0, 0
     for ev in goals:
         per = int(ev.get("period",0) or 0)
@@ -420,17 +419,10 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
         elif per == 4:
             ot_goals.append(line)
 
+    # Буллиты: по запросу — одна строка, без автора, только итоговый счёт
+    so_lines: List[str] = []
     if shootout:
-        so_h = so_a = 0
-        for ev in shootout:
-            team = ev["teamAbbrev"]
-            shooter = ru_last_or_keep((ev["shooter"] or "").title(), ru_map)
-            res = ev["result"]
-            if res == "goal":
-                if team == h_ab: so_h += 1
-                elif team == a_ab: so_a += 1
-            word = "гол" if res == "goal" else "мимо"
-            so_lines.append(f"Раунд {ev['round']} — {shooter or '—'} — {word} (SO {so_h}:{so_a})")
+        so_lines.append(f"буллит — {h_score}:{a_score}")
 
     def add_period(title: str, arr: List[str], out: List[str]):
         out.append(title)
@@ -454,7 +446,7 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     full.append("</tg-spoiler>")
     return "\n".join(full).replace("\n\n\n","\n\n").strip()
 
-# ---------- Рендер дня ----------
+# ---------- day render & safe split by WHOLE BLOCKS ----------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 def month_ru(m: int) -> str: return RU_MONTHS.get(m, "")
@@ -491,32 +483,34 @@ def build_day_text(ymd: str, tz: str) -> List[str]:
     head = f"🗓 Регулярный чемпионат НХЛ • {base_local.day} {month_ru(base_local.month)} • {len(games)} матчей\n\nРезультаты надёжно спрятаны 👇"
     sep = "—" * 66
 
-    blocks = []
+    # Собираем ЦЕЛЫЕ блоки (разделитель + блок игры), чтобы не рвать <tg-spoiler>
+    block_texts: List[str] = []
     for g in games:
-        blocks.append(sep)
-        blocks.append(render_game_block(g, standings))
+        block_texts.append(sep + "\n" + render_game_block(g, standings) + "\n")
 
-    txt = head + "\n" + "\n".join(blocks)
+    # Безопасная нарезка частей по 3500 символов
     parts: List[str] = []
-    cur, cur_len = [], 0
-    for line in txt.splitlines():
-        n = len(line) + 1
-        if cur_len + n > 3500:
-            parts.append("\n".join(cur))
-            cur, cur_len = [line], n
+    cur = head + "\n"
+    for blk in block_texts:
+        if len(cur) + len(blk) > 3500:
+            parts.append(cur.rstrip())
+            cur = blk
         else:
-            cur.append(line); cur_len += n
-    if cur: parts.append("\n".join(cur))
+            cur += blk
+    if cur.strip():
+        parts.append(cur.rstrip())
+
     dbg(f"Telegram parts: {len(parts)}")
     return parts
 
 def main():
     parts = build_day_text(REPORT_DATE_LOCAL, REPORT_TZ)
+    total = len(parts)
     for i, part in enumerate(parts, 1):
         if i == 1:
             send_telegram_text(part)
         else:
-            send_telegram_text(f"…продолжение (часть {i}/{len(parts)})\n\n{part}")
+            send_telegram_text(f"…продолжение (часть {i}/{total})\n\n{part}")
 
 if __name__ == "__main__":
     main()
