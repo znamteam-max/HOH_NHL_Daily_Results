@@ -1,8 +1,8 @@
-name: NHL single result (auto + manual)
+name: NHL single result (manual + auto every 3 min)
 
 on:
   schedule:
-    - cron: "*/3 * * * *"
+    - cron: "*/3 * * * *"    # автопост каждые 3 минуты
   workflow_dispatch:
     inputs:
       gamePk:
@@ -10,32 +10,43 @@ on:
         required: false
         default: ""
       gameDate:
-        description: "YYYY-MM-DD (optional if using MATCH)"
+        description: "YYYY-MM-DD (optional if using gamePk)"
         required: false
         default: ""
       match:
         description: "e.g. 'SEA - NYI' (HOME - AWAY) or 'SEA@NYI' (AWAY@HOME)"
         required: false
         default: ""
+      # Ниже параметры держим только для совместимости UI (не используются):
+      searchBack:
+        description: "UNUSED"
+        required: false
+        default: "1"
+      searchFwd:
+        description: "UNUSED"
+        required: false
+        default: "1"
+      requireFinal:
+        description: "UNUSED"
+        required: false
+        default: "1"
+      forcePost:
+        description: "UNUSED"
+        required: false
+        default: "1"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: nhl-single-result
-  cancel-in-progress: true
+  contents: write   # чтобы коммитить state/posted_games.json
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -44,23 +55,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: "Debug - check script header (guard)"
-        run: |
-          sed -n '1,80p' nhl_single_result_bot.py
-          echo "----- grep old guard -----"
-          if grep -n "provide GAME_PK or GAME_QUERY" nhl_single_result_bot.py; then
-            echo "❌ Found old guard text in nhl_single_result_bot.py"
-            exit 1
-          else
-            echo "✅ OK: new bot version (no old guard)"
-          fi
-
-      - name: Prepare inputs (manual only)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Prepare inputs (build GAME_QUERY if needed)
+        if: github.event_name == 'workflow_dispatch'
         env:
-          INPUT_GAMEPK: ${{ inputs.gamePk }}
-          INPUT_DATE:   ${{ inputs.gameDate }}
-          INPUT_MATCH:  ${{ inputs.match }}
+          INPUT_GAMEPK:  ${{ inputs.gamePk }}
+          INPUT_DATE:    ${{ inputs.gameDate }}
+          INPUT_MATCH:   ${{ inputs.match }}
         run: |
           python - << 'PY'
           import os, re
@@ -84,12 +84,25 @@ jobs:
           print("GAME_QUERY:", q or "(empty)")
           PY
 
-      - name: Run single result (auto or manual)
+      - name: Post single result(s)
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          GAME_PK:            ${{ env.GAME_PK }}
-          GAME_QUERY:         ${{ env.GAME_QUERY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.Telegram_bot_token || secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.Telegram_chat_id   || secrets.TELEGRAM_CHAT_ID }}
           DEBUG_VERBOSE:      "1"
+          # Для workflow_dispatch GAME_PK/GAME_QUERY подставятся из GITHUB_ENV предыдущего шага.
+          # Для schedule — авто-режим (ничего не передаём), бот сам найдёт и отправит новые FINAL.
         run: |
           python nhl_single_result_bot.py
+
+      - name: Commit posted state (if changed)
+        run: |
+          set -e
+          if git status --porcelain | grep -E "^( M| M|M |A )\s+state/posted_games\.json" >/dev/null 2>&1; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/posted_games.json
+            git commit -m "Update posted state"
+            git push
+          else
+            echo "No state changes"
+          fi
