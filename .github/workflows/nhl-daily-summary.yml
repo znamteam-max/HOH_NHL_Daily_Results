@@ -2,7 +2,7 @@ name: NHL daily results to Telegram
 
 on:
   schedule:
-    - cron: "35 5 * * *"   # 06:35 Europe/London (как было)
+    - cron: "35 5 * * *"   # утренний запуск (оставь как нужно тебе)
   workflow_dispatch:
     inputs:
       local_date:
@@ -19,15 +19,13 @@ on:
         default: "0"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -38,12 +36,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Run daily summary (explicit local day if provided)
+      - name: Run daily summary
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          REPORT_DATE:        ${{ github.event.inputs.local_date }}  # <- было REPORT_DATE_LOCAL
-          REPORT_TZ:          ${{ github.event.inputs.tz }}          # тот же input, корректное имя env
+          REPORT_DATE_LOCAL:  ${{ github.event.inputs.local_date }}
+          REPORT_TZ:          ${{ github.event.inputs.tz }}
           DRY_RUN:            ${{ github.event.inputs.dry_run }}
-        run: |
-          python nhl_daily_results_bot.py
+          DEBUG_VERBOSE:      "1"
+        run: python nhl_daily_results_bot.py

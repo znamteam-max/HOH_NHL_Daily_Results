@@ -2,7 +2,7 @@ name: NHL single result (auto + manual)
 
 on:
   schedule:
-    - cron: "*/3 * * * *"   # каждые 3 минуты — авто-режим (постит FINAL из вчера+сегодня без повторов)
+    - cron: "*/3 * * * *"
   workflow_dispatch:
     inputs:
       gamePk:
@@ -19,24 +19,37 @@ on:
         default: ""
 
 permissions:
-  contents: write  # для state/posted_games.json на push не требуется, но пусть будет
+  contents: write
+
+concurrency:
+  group: nhl-single-result
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
+
+      - name: Debug: show script header (guard check)
+        run: |
+          sed -n '1,60p' nhl_single_result_bot.py
+          echo "----- grep old guard -----"
+          if grep -n "provide GAME_PK or GAME_QUERY" -n nhl_single_result_bot.py; then
+            echo "❌ Старая версия nhl_single_result_bot.py (есть старый guard)."
+            exit 1
+          else
+            echo "✅ Ок: новый бот без старого guard-а."
+          fi
 
       - name: Prepare inputs (manual only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -64,7 +77,8 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               fh.write(f"GAME_PK={gp}\n")
               fh.write(f"GAME_QUERY={q}\n")
-          print("GAME_QUERY:", q or "(empty)")
+          echo = q or "(empty)"
+          print("GAME_QUERY:", echo)
           PY
 
       - name: Run single result (auto or manual)
@@ -74,5 +88,4 @@ jobs:
           GAME_PK:            ${{ env.GAME_PK }}
           GAME_QUERY:         ${{ env.GAME_QUERY }}
           DEBUG_VERBOSE:      "1"
-        run: |
-          python nhl_single_result_bot.py
+        run: python nhl_single_result_bot.py
