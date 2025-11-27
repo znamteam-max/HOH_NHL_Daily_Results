@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-NHL Single Result → Telegram
-
-Фиксы:
-- Формат шапки: «эмодзи/• — название — счёт — рекорд» (без дублирования).
-- Буллиты: автор каждого броска и счёт серии (SO X:Y).
-- Если /game-summary 404 — собираем по play-by-play/boxscore.
-- Поиск GAME_PK из GAME_QUERY "YYYY-MM-DD HOME - AWAY" или "AWAY@HOME".
-
-ENV:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  GAME_PK (опц.), GAME_QUERY (опц.), DEBUG_VERBOSE
-"""
-
 from __future__ import annotations
 import os, sys, time, re, textwrap
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date, timedelta
-
 import requests
 from bs4 import BeautifulSoup
 
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NHLSingleBot/1.2; +github)",
+    "User-Agent": "Mozilla/5.0 (compatible; NHLSingleBot/1.3; +github)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -83,12 +68,9 @@ TEAM_EMOJI = {
     "SEA":"🦑","LAK":"👑",
 }
 
-# ---- sports.ru slugs (Utah/Vegas) ----
 def _slugify_en(s: str) -> str:
     s = (s or "").strip().lower()
-    s = re.sub(r"[^\w\s-]", "", s)
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"-+", "-", s)
+    s = re.sub(r"[^\w\s-]", "", s); s = re.sub(r"\s+", "-", s); s = re.sub(r"-+", "-", s)
     return s
 
 SPORTSRU_TEAM_SLUGS = {
@@ -97,12 +79,12 @@ SPORTSRU_TEAM_SLUGS = {
     "UTH": ["utah-mammoth","utah","utah-hc","utah-hockey-club","utah-hc-nhl"],
     "UTAH":["utah-mammoth","utah","utah-hc","utah-hockey-club","utah-hc-nhl"],
 }
+
 def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
-    v=[]
-    abbr = (team.get("abbrev") or team.get("triCode") or "").upper()
+    v=[]; abbr=(team.get("abbrev") or team.get("triCode") or "").upper()
     if abbr in SPORTSRU_TEAM_SLUGS: v += SPORTSRU_TEAM_SLUGS[abbr]
-    place = _slugify_en(team.get("placeName") or team.get("city") or "")
-    nick  = _slugify_en(team.get("teamName") or team.get("name") or "")
+    place=_slugify_en(team.get("placeName") or team.get("city") or "")
+    nick=_slugify_en(team.get("teamName") or team.get("name") or "")
     if place and nick: v.append(f"{place}-{nick}")
     if nick: v.append(nick)
     if place and place not in v: v.append(place)
@@ -110,6 +92,7 @@ def _team_slug_variants_for_sportsru(team: Dict[str,Any]) -> List[str]:
     for x in v:
         if x and x not in seen: out.append(x); seen.add(x)
     return out
+
 def gen_sportsru_match_urls(home_team: Dict[str,Any], away_team: Dict[str,Any]) -> List[str]:
     base="https://www.sports.ru/hockey/match"
     hs=_team_slug_variants_for_sportsru(home_team)
@@ -143,8 +126,7 @@ def try_parse_sportsru_names(url: str) -> Dict[str,str]:
             if m: en = m.group(1).replace("-", " ")
         if en:
             en_last = en.split()[-1].title()
-            if en_last and ru_last:
-                ru[en_last] = ru_last
+            if en_last and ru_last: ru[en_last] = ru_last
     if ru: dbg(f"sports.ru names extracted from {url}: {len(ru)}")
     return ru
 
@@ -159,7 +141,20 @@ def fetch_ru_name_map_for_match(home_team: Dict[str,Any], away_team: Dict[str,An
     dbg("sports.ru tried URLs (no data): " + " | ".join(tried[:8]))
     return {}
 
-# ---- NHL fetch ----
+def http_get_json(url: str, timeout: int = 30) -> Any:
+    return _get_with_retries(url, timeout=timeout, as_text=False)
+
+def http_get_text(url: str, timeout: int = 30) -> str:
+    return _get_with_retries(url, timeout=timeout, as_text=True)
+
+def fetch_json_safe(url: str) -> Optional[Dict[str,Any]]:
+    try:
+        js = http_get_json(url)
+        if isinstance(js, dict): return js
+    except Exception as e:
+        dbg(f"fetch fail {url}: {e!r}")
+    return None
+
 def resolve_game_pk_from_query(q: str) -> Optional[int]:
     try:
         ymd, pair = q.split(" ", 1)
@@ -168,11 +163,9 @@ def resolve_game_pk_from_query(q: str) -> Optional[int]:
         return None
     home, away = "", ""
     if "@" in pair:
-        a, h = pair.split("@", 1)
-        away, home = a.strip().upper(), h.strip().upper()
+        a, h = pair.split("@", 1); away, home = a.strip().upper(), h.strip().upper()
     elif "-" in pair:
-        left, right = pair.split("-", 1)
-        home, away = left.strip().upper(), right.strip().upper()
+        left, right = pair.split("-", 1); home, away = left.strip().upper(), right.strip().upper()
     else:
         return None
 
@@ -197,102 +190,103 @@ def resolve_game_pk_from_query(q: str) -> Optional[int]:
             return gid
     return None
 
-def fetch_json_safe(url: str) -> Optional[Dict[str,Any]]:
-    try:
-        js = http_get_json(url)
-        if isinstance(js, dict):
-            return js
-    except Exception as e:
-        dbg(f"fetch fail {url}: {e!r}")
-    return None
-
 def mmss_to_ru(mmss: str) -> str:
     return (mmss or "00:00").replace(":", ".")
 
-# ---- PBP extract helpers (такие же, как в daily) ----
-def _extract_period(ev: Dict[str,Any]) -> int:
-    return (
-        (ev.get("periodDescriptor") or {}).get("number")
-        or (ev.get("period") or {}).get("number")
-        or (ev.get("about")  or {}).get("periodNumber")
-        or 0
-    ) or 0
-
-def _extract_time(ev: Dict[str,Any]) -> str:
-    return (
-        ev.get("timeInPeriod")
-        or (ev.get("about") or {}).get("periodTime")
-        or "00:00"
-    )
-
-def _extract_team_abbrev(ev: Dict[str,Any]) -> str:
-    return (
-        (ev.get("details") or {}).get("eventOwnerTeamAbbrev")
-        or ev.get("teamAbbrev")
-        or (ev.get("team") or {}).get("abbrev")
-        or ""
-    )
-
-def _extract_scorer_last(ev: Dict[str,Any]) -> str:
-    sc = ev.get("scorer")
-    if isinstance(sc, dict):
-        nm = (sc.get("lastName") or sc.get("name") or sc.get("fullName") or "").strip()
-        if nm: return nm.split()[-1]
-    for p in ev.get("players") or []:
-        if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
-            nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
-            if nm: return nm.split()[-1]
-    det = ev.get("details") or {}
-    for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
-        nm = (det.get(k) or "").strip()
-        if nm: return nm.split()[-1]
-    return ""
-
-def _extract_assists_last_list(ev: Dict[str,Any]) -> List[str]:
-    out=[]
-    for a in ev.get("assists") or []:
-        nm = (a.get("lastName") or a.get("name") or a.get("fullName") or "").strip()
-        if nm: out.append(nm.split()[-1])
-    if out: return out
-    for p in ev.get("players") or []:
-        if (p.get("type") or p.get("playerType") or "").lower().startswith("assist"):
-            nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
-            if nm: out.append(nm.split()[-1])
-    return out
-
-def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]], Dict[str,Any]]:
+def load_pbp_data(game_pk: int):
     js_any = http_get_json(GAME_PBP_FMT.format(gamePk=game_pk))
+    plays_obj = {"scoringPlays": [], "allPlays": [], "shootoutPlays": []}
     if isinstance(js_any, dict):
-        pbp = js_any
-        plays = pbp.get("plays", {})
-        scoring = plays.get("scoringPlays") or []
-        scan = plays.get("allPlays") or []
-    else:
-        # список
-        scoring, scan = [], list(js_any)
+        raw = js_any.get("plays")
+        if isinstance(raw, dict):
+            plays_obj = {"scoringPlays": raw.get("scoringPlays") or [],
+                         "allPlays":     raw.get("allPlays")     or [],
+                         "shootoutPlays":raw.get("shootoutPlays") or []}
+        elif isinstance(raw, list):
+            plays_obj["allPlays"] = raw
+        else:
+            plays_obj["allPlays"] = js_any.get("allPlays") or []
+    elif isinstance(js_any, list):
+        plays_obj["allPlays"] = js_any
+
+    scoring = plays_obj.get("scoringPlays") or []
+    allplays = plays_obj.get("allPlays") or []
+    raw_so = plays_obj.get("shootoutPlays") or []
 
     goals=[]
     for ev in scoring:
-        per = _extract_period(ev)
-        tm  = _extract_time(ev)
-        owner = _extract_team_abbrev(ev)
-        scorer = _extract_scorer_last(ev)
-        assists = _extract_assists_last_list(ev)
-        goals.append({"period":per,"time":tm,"teamAbbrev":owner,"scorer":scorer,"assists":assists})
+        per = (
+            (ev.get("periodDescriptor") or {}).get("number")
+            or (ev.get("period") or {}).get("number")
+            or (ev.get("about")  or {}).get("periodNumber")
+            or 0
+        ) or 0
+        tm  = ev.get("timeInPeriod") or (ev.get("about") or {}).get("periodTime") or "00:00"
+        owner = ( (ev.get("details") or {}).get("eventOwnerTeamAbbrev")
+                  or ev.get("teamAbbrev")
+                  or (ev.get("team") or {}).get("abbrev") or "" )
+        def _scorer(ev):
+            sc = ev.get("scorer")
+            if isinstance(sc, dict):
+                nm = (sc.get("lastName") or sc.get("name") or sc.get("fullName") or "").strip()
+                if nm: return nm.split()[-1]
+            for p in ev.get("players") or []:
+                if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
+                    nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                    if nm: return nm.split()[-1]
+            det = ev.get("details") or {}
+            for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
+                nm = (det.get(k) or "").strip()
+                if nm: return nm.split()[-1]
+            return ""
+        def _assists(ev):
+            out=[]
+            for a in ev.get("assists") or []:
+                nm = (a.get("lastName") or a.get("name") or a.get("fullName") or "").strip()
+                if nm: out.append(nm.split()[-1])
+            if out: return out
+            for p in ev.get("players") or []:
+                if (p.get("type") or p.get("playerType") or "").lower().startswith("assist"):
+                    nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                    if nm: out.append(nm.split()[-1])
+            return out
+        goals.append({"period":per,"time":tm,"teamAbbrev":owner,"scorer":_scorer(ev),"assists":_assists(ev)})
 
-    shootout=[]
-    raw_so = (plays.get("shootoutPlays") if isinstance(js_any, dict) else []) or []
     if not raw_so:
-        for ev in scan:
-            per = _extract_period(ev)
+        for ev in allplays:
+            per = (
+                (ev.get("periodDescriptor") or {}).get("number")
+                or (ev.get("period") or {}).get("number")
+                or (ev.get("about")  or {}).get("periodNumber")
+                or 0
+            ) or 0
             ptype = (ev.get("periodDescriptor") or {}).get("periodType") \
                     or (ev.get("about") or {}).get("ordinalNum") or ""
             if per >= 5 or str(ptype).upper() == "SO":
                 raw_so.append(ev)
+
+    shootout=[]
     rnd=0
     for ev in raw_so:
-        team = _extract_team_abbrev(ev).upper()
-        shooter = _extract_scorer_last(ev)
+        team = ((ev.get("details") or {}).get("eventOwnerTeamAbbrev")
+                or ev.get("teamAbbrev")
+                or (ev.get("team") or {}).get("abbrev") or "").upper()
+        # shooter
+        sc=""
+        scd=ev.get("scorer")
+        if isinstance(scd, dict):
+            nm=(scd.get("lastName") or scd.get("name") or scd.get("fullName") or "").strip()
+            if nm: sc = nm.split()[-1]
+        if not sc:
+            for p in ev.get("players") or []:
+                if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
+                    nm=(p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
+                    if nm: sc = nm.split()[-1]; break
+        if not sc:
+            det = ev.get("details") or {}
+            for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
+                nm = (det.get(k) or "").strip()
+                if nm: sc = nm.split()[-1]; break
         tdk = (ev.get("typeDescKey") or "").lower()
         det = ev.get("details") or {}
         is_goal = bool(det.get("isGoal"))
@@ -300,23 +294,11 @@ def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]
         if "miss" in tdk or "no_goal" in tdk: is_goal = False
         round_no = det.get("shootoutRound") or det.get("round") or rnd + 1
         rnd = int(round_no)
-        shootout.append({
-            "round": rnd,
-            "teamAbbrev": team,
-            "shooter": shooter,
-            "result": "goal" if is_goal else "miss",
-        })
+        shootout.append({"round":rnd,"teamAbbrev":team,"shooter":sc,"result":"goal" if is_goal else "miss"})
 
-    # Попробуем вытащить команды/счёт из pbp.gameInfo
-    game_info = {}
-    if isinstance(js_any, dict):
-        game_info = (js_any.get("gameInfo") or {})
-    return goals, shootout, game_info
+    return goals, shootout, (js_any.get("gameInfo") if isinstance(js_any, dict) else {})
 
-# ---- форматирование ----
-def ru_last_or_keep(en_last: str, ru_map: Dict[str,str]) -> str:
-    if not en_last: return ""
-    return ru_map.get(en_last, en_last)
+TEAM_EMOJI = TEAM_EMOJI  # reuse
 
 def send_telegram_text(text: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -330,7 +312,6 @@ def send_telegram_text(text: str):
         raise RuntimeError(f"Telegram error: {js}")
 
 def render_single(game_pk: int) -> str:
-    # summary -> box -> pbp
     sumjs = fetch_json_safe(GAME_SUMMARY_FMT.format(gamePk=game_pk))
     boxjs = None if sumjs else fetch_json_safe(GAME_BOX_FMT.format(gamePk=game_pk))
     goals, shootout, game_info = load_pbp_data(game_pk)
@@ -344,10 +325,8 @@ def render_single(game_pk: int) -> str:
         hscore = int((boxjs.get("homeTeam") or {}).get("score",0))
         ascore = int((boxjs.get("awayTeam") or {}).get("score",0))
     else:
-        # pbp-only
         home = (game_info.get("homeTeam") or {})
         away = (game_info.get("awayTeam") or {})
-        # посчитаем по голам
         h_ab = (home.get("abbrev") or "").upper()
         a_ab = (away.get("abbrev") or "").upper()
         hscore = sum(1 for ev in goals if (ev.get("teamAbbrev") or "").upper()==h_ab)
@@ -365,24 +344,30 @@ def render_single(game_pk: int) -> str:
     h_rec = record_of(home)
     a_rec = record_of(away)
 
+    # sports.ru русские фамилии
     ru_map = fetch_ru_name_map_for_match(home, away)
 
-    # Шапка
     header = [
         f"{h_emoji} «{h_name}» — {hscore} ({h_rec})",
         f"{a_emoji} «{a_name}» — {ascore} ({a_rec})",
         "",
     ]
 
-    # Периоды
     per_goals = {1:[],2:[],3:[]}
     ot_goals: List[str] = []
     so_lines: List[str] = []
 
     h_c = a_c = 0
     for ev in goals:
-        per = _extract_period(ev)
-        tm  = mmss_to_ru(ev.get("time")) if isinstance(ev.get("time"), str) else mmss_to_ru(ev.get("time", "00:00"))
+        # period/time
+        per = (
+            (ev.get("periodDescriptor") or {}).get("number")
+            or (ev.get("period") or {}).get("number")
+            or (ev.get("about")  or {}).get("periodNumber")
+            or ev.get("period")
+            or 0
+        ) or 0
+        tm  = mmss_to_ru(ev.get("time") if isinstance(ev.get("time"), str) else ev.get("time","00:00"))
         owner = (ev.get("teamAbbrev") or "").upper()
         if owner == h_ab: h_c += 1
         elif owner == a_ab: a_c += 1
@@ -390,10 +375,8 @@ def render_single(game_pk: int) -> str:
         assists = [ru_last_or_keep(x.title(), ru_map) for x in (ev.get("assists") or [])]
         who = f"{scorer} ({', '.join(assists)})" if assists else (scorer or "—")
         line = f"{h_c}:{a_c} – {tm} {who}"
-        if per in (1,2,3):
-            per_goals[per].append(line)
-        elif per == 4:
-            ot_goals.append(line)
+        if per in (1,2,3): per_goals[per].append(line)
+        elif per == 4:     ot_goals.append(line)
 
     if shootout:
         so_h = so_a = 0

@@ -1,36 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-NHL Daily Results → Telegram (spoiler friendly, RU names if possible)
-
-Фиксы:
-- PBP может прийти списком — поддержано.
-- Эмодзи+название+счёт+рекорд в ОДНОМ месте (без дублирования).
-- Буллиты: показываем автора каждого броска и текущий счёт серии (SO X:Y).
-- DRY_RUN безопасно инициализирован из ENV.
-- Расширенный генератор URL для sports.ru (Utah/Vegas, обе ориентации, /stat).
-
-ENV:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  REPORT_DATE_LOCAL (YYYY-MM-DD, опционально)
-  REPORT_TZ (IANA TZ, по умолчанию Europe/Amsterdam)
-  DRY_RUN ("1" = не слать, печатать)
-  DEBUG_VERBOSE ("1" = детальные логи)
-"""
-
 from __future__ import annotations
-import os, sys, time, textwrap, re
-from typing import Any, Dict, List, Optional, Tuple
+import os, time, textwrap, re
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime, date, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-
 import requests
 from bs4 import BeautifulSoup
 
 API = "https://api-web.nhle.com"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.2; +github)",
+    "User-Agent": "Mozilla/5.0 (compatible; NHLDailyBot/1.3; +github)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -61,8 +42,7 @@ def _get_with_retries(url: str, *, timeout: int = 30, as_text: bool = False) -> 
             last = e
             dbg(f"retry {i+1}/3 for {url}: {repr(e)}")
             time.sleep(0.75 * (i+1))
-    if last:
-        raise last
+    if last: raise last
 
 def http_get_json(url: str, timeout: int = 30) -> Any:
     return _get_with_retries(url, timeout=timeout, as_text=False)
@@ -80,7 +60,6 @@ TEAM_RU = {
     "UTA":"Юта","MTL":"Монреаль","VGK":"Вегас","OTT":"Оттава",
     "ANA":"Анахайм","VAN":"Ванкувер","SEA":"Сиэтл","LAK":"Лос-Анджелес",
 }
-
 TEAM_EMOJI = {
     "EDM":"🛢️","DAL":"⭐️","DET":"🛡️","NSH":"🐯","TBL":"⚡","CGY":"🔥",
     "FLA":"🐆","PHI":"🛩","NJD":"😈","STL":"🎵","NYI":"🏝️","BOS":"🐻",
@@ -249,7 +228,7 @@ def fmt_record(rec: Tuple[int,int,int]) -> str:
 def mmss_to_ru(mmss: str) -> str:
     return (mmss or "00:00").replace(":", ".")
 
-# ---------- PBP загрузка (поддержка разных форматов) ----------
+# ---------- PBP загрузка (нормализация list/dict БЕЗУСЛОВНО) ----------
 def _extract_period(ev: Dict[str,Any]) -> int:
     return (
         (ev.get("periodDescriptor") or {}).get("number")
@@ -274,17 +253,14 @@ def _extract_team_abbrev(ev: Dict[str,Any]) -> str:
     )
 
 def _extract_scorer_last(ev: Dict[str,Any]) -> str:
-    # прямые поля
     sc = ev.get("scorer")
     if isinstance(sc, dict):
         nm = (sc.get("lastName") or sc.get("name") or sc.get("fullName") or "").strip()
         if nm: return nm.split()[-1]
-    # players[]
     for p in ev.get("players") or []:
         if (p.get("type") or p.get("playerType") or "").lower() in ("scorer","shooter"):
             nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
             if nm: return nm.split()[-1]
-    # details*
     det = ev.get("details") or {}
     for k in ("shootoutShooterName","scoringPlayerName","scorerName"):
         nm = (det.get(k) or "").strip()
@@ -297,7 +273,6 @@ def _extract_assists_last_list(ev: Dict[str,Any]) -> List[str]:
         nm = (a.get("lastName") or a.get("name") or a.get("fullName") or "").strip()
         if nm: out.append(nm.split()[-1])
     if out: return out
-    # players[]
     for p in ev.get("players") or []:
         if (p.get("type") or p.get("playerType") or "").lower().startswith("assist"):
             nm = (p.get("lastName") or p.get("name") or p.get("fullName") or "").strip()
@@ -305,20 +280,33 @@ def _extract_assists_last_list(ev: Dict[str,Any]) -> List[str]:
     return out
 
 def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]]]:
-    """
-    Возвращает:
-      goals: [{period,time,teamAbbrev,scorer,assists}]
-      shootout: [{round,teamAbbrev,shooter,result}]  # result in {"goal","miss"}
-    """
     js = http_get_json(GAME_PBP_FMT.format(gamePk=game_pk))
 
-    # нормализуем источники
-    if isinstance(js, list):
-        plays = js
-        plays_obj = {"scoringPlays": [], "allPlays": plays}
+    # НОРМАЛИЗАЦИЯ: делаем plays_obj словарём при любом входе (dict/list/что угодно)
+    plays_obj: Dict[str,Any] = {"scoringPlays": [], "allPlays": [], "shootoutPlays": []}
+    if isinstance(js, dict):
+        raw = js.get("plays")
+        if isinstance(raw, dict):
+            # обычный вариант
+            plays_obj = {"scoringPlays": raw.get("scoringPlays") or [],
+                         "allPlays":     raw.get("allPlays")     or [],
+                         "shootoutPlays":raw.get("shootoutPlays") or []}
+        elif isinstance(raw, list):
+            # редкий вариант: "plays" это список
+            plays_obj["allPlays"] = raw
+        else:
+            # иногда нужные события лежат на верхнем уровне
+            plays_obj["allPlays"] = js.get("allPlays") or []
+    elif isinstance(js, list):
+        # полностью список
+        plays_obj["allPlays"] = js
     else:
-        plays_obj = js.get("plays", {}) if isinstance(js, dict) else {}
+        # неизвестный формат — оставим пустым
+        pass
+
     scoring = plays_obj.get("scoringPlays") or []
+    allplays = plays_obj.get("allPlays") or []
+    shootout_src = plays_obj.get("shootoutPlays") or []
 
     goals: List[Dict[str,Any]] = []
     for ev in scoring:
@@ -332,37 +320,26 @@ def load_pbp_data(game_pk: int) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]
             "scorer": scorer, "assists": assists
         })
 
-    # буллиты — сначала специализированный список, если есть
-    shootout: List[Dict[str,Any]] = []
-    raw_so = []
-    if isinstance(plays_obj, dict):
-        raw_so = plays_obj.get("shootoutPlays") or []
+    # Буллиты: если спец-список пуст, просканируем allPlays
+    raw_so = list(shootout_src)
     if not raw_so:
-        # просканируем allPlays/plays на предмет SO
-        scan = plays_obj.get("allPlays") if isinstance(plays_obj, dict) else None
-        if scan is None and isinstance(js, list):
-            scan = js
-        for ev in (scan or []):
+        for ev in allplays:
             per = _extract_period(ev)
-            # shootout обычно period >= 5 или periodType SO
             ptype = (ev.get("periodDescriptor") or {}).get("periodType") \
                     or (ev.get("about") or {}).get("ordinalNum") or ""
-            is_so = per >= 5 or str(ptype).upper() == "SO"
-            if not is_so: continue
-            raw_so.append(ev)
+            if per >= 5 or str(ptype).upper() == "SO":
+                raw_so.append(ev)
 
-    # превратим в компактную структуру
+    shootout: List[Dict[str,Any]] = []
     rnd = 0
-    for i, ev in enumerate(raw_so, 1):
+    for ev in raw_so:
         team = _extract_team_abbrev(ev).upper()
         shooter = _extract_scorer_last(ev)
-        # гол/мимо
         tdk = (ev.get("typeDescKey") or "").lower()
         det = ev.get("details") or {}
         is_goal = bool(det.get("isGoal"))
         if "goal" in tdk: is_goal = True
         if "miss" in tdk or "no_goal" in tdk: is_goal = False
-        # round
         round_no = det.get("shootoutRound") or det.get("round") or rnd + 1
         rnd = int(round_no)
         shootout.append({
@@ -393,11 +370,9 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     h_rec = fmt_record(standings.get(h_ab, (0,0,0)))
     a_rec = fmt_record(standings.get(a_ab, (0,0,0)))
 
-    # PBP данные
     goals, shootout = load_pbp_data(g["id"])
     ru_map = fetch_ru_name_map_for_match(home, away)
 
-    # Шапка — строго один раз, внутри спойлера:
     header = [
         f"{h_emoji} «{h_name}» — {h_score} ({h_rec})",
         f"{a_emoji} «{a_name}» — {a_score} ({a_rec})",
@@ -408,7 +383,6 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     ot_goals: List[str] = []
     so_lines: List[str] = []
 
-    # динамика счёта по периодам (только игровые голы/ОТ)
     h_c, a_c = 0, 0
     for ev in goals:
         per = int(ev.get("period",0) or 0)
@@ -424,15 +398,13 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
             per_goals[per].append(line)
         elif per == 4:
             ot_goals.append(line)
-        # period >=5 (SO) мы не добавляем сюда — отдельный раздел ниже
 
-    # Буллиты — линия за линией с текущим счётом серии
     if shootout:
         so_h = so_a = 0
         for ev in shootout:
             team = ev["teamAbbrev"]
             shooter = ru_last_or_keep((ev["shooter"] or "").title(), ru_map)
-            res = ev["result"]  # "goal"/"miss"
+            res = ev["result"]
             if res == "goal":
                 if team == h_ab: so_h += 1
                 elif team == a_ab: so_a += 1
@@ -441,10 +413,8 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
 
     def add_period(title: str, arr: List[str], out: List[str]):
         out.append(title)
-        if arr:
-            out.extend(arr)
-        else:
-            out.append("Голов не было")
+        if arr: out.extend(arr)
+        else:   out.append("Голов не было")
         out.append("")
 
     body: List[str] = []
@@ -456,7 +426,6 @@ def render_game_block(g: Dict[str,Any], standings: Dict[str,Tuple[int,int,int]])
     if so_lines:
         add_period("<i>Буллиты</i>", so_lines, body)
 
-    # Итоговый блок (без дублирования шапки снаружи)
     full = []
     full.append("<tg-spoiler>")
     full.extend(header)
@@ -493,7 +462,7 @@ def build_day_text(ymd: str, tz: str) -> List[str]:
             games.append(g)
     dbg(f"Collected FINAL games: {len(games)}")
 
-    standings = fetch_standings_map()  # если 0 — покажем 0-0-0
+    standings = fetch_standings_map()
 
     if not games:
         return [f"🗓 Регулярный чемпионат НХЛ • {base_local.day} {month_ru(base_local.month)} • матчей нет"]
@@ -507,7 +476,6 @@ def build_day_text(ymd: str, tz: str) -> List[str]:
         blocks.append(render_game_block(g, standings))
 
     txt = head + "\n" + "\n".join(blocks)
-    # разбиение под лимиты Telegram
     parts: List[str] = []
     cur, cur_len = [], 0
     for line in txt.splitlines():
