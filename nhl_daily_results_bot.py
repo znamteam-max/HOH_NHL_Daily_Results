@@ -113,8 +113,8 @@ SPORTSRU_SLUGS = {
     "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
     "WSH":["washington-capitals"],
     "WPG":["winnipeg-jets"],
-    # — Юта (новая команда, встречаются варианты) —
-    "UTA":["utah-hockey-club","utah-hc","utah","utah-hc-nhl"],
+    # — фикс: актуальный слег Юты —
+    "UTA":["utah-mammoth","utah","utah-hockey-club","utah-hc","utah-hc-nhl","utah-mammoths"],
 }
 
 # ---------- HTTP ----------
@@ -383,7 +383,8 @@ def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], L
                 except Exception as e:
                     if DEBUG_VERBOSE: print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}")
                     continue
-                # Определяем, какая сторона на странице — хозяева
+                # Определяем, какая сторона на странице — хозяева, исходя из того,
+                # принадлежит ли левый слег множеству кандидатов хозяев.
                 left_is_home = left in h_list
                 home_side = "home" if left_is_home else "away"
                 away_side = "away" if left_is_home else "home"
@@ -427,18 +428,14 @@ def period_title_text(num: int, ptype: str, ot_index: Optional[int], ot_total: i
 def line_goal(ev: ScoringEvent) -> str:
     score=f"{ev.home_goals}:{ev.away_goals}"
     who=ev.scorer or "—"
-    if ev.assists:
-        assists = f" ({ev.assists[0]})" if len(ev.assists)==1 else f" ({', '.join(ev.assists)})"
-    else:
-        assists = ""
+    assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
     return f"{score} – {ev.time} {who}{assists}"
 
 def build_match_block_with_spoiler(meta: GameMeta, standings: Dict[str,TeamRecord], events: List[ScoringEvent]) -> str:
     he = TEAM_EMOJI.get(meta.home_tri, ""); ae = TEAM_EMOJI.get(meta.away_tri, "")
-    # внешняя (видимая) часть — только эмодзи, без повторения названий
-    visible = f"{he}\n{ae}"
-
     hn = TEAM_RU.get(meta.home_tri, meta.home_tri); an = TEAM_RU.get(meta.away_tri, meta.away_tri)
+    visible = f"{he} <b>«{hn}»</b>\n{ae} <b>«{an}»</b>"
+
     hrec = standings.get(meta.home_tri).as_str() if meta.home_tri in standings else "?"
     arec = standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
     head_hidden = f"<b>«{hn}»: {meta.home_score}</b> ({hrec})\n<b>«{an}»: {meta.away_score}</b> ({arec})"
@@ -545,8 +542,7 @@ def make_post_text(games: List[GameMeta], standings: Dict[str,TeamRecord]) -> st
         sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
         merged = merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
         blocks.append(build_match_block_with_spoiler(meta, standings, merged))
-    # дополнительная пустая строка ПОСЛЕ разделителя
-    return "\n\n——————————————————\n\n".join(blocks).strip()
+    return "\n\n——————————————————\n".join(blocks).strip()
 
 def main():
     games=list_final_games_for_local_day()
