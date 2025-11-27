@@ -4,18 +4,10 @@
 """
 HOH · NHL Daily Results — daily summary with spoilers
 
-— Собирает FINAL-матчи за окно «вчера/сегодня/завтра» в зависимости от локальной даты и TZ.
-— Снаружи: эмодзи + названия команд (жирным), без счёта.
-— Внутри <tg-spoiler>…</tg-spoiler>: жирный счёт с рекордами (W-L-OT), события по периодам (включая ОТ и буллиты).
-— Заголовки периодов/ОТ/буллитов — курсивом; «Овертайм» без №, если он один.
-— Пустая строка перед каждым заголовком периода.
-— Имена: берём из PBP (fallback’и на разные поля + массив players), затем подменяем на sports.ru (кириллица), где возможно.
-— Поддержка UTA (Юта).
-
 ENV:
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
 - REPORT_DATE_LOCAL (YYYY-MM-DD) — «этот локальный день» в REPORT_TZ
-- REPORT_TZ (IANA, напр. Europe/Amsterdam) — таймзона «этого дня»
+- REPORT_TZ (IANA, напр. Europe/Amsterdam)
 - DRY_RUN=0/1
 - DEBUG_VERBOSE=0/1
 """
@@ -77,8 +69,7 @@ TEAM_RU = {
     "FLA":"Флорида","LAK":"Лос-Анджелес","MIN":"Миннесота","MTL":"Монреаль","NSH":"Нэшвилл",
     "NJD":"Нью-Джерси","NYI":"Айлендерс","NYR":"Рейнджерс","OTT":"Оттава","PHI":"Филадельфия",
     "PIT":"Питтсбург","SJS":"Сан-Хосе","SEA":"Сиэтл","STL":"Сент-Луис","TBL":"Тампа-Бэй",
-    "TOR":"Торонто","VAN":"Ванкувер","VGK":"Вегас","WSH":"Вашингтон","WPG":"Виннипег",
-    "UTA":"Юта",
+    "TOR":"Торонто","VAN":"Ванкувер","VGK":"Вегас","WSH":"Вашингтон","WPG":"Виннипег","UTA":"Юта",
 }
 TEAM_EMOJI = {
     "ANA":"🦆","ARI":"🦂","BOS":"🐻","BUF":"🦬","CGY":"🔥","CAR":"🌪️","CHI":"🦅","COL":"⛰️","CBJ":"💣",
@@ -86,19 +77,44 @@ TEAM_EMOJI = {
     "NJD":"😈","NYI":"🏝️","NYR":"🗽","OTT":"🛡","PHI":"🛩","PIT":"🐧","SJS":"🦈","SEA":"🦑","STL":"🎵",
     "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️","UTA":"🧊",
 }
-SPORTSRU_SLUG = {
-    "ANA":"anaheim-ducks","ARI":"arizona-coyotes","BOS":"boston-bruins","BUF":"buffalo-sabres",
-    "CGY":"calgary-flames","CAR":"carolina-hurricanes","CHI":"chicago-blackhawks",
-    "COL":"colorado-avalanche","CBJ":"columbus-blue-jackets","DAL":"dallas-stars",
-    "DET":"detroit-red-wings","EDM":"edmonton-oilers","FLA":"florida-panthers",
-    "LAK":"los-angeles-kings","MIN":"minnesota-wild","MTL":"montreal-canadiens",
-    "NSH":"nashville-predators","NJD":"new-jersey-devils","NYI":"new-york-islanders",
-    "NYR":"new-york-rangers","OTT":"ottawa-senators","PHI":"philadelphia-flyers",
-    "PIT":"pittsburgh-penguins","SJS":"san-jose-sharks","SEA":"seattle-kraken",
-    "STL":"st-louis-blues","TBL":"tampa-bay-lightning","TOR":"toronto-maple-leafs",
-    "VAN":"vancouver-canucks","VGK":"vegas-golden-knights","WSH":"washington-capitals",
-    "WPG":"winnipeg-jets",
-    # Юта — на sports.ru нестабильно, пропускаем (возьмём official en)
+
+# — ключ: трикода, значение: список возможных слегов на sports.ru —
+SPORTSRU_SLUGS = {
+    "ANA":["anaheim-ducks"],
+    "ARI":["arizona-coyotes"],
+    "BOS":["boston-bruins"],
+    "BUF":["buffalo-sabres"],
+    "CGY":["calgary-flames"],
+    "CAR":["carolina-hurricanes"],
+    "CHI":["chicago-blackhawks"],
+    "COL":["colorado-avalanche"],
+    "CBJ":["columbus-blue-jackets"],
+    "DAL":["dallas-stars"],
+    "DET":["detroit-red-wings"],
+    "EDM":["edmonton-oilers"],
+    "FLA":["florida-panthers"],
+    "LAK":["los-angeles-kings","la-kings"],
+    "MIN":["minnesota-wild"],
+    "MTL":["montreal-canadiens"],
+    "NSH":["nashville-predators"],
+    "NJD":["new-jersey-devils"],
+    "NYI":["new-york-islanders"],
+    "NYR":["new-york-rangers"],
+    "OTT":["ottawa-senators"],
+    "PHI":["philadelphia-flyers"],
+    "PIT":["pittsburgh-penguins"],
+    "SJS":["san-jose-sharks"],
+    "SEA":["seattle-kraken"],
+    "STL":["st-louis-blues","saint-louis-blues","stlouis-blues"],
+    "TBL":["tampa-bay-lightning"],
+    "TOR":["toronto-maple-leafs"],
+    "VAN":["vancouver-canucks"],
+    # — запрос пользователя: вегас часто как "vegas" —
+    "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
+    "WSH":["washington-capitals"],
+    "WPG":["winnipeg-jets"],
+    # — Юта (новая команда, встречаются варианты) —
+    "UTA":["utah-hockey-club","utah-hc","utah","utah-hc-nhl"],
 }
 
 # ---------- HTTP ----------
@@ -193,20 +209,17 @@ def fetch_standings_map() -> Dict[str, TeamRecord]:
 
 # ---------- schedule ----------
 def _iter_sched_days_for_local_day() -> List[str]:
-    # если задан REPORT_DATE_LOCAL + REPORT_TZ — собираем матчи, стартовавшие «в этот локальный календарный день»
     if REPORT_DATE_LOCAL:
         try:
             from zoneinfo import ZoneInfo
             tz = ZoneInfo(REPORT_TZ or "Europe/Amsterdam")
             y, m, d = map(int, REPORT_DATE_LOCAL.split("-"))
             base_local = datetime(y, m, d, 12, 0, tzinfo=tz)
-            # берём день-1 / день / день+1 — т.к. у API /schedule/ день UTC, а нам нужен срез по локали
             dates = [(base_local + timedelta(days=off)).astimezone(timezone.utc).date().isoformat() for off in (-1,0,1)]
             print(f"[DBG] Daily summary for {REPORT_DATE_LOCAL} in {REPORT_TZ}")
             return sorted(set(dates))
         except Exception:
             pass
-    # по умолчанию подтягиваем вчера/сегодня/завтра UTC — чтобы точно собрать локальный срез
     now_utc = datetime.now(timezone.utc)
     return sorted({(now_utc+timedelta(days=off)).date().isoformat() for off in (-1,0,1)})
 
@@ -237,7 +250,7 @@ def list_final_games_for_local_day() -> List[GameMeta]:
     games = sorted(metas.values(), key=lambda m: m.gameDateUTC)
     print(f"[DBG] Collected FINAL games: {len(games)}"); return games
 
-# ---------- PBP (с поддержкой буллитов и фоллбэками) ----------
+# ---------- PBP ----------
 _SO_TYPES_GOAL = {"GOAL","SHOT"}
 _ASSIST_KEYS = (
     "assist1PlayerName","assist2PlayerName","assist3PlayerName",
@@ -267,7 +280,6 @@ def _is_shootout_goal(type_key: str, details: dict, period_type: str) -> bool:
     return type_key == "GOAL"
 
 def _players_fallback_names(p: dict) -> Tuple[str, List[str]]:
-    # некоторые записи содержат массив players с типами "Scorer", "Assist"
     scorer=""; assists=[]
     try:
         for pl in p.get("players") or []:
@@ -303,7 +315,7 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
         if not (isinstance(h,int) and isinstance(a,int)):
             sc = p.get("score", {}) or {}
             if isinstance(sc.get("home"),int) and isinstance(sc.get("away"),int): h,a = sc["home"], sc["away"]
-            else: h,a = prev_h, prev_a  # в SO не меняется
+            else: h,a = prev_h, prev_a
 
         team = home_tri if h>prev_h else (away_tri if a>prev_a else _upper_str(
             det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")
@@ -358,25 +370,39 @@ def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
     return res
 
 def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], List[SRUGoal], str]:
-    hs = SPORTSRU_SLUG.get(home_tri); as_ = SPORTSRU_SLUG.get(away_tri)
-    if not hs or not as_: return [], [], ""
-    for order in [(hs,as_),(as_,hs)]:
-        url = f"https://www.sports.ru/hockey/match/{order[0]}-vs-{order[1]}/"
-        try:
-            html = http_get_text(url, timeout=20)
-        except Exception as e:
-            if DEBUG_VERBOSE: print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}")
-            continue
-        home_side = "home" if order[0]==hs else "away"
-        away_side = "away" if home_side=="home" else "home"
-        h = parse_sportsru_goals_html(html, home_side)
-        a = parse_sportsru_goals_html(html, away_side)
-        if h or a:
-            print(f"[DBG] sports.ru goals ok for {url}: home={len(h)} away={len(a)}")
-            return h,a,url
+    h_list = SPORTSRU_SLUGS.get(home_tri, [])
+    a_list = SPORTSRU_SLUGS.get(away_tri, [])
+    tried = []
+    for hslug in h_list:
+        for aslug in a_list:
+            for left,right in ((hslug,aslug),(aslug,hslug)):
+                url = f"https://www.sports.ru/hockey/match/{left}-vs-{right}/"
+                tried.append(url)
+                try:
+                    html = http_get_text(url, timeout=20)
+                except Exception as e:
+                    if DEBUG_VERBOSE: print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}")
+                    continue
+                # Определяем, какая сторона на странице — хозяева, исходя из того,
+                # принадлежит ли левый слег множеству кандидатов хозяев.
+                left_is_home = left in h_list
+                home_side = "home" if left_is_home else "away"
+                away_side = "away" if left_is_home else "home"
+                h = parse_sportsru_goals_html(html, home_side)
+                a = parse_sportsru_goals_html(html, away_side)
+                if h or a:
+                    print(f"[DBG] sports.ru goals ok for {url}: home={len(h)} away={len(a)}")
+                    return h,a,url
+    if DEBUG_VERBOSE and tried:
+        print("[DBG] sports.ru tried URLs (no data):", " | ".join(tried))
     return [],[], ""
 
 # ---------- merge & format ----------
+@dataclass
+class TeamRecord:
+    wins: int; losses: int; ot: int; points: int
+    def as_str(self) -> str: return f"{self.wins}-{self.losses}-{self.ot}"
+
 def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home: List[SRUGoal], sru_away: List[SRUGoal], home_tri: str, away_tri: str) -> List[ScoringEvent]:
     h_i=a_i=0; out=[]
     for ev in evs:
@@ -476,7 +502,6 @@ def send_telegram_text(text: str) -> None:
     if not token or not chat_id:
         print("[ERR] Telegram token/chat_id not set"); return
 
-    # безопасный локальный флаг на случай будущих правок
     dry_run = DRY_RUN or _env_bool("DRY_RUN", False)
 
     url=f"{TG_API}/bot{token}/sendMessage"; headers={"Content-Type":"application/json"}
@@ -510,7 +535,7 @@ def header_ru(n_games: int) -> str:
     return f"🗓 Регулярный чемпионат НХЛ • {now.day} {MONTHS_RU[now.month]} • {n_games} {word}"
 
 def make_post_text(games: List[GameMeta], standings: Dict[str,TeamRecord]) -> str:
-    header_block = f"{header_ru(len(games))}\n\nРезультаты надёжно спрятаны 👇"
+    header_block = f"{header_ru(len(games))}\n\nРезультаты надёжно спрятаны 👇——————————————————"
     blocks: List[str] = [header_block]
     for meta in games:
         evs = fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)

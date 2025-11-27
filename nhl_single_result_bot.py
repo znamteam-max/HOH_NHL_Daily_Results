@@ -3,23 +3,6 @@
 
 """
 HOH · NHL Single Result Bot — per-game posts & autopost (no repeats)
-
-Режимы:
-1) Ручной: через ENV передаём GAME_PK или GAME_QUERY="YYYY-MM-DD SEA - NYI" (HOME - AWAY) / "SEA@NYI" (AWAY@HOME).
-2) Автопост: если не задано ни GAME_PK, ни GAME_QUERY — сканируем вчера+сегодня (UTC), берём FINAL/ОFF игры,
-   постим те, что ещё не отправлялись. Состояние хранится в state/posted_games.json.
-
-Особенности:
-— Не полагаемся на /game-summary (часто 404). Мету берём из /schedule и PBP.
-— Имена: PBP (+fallback в массиве players) → затем подмена на sports.ru, где доступно.
-— Поддержка UTA.
-
-ENV:
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (опц.) TELEGRAM_THREAD_ID
-- GAME_PK (опц.), GAME_QUERY (опц., см. формат выше)
-- STATE_PATH="state/posted_games.json"
-- DRY_RUN=0/1
-- DEBUG_VERBOSE=0/1
 """
 
 from __future__ import annotations
@@ -72,18 +55,41 @@ TEAM_EMOJI = {
     "NJD":"😈","NYI":"🏝️","NYR":"🗽","OTT":"🛡","PHI":"🛩","PIT":"🐧","SJS":"🦈","SEA":"🦑","STL":"🎵",
     "TBL":"⚡","TOR":"🍁","VAN":"🐳","VGK":"🎰","WSH":"🦅","WPG":"✈️","UTA":"🧊",
 }
-SPORTSRU_SLUG = {
-    "ANA":"anaheim-ducks","ARI":"arizona-coyotes","BOS":"boston-bruins","BUF":"buffalo-sabres",
-    "CGY":"calgary-flames","CAR":"carolina-hurricanes","CHI":"chicago-blackhawks",
-    "COL":"colorado-avalanche","CBJ":"columbus-blue-jackets","DAL":"dallas-stars",
-    "DET":"detroit-red-wings","EDM":"edmonton-oilers","FLA":"florida-panthers",
-    "LAK":"los-angeles-kings","MIN":"minnesota-wild","MTL":"montreal-canadiens",
-    "NSH":"nashville-predators","NJD":"new-jersey-devils","NYI":"new-york-islanders",
-    "NYR":"new-york-rangers","OTT":"ottawa-senators","PHI":"philadelphia-flyers",
-    "PIT":"pittsburgh-penguins","SJS":"san-jose-sharks","SEA":"seattle-kraken",
-    "STL":"st-louis-blues","TBL":"tampa-bay-lightning","TOR":"toronto-maple-leafs",
-    "VAN":"vancouver-canucks","VGK":"vegas-golden-knights","WSH":"washington-capitals",
-    "WPG":"winnipeg-jets",
+
+SPORTSRU_SLUGS = {
+    "ANA":["anaheim-ducks"],
+    "ARI":["arizona-coyotes"],
+    "BOS":["boston-bruins"],
+    "BUF":["buffalo-sabres"],
+    "CGY":["calgary-flames"],
+    "CAR":["carolina-hurricanes"],
+    "CHI":["chicago-blackhawks"],
+    "COL":["colorado-avalanche"],
+    "CBJ":["columbus-blue-jackets"],
+    "DAL":["dallas-stars"],
+    "DET":["detroit-red-wings"],
+    "EDM":["edmonton-oilers"],
+    "FLA":["florida-panthers"],
+    "LAK":["los-angeles-kings","la-kings"],
+    "MIN":["minnesota-wild"],
+    "MTL":["montreal-canadiens"],
+    "NSH":["nashville-predators"],
+    "NJD":["new-jersey-devils"],
+    "NYI":["new-york-islanders"],
+    "NYR":["new-york-rangers"],
+    "OTT":["ottawa-senators"],
+    "PHI":["philadelphia-flyers"],
+    "PIT":["pittsburgh-penguins"],
+    "SJS":["san-jose-sharks"],
+    "SEA":["seattle-kraken"],
+    "STL":["st-louis-blues","saint-louis-blues","stlouis-blues"],
+    "TBL":["tampa-bay-lightning"],
+    "TOR":["toronto-maple-leafs"],
+    "VAN":["vancouver-canucks"],
+    "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
+    "WSH":["washington-capitals"],
+    "WPG":["winnipeg-jets"],
+    "UTA":["utah-hockey-club","utah-hc","utah","utah-hc-nhl"],
 }
 
 UA_HEADERS = {
@@ -200,7 +206,6 @@ def _game_to_meta(g: dict)->Optional[GameMeta]:
     return GameMeta(gid,gdt,state,htri,atri,hscore,ascore)
 
 def resolve_game_by_query(q: str)->Optional[GameMeta]:
-    # Форматы: "YYYY-MM-DD SEA - NYI"  (HOME - AWAY)  или  "YYYY-MM-DD SEA@NYI" (AWAY@HOME)
     q=q.strip()
     if not q: return None
     try:
@@ -220,10 +225,8 @@ def resolve_game_by_query(q: str)->Optional[GameMeta]:
         return None
 
     js_for_day=_list_games_for_dates([f"{y:04d}-{m:02d}-{d:02d}"])
-    # Захватываем соседние даты: игры ночью могут просочиться в соседний UTC-день
-    js_for_day+=_list_games_for_dates([f"{y:04d}-{m:02d}-{d-1:02d}"]) if d>1 else []
-    metas=[_game_to_meta(g) for g in js_for_day]
-    metas=[m for m in metas if m]
+    if d>1: js_for_day+=_list_games_for_dates([f"{y:04d}-{m:02d}-{d-1:02d}"])
+    metas=[_game_to_meta(g) for g in js_for_day]; metas=[m for m in metas if m]
     for m in metas:
         if m.home_tri==home and m.away_tri==away:
             print(f"[DBG] Resolved GAME_PK={m.gamePk} for {q}")
@@ -335,19 +338,27 @@ def parse_sportsru_goals_html(html: str, side: str)->List[SRUGoal]:
     return res
 
 def fetch_sportsru_goals(home_tri:str, away_tri:str)->Tuple[List[SRUGoal],List[SRUGoal],str]:
-    hs=SPORTSRU_SLUG.get(home_tri); as_=SPORTSRU_SLUG.get(away_tri)
-    if not hs or not as_: return [], [], ""
-    for order in [(hs,as_),(as_,hs)]:
-        url=f"https://www.sports.ru/hockey/match/{order[0]}-vs-{order[1]}/"
-        try: html=http_get_text(url, timeout=20)
-        except Exception as e: 
-            if DEBUG_VERBOSE: print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}"); 
-            continue
-        home_side="home" if order[0]==hs else "away"; away_side="away" if home_side=="home" else "home"
-        h=parse_sportsru_goals_html(html, home_side); a=parse_sportsru_goals_html(html, away_side)
-        if h or a:
-            print(f"[DBG] sports.ru goals ok for {url}: home={len(h)} away={len(a)}")
-            return h,a,url
+    h_list = SPORTSRU_SLUGS.get(home_tri, [])
+    a_list = SPORTSRU_SLUGS.get(away_tri, [])
+    tried=[]
+    for hslug in h_list:
+        for aslug in a_list:
+            for left,right in ((hslug,aslug),(aslug,hslug)):
+                url=f"https://www.sports.ru/hockey/match/{left}-vs-{right}/"
+                tried.append(url)
+                try: html=http_get_text(url, timeout=20)
+                except Exception as e:
+                    if DEBUG_VERBOSE: print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}")
+                    continue
+                left_is_home = left in h_list
+                home_side = "home" if left_is_home else "away"
+                away_side = "away" if left_is_home else "home"
+                h=parse_sportsru_goals_html(html, home_side); a=parse_sportsru_goals_html(html, away_side)
+                if h or a:
+                    print(f"[DBG] sports.ru goals ok for {url}: home={len(h)} away={len(a)}")
+                    return h,a,url
+    if DEBUG_VERBOSE and tried:
+        print("[DBG] sports.ru tried URLs (no data):", " | ".join(tried))
     return [],[], ""
 
 def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home: List[SRUGoal], sru_away: List[SRUGoal], home_tri:str, away_tri:str)->List[ScoringEvent]:
@@ -394,8 +405,8 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key; ot_idx=ot_order.get(key)
         title=period_title_text(pnum,ptype,ot_idx,ot_total)
-        lines.append("")              # пустая строка
-        lines.append(_italic(title))  # курсивом
+        lines.append("")
+        lines.append(_italic(title))
         per=groups[key]
         if not per: lines.append("Голов не было")
         else:
@@ -440,7 +451,6 @@ def send_telegram_text(text:str)->None:
 
 # --- Resolve meta / autopost ---
 def get_meta_by_gamepk_scan_schedule(gamePk:int)->Optional[GameMeta]:
-    # Находим запись об игре в ближайших датах
     raw=_list_games_for_dates(_iter_dates_around_today(3,3))
     for g in raw:
         gid=_first_int(g.get("id"),g.get("gameId"),g.get("gamePk"))
@@ -479,7 +489,6 @@ def main():
             return
         metas=[meta]
     else:
-        # AUTO mode: вчера + сегодня (UTC), все FINAL/ОFF, которые ещё не отправлялись
         metas=autopost_yesterday_today()
         print("FINAL games:", [m.gamePk for m in metas])
         metas=[m for m in metas if not posted.get(str(m.gamePk))]
