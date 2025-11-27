@@ -89,7 +89,8 @@ SPORTSRU_SLUGS = {
     "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
     "WSH":["washington-capitals"],
     "WPG":["winnipeg-jets"],
-    "UTA":["utah-hockey-club","utah-hc","utah","utah-hc-nhl"],
+    # — фикс: актуальный слег Юты —
+    "UTA":["utah-mammoth","utah","utah-hockey-club","utah-hc","utah-hc-nhl","utah-mammoths"],
 }
 
 UA_HEADERS = {
@@ -382,30 +383,8 @@ def period_title_text(num:int, ptype:str, ot_index:Optional[int], ot_total:int)-
     if t=="OVERTIME": return "Овертайм" if ot_total<=1 else f"Овертайм №{ot_index or 1}"
     if t=="SHOOTOUT": return "Буллиты"
     return f"Период {num}"
-
-# --- Only winning shootout attempt ---
-def _pick_so_winner_and_filter(events: List[ScoringEvent], home_tri: str, away_tri: str, home_score: int, away_score: int):
-    """Return (winner_name_or_None, filtered_events_with_only_winning_SO_or_no_SO)."""
-    so = [e for e in events if (e.period_type or "").upper() == "SHOOTOUT"]
-    if not so:
-        return None, events
-    winner_tri = home_tri if home_score > away_score else away_tri
-    last_winner = None
-    for e in so:
-        if e.team_for == winner_tri:
-            last_winner = e
-    filtered = [e for e in events if (e.period_type or "").upper() != "SHOOTOUT"]
-    if last_winner is None:
-        return None, filtered
-    filtered.append(last_winner)
-    return (last_winner.scorer or None), filtered
-
 def line_goal(ev:ScoringEvent)->str:
-    score=f"{ev.home_goals}:{ev.away_goals}"; who=ev.scorer or "—"
-    if ev.assists:
-        assists = f" ({ev.assists[0]})" if len(ev.assists)==1 else f" ({', '.join(ev.assists)})"
-    else:
-        assists = ""
+    score=f"{ev.home_goals}:{ev.away_goals}"; who=ev.scorer or "—"; assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
     return f"{score} – {ev.time} {who}{assists}"
 
 def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], events: List[ScoringEvent]) -> str:
@@ -415,9 +394,6 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     arec=standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
     head=f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
 
-    # Leave only winning shootout; add header line
-    so_winner, events = _pick_so_winner_and_filter(events, meta.home_tri, meta.away_tri, meta.home_score, meta.away_score)
-
     groups:Dict[Tuple[int,str],List[ScoringEvent]]={}
     for ev in events: groups.setdefault((ev.period,ev.period_type),[]).append(ev)
     for pnum in (1,2,3):
@@ -426,13 +402,10 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     ot_total=len(ot_keys); ot_order={k:i+1 for i,k in enumerate(ot_keys)}
 
     lines=[head]
-    if so_winner:
-        lines.append(_italic(f"Победный буллит — {so_winner}"))
-
     sort_key=lambda x:(x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key; ot_idx=ot_order.get(key)
-        title = "Победный буллит" if (ptype or "").upper()=="SHOOTOUT" else period_title_text(pnum,ptype,ot_idx,ot_total)
+        title=period_title_text(pnum,ptype,ot_idx,ot_total)
         lines.append("")
         lines.append(_italic(title))
         per=groups[key]
