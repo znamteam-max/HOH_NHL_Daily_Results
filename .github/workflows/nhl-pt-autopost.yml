@@ -1,135 +1,80 @@
-name: NHL AutoPost (PT day complete)
+name: NHL PT Autopost
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут (UTC)
+    # каждые 10 минут — одиночные результаты (idempotent)
+    - cron: "*/10 * * * *"
+    # раз в день 09:30 Хельсинки — общий пост за локальный день
+    - cron: "30 7 * * *"
   workflow_dispatch:
-    inputs:
-      pt_date:
-        description: "Принудительная PT-дата YYYY-MM-DD (опционально)"
-        required: false
-        default: ""
-
-permissions:
-  contents: write
 
 concurrency:
-  group: nhl-autopost-pt
-  cancel-in-progress: true
+  group: nhl-pt-autopost
+  cancel-in-progress: false
 
 jobs:
-  autopost:
+  single-results:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '*/10 ')
     runs-on: ubuntu-latest
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      FORCE_PT_DATE:      ${{ github.event.inputs.pt_date }}
-
+      STATE_PATH: .state/posted_games.json
+      DRY_RUN: "0"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set cache date (UTC)
+        run: echo "CACHE_DATE=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Restore state cache (per day)
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: nhl-single-${{ env.CACHE_DATE }}
+          restore-keys: |
+            nhl-single-
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install deps
-        run: pip install requests beautifulsoup4
-
-      - name: Resolve PT day and check NHL completeness
-        id: check
         run: |
-          python - << 'PY'
-          import os, sys, requests
-          from datetime import datetime, timedelta, date, time
-          from zoneinfo import ZoneInfo
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
 
-          API = "https://api-web.nhle.com"
-
-          tz_pt = ZoneInfo("America/Los_Angeles")
-          force = os.getenv("FORCE_PT_DATE","").strip()
-          if force:
-              try:
-                  base_pt = date.fromisoformat(force)
-              except Exception:
-                  print("Invalid pt_date input, must be YYYY-MM-DD")
-                  sys.exit(1)
-          else:
-              now_pt = datetime.now(tz_pt)
-              base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
-
-          ymd_pt = base_pt.strftime("%Y-%m-%d")
-          print("PT day:", ymd_pt)
-
-          def fetch_sched(d):
-              url = f"{API}/v1/schedule/{d.isoformat()}"
-              r = requests.get(url, timeout=25); r.raise_for_status()
-              js = r.json()
-              games = js.get("games")
-              if games is None:
-                  weeks = js.get("gameWeek") or []
-                  games = []
-                  for w in weeks:
-                      games.extend(w.get("games") or [])
-              return games or []
-
-          # простая проверка: есть ли игры и все ли FINAL/OFF
-          raw = fetch_sched(base_pt)
-          def is_completed(g):
-              st = (g.get("gameState") or g.get("gameStatus") or "").upper()
-              return st in ("FINAL","OFF")
-
-          all_done = bool(raw) and all(is_completed(g) for g in raw)
-          print("all_completed:", all_done)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"ready={'true' if all_done else 'false'}\n")
-              fh.write(f"pt_ymd={ymd_pt}\n")
-          PY
-
-      - name: Run daily summary for that PT day
-        if: steps.check.outputs.ready == 'true'
+      - name: Run single results bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          REPORT_DATE:        ${{ steps.check.outputs.pt_ymd }}   # <- было REPORT_DATE_LOCAL
-          REPORT_TZ:          America/Los_Angeles                 # <- было REPORT_DATE_TZ
-        run: python nhl_daily_results_bot.py
-
-      - name: Mark PT day as posted (with rebase & retry)
-        if: steps.check.outputs.ready == 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TG_THREAD_ID }}
         run: |
-          set -e
-          mkdir -p .posted
-          PTYMD="${{ steps.check.outputs.pt_ymd }}"
-          MARK=".posted/nhl-pt-${PTYMD//-/}.done"
-          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > "$MARK"
+          mkdir -p .state
+          python nhl_single_result_bot.py
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  daily-results:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 7 * * *'
+    runs-on: ubuntu-latest
+    env:
+      DRY_RUN: "0"
+      REPORT_TZ: "Europe/Helsinki"
+      # можно не задавать REPORT_DATE_LOCAL — бот сам возьмёт «окно» -1/0/+1
+    steps:
+      - uses: actions/checkout@v4
 
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          git add "$MARK"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-          attempt=0
-          until [ $attempt -ge 3 ]
-          do
-            git fetch origin "$BRANCH" || true
-            git pull --rebase origin "$BRANCH" || true
-            if git commit -m "NHL posted for PT ${PTYMD}"; then
-              if git push origin "HEAD:$BRANCH"; then
-                echo "Marker pushed"; exit 0
-              fi
-            else
-              echo "Nothing to commit (marker may already exist)"; exit 0
-            fi
-            attempt=$((attempt+1))
-            echo "Retry push ($attempt)..."
-            sleep 2
-          done
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
 
-          echo "Failed to push marker after retries" >&2
-          exit 1
+      - name: Run daily results bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TG_THREAD_ID }}
+        run: python nhl_daily_results_bot.py
