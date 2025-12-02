@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-HOH · NHL Single Result Bot — per-game posts & autopost (idempotent)
+HOH · NHL Single Result Bot — per-game posts & autopost (no repeats)
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _env_int(name: str, default: int) -> int:
 
 DRY_RUN = _env_bool("DRY_RUN", False)
 DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", False)
-STATE_PATH = _env_str("STATE_PATH", ".state/posted_games.json").strip() or ".state/posted_games.json"
+STATE_PATH = _env_str("STATE_PATH", "state/posted_games.json").strip() or "state/posted_games.json"
 
 TEAM_RU = {
     "ANA":"Анахайм","ARI":"Аризона","BOS":"Бостон","BUF":"Баффало","CGY":"Калгари","CAR":"Каролина",
@@ -57,15 +57,40 @@ TEAM_EMOJI = {
 }
 
 SPORTSRU_SLUGS = {
-    "ANA":["anaheim-ducks"], "ARI":["arizona-coyotes"], "BOS":["boston-bruins"], "BUF":["buffalo-sabres"],
-    "CGY":["calgary-flames"], "CAR":["carolina-hurricanes"], "CHI":["chicago-blackhawks"], "COL":["colorado-avalanche"],
-    "CBJ":["columbus-blue-jackets"], "DAL":["dallas-stars"], "DET":["detroit-red-wings"], "EDM":["edmonton-oilers"],
-    "FLA":["florida-panthers"], "LAK":["los-angeles-kings","la-kings"], "MIN":["minnesota-wild"], "MTL":["montreal-canadiens"],
-    "NSH":["nashville-predators"], "NJD":["new-jersey-devils"], "NYI":["new-york-islanders"], "NYR":["new-york-rangers"],
-    "OTT":["ottawa-senators"], "PHI":["philadelphia-flyers"], "PIT":["pittsburgh-penguins"], "SJS":["san-jose-sharks"],
-    "SEA":["seattle-kraken"], "STL":["st-louis-blues","saint-louis-blues","stlouis-blues"], "TBL":["tampa-bay-lightning"],
-    "TOR":["toronto-maple-leafs"], "VAN":["vancouver-canucks"], "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
-    "WSH":["washington-capitals"], "WPG":["winnipeg-jets"], "UTA":["utah-hockey-club","utah-hc","utah","utah-hc-nhl"],
+    "ANA":["anaheim-ducks"],
+    "ARI":["arizona-coyotes"],
+    "BOS":["boston-bruins"],
+    "BUF":["buffalo-sabres"],
+    "CGY":["calgary-flames"],
+    "CAR":["carolina-hurricanes"],
+    "CHI":["chicago-blackhawks"],
+    "COL":["colorado-avalanche"],
+    "CBJ":["columbus-blue-jackets"],
+    "DAL":["dallas-stars"],
+    "DET":["detroit-red-wings"],
+    "EDM":["edmonton-oilers"],
+    "FLA":["florida-panthers"],
+    "LAK":["los-angeles-kings","la-kings"],
+    "MIN":["minnesota-wild"],
+    "MTL":["montreal-canadiens"],
+    "NSH":["nashville-predators"],
+    "NJD":["new-jersey-devils"],
+    "NYI":["new-york-islanders"],
+    "NYR":["new-york-rangers"],
+    "OTT":["ottawa-senators"],
+    "PHI":["philadelphia-flyers"],
+    "PIT":["pittsburgh-penguins"],
+    "SJS":["san-jose-sharks"],
+    "SEA":["seattle-kraken"],
+    "STL":["st-louis-blues","saint-louis-blues","stlouis-blues"],
+    "TBL":["tampa-bay-lightning"],
+    "TOR":["toronto-maple-leafs"],
+    "VAN":["vancouver-canucks"],
+    "VGK":["vegas","vegas-golden-knights","vegas-knights","vgk"],
+    "WSH":["washington-capitals"],
+    "WPG":["winnipeg-jets"],
+    # — фикс: актуальный слег Юты —
+    "UTA":["utah-mammoth","utah","utah-hockey-club","utah-hc","utah-hc-nhl","utah-mammoths"],
 }
 
 UA_HEADERS = {
@@ -129,23 +154,6 @@ def _extract_name(obj_or_str: Any)->Optional[str]:
             v=obj_or_str.get(k)
             if isinstance(v,str) and v.strip(): return v.strip()
     return None
-
-def _sanitize_person(nm: Optional[str]) -> Optional[str]:
-    if not nm: return nm
-    s = str(nm)
-    # убрать случайные внешние скобки/длинные тире/повторы пробелов
-    s = re.sub(r"^[\s–—-]*\(*\s*", "", s)
-    s = re.sub(r"\s*\)*[\s–—-]*$", "", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s or None
-
-def _sanitize_assists(names: List[str]) -> List[str]:
-    out=[]
-    for x in names or []:
-        sx=_sanitize_person(x)
-        if sx and sx not in out:
-            out.append(sx)
-    return out
 
 # --- Standings / schedule / PBP / sports.ru ---
 def fetch_standings_map()->Dict[str,TeamRecord]:
@@ -284,7 +292,6 @@ def fetch_scoring_official(gamePk:int, home_tri:str, away_tri:str)->List[Scoring
             sc=p.get("score",{}) or {}
             if isinstance(sc.get("home"),int) and isinstance(sc.get("away"),int): h,a=sc["home"],sc["away"]
             else: h,a=prev_h,prev_a
-        # team owner
         team=home_tri if h>prev_h else (away_tri if a>prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
 
         scorer=""
@@ -366,9 +373,6 @@ def merge_official_with_sportsru(evs: List[ScoringEvent], sru_home: List[SRUGoal
             g=sru_away[a_i]; a_i+=1; 
             if g.scorer_ru: ev.scorer=g.scorer_ru
             if g.assists_ru: ev.assists=g.assists_ru
-        # sanitize
-        ev.scorer = _sanitize_person(ev.scorer) or ev.scorer
-        ev.assists = _sanitize_assists(ev.assists)
         out.append(ev)
     return out
 
@@ -377,40 +381,10 @@ def period_title_text(num:int, ptype:str, ot_index:Optional[int], ot_total:int)-
     t=(ptype or "").upper()
     if t=="REGULAR": return f"{num}-й период"
     if t=="OVERTIME": return "Овертайм" if ot_total<=1 else f"Овертайм №{ot_index or 1}"
-    if t=="SHOOTOUT": return "Победный буллит"
+    if t=="SHOOTOUT": return "Буллиты"
     return f"Период {num}"
-
-# — только победный буллит —
-def _pick_so_winner_and_filter(events: List[ScoringEvent], home_tri: str, away_tri: str, home_score: int, away_score: int):
-    so = [e for e in events if (e.period_type or "").upper() == "SHOOTOUT"]
-    if not so:
-        return None, events
-    winner_tri = home_tri if home_score > away_score else away_tri
-    # последний забитый у победившей команды
-    last_winner = None
-    for e in so:
-        if (e.team_for or "").upper() == winner_tri.upper():
-            last_winner = e
-    filtered = [e for e in events if (e.period_type or "").upper() != "SHOOTOUT"]
-    if last_winner is None:
-        return None, filtered
-    # подчистить время и имя для красивого формата
-    last_winner.time = ""  # убираем 00.00
-    last_winner.scorer = _sanitize_person(last_winner.scorer) or (TEAM_RU.get(winner_tri,winner_tri))
-    filtered.append(last_winner)
-    return (last_winner.scorer or None), filtered
-
 def line_goal(ev:ScoringEvent)->str:
-    score=f"{ev.home_goals}:{ev.away_goals}"
-    who = _sanitize_person(ev.scorer) or "—"
-    if (ev.period_type or "").upper()=="SHOOTOUT":
-        # без времени и второго тире — "2:2 – Имя"
-        return f"{score} – {who}"
-    # обычные периоды
-    if ev.assists:
-        assists = f" ({ev.assists[0]})" if len(ev.assists)==1 else f" ({', '.join(ev.assists)})"
-    else:
-        assists = ""
+    score=f"{ev.home_goals}:{ev.away_goals}"; who=ev.scorer or "—"; assists=f" ({', '.join(ev.assists)})" if ev.assists else ""
     return f"{score} – {ev.time} {who}{assists}"
 
 def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], events: List[ScoringEvent]) -> str:
@@ -420,9 +394,6 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     arec=standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
     head=f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
 
-    # Победный буллит
-    so_winner, events = _pick_so_winner_and_filter(events, meta.home_tri, meta.away_tri, meta.home_score, meta.away_score)
-
     groups:Dict[Tuple[int,str],List[ScoringEvent]]={}
     for ev in events: groups.setdefault((ev.period,ev.period_type),[]).append(ev)
     for pnum in (1,2,3):
@@ -431,13 +402,10 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     ot_total=len(ot_keys); ot_order={k:i+1 for i,k in enumerate(ot_keys)}
 
     lines=[head]
-    if so_winner:
-        lines.append(_italic(f"Победный буллит — {so_winner}"))
-
     sort_key=lambda x:(x[0], 0 if (x[1] or "").upper()=="REGULAR" else 1 if (x[1] or "").upper()=="OVERTIME" else 2)
     for key in sorted(groups.keys(), key=sort_key):
         pnum,ptype=key; ot_idx=ot_order.get(key)
-        title = "Победный буллит" if (ptype or "").upper()=="SHOOTOUT" else period_title_text(pnum,ptype,ot_idx,ot_total)
+        title=period_title_text(pnum,ptype,ot_idx,ot_total)
         lines.append("")
         lines.append(_italic(title))
         per=groups[key]
@@ -497,11 +465,8 @@ def autopost_yesterday_today()->List[GameMeta]:
     raw=_list_games_for_dates(dates)
     metas=[_game_to_meta(g) for g in raw]; metas=[m for m in metas if m]
     finals=[m for m in metas if (m.state in ("FINAL","OFF"))]
-    # дедуп по gamePk
-    uniq: Dict[int, GameMeta] = {}
-    for m in sorted(finals, key=lambda x: x.gameDateUTC):
-        uniq[m.gamePk] = m
-    return list(uniq.values())
+    finals=sorted(finals, key=lambda m:m.gameDateUTC)
+    return finals
 
 def main():
     game_pk=_env_str("GAME_PK","").strip()
@@ -530,14 +495,8 @@ def main():
         metas=[m for m in metas if not posted.get(str(m.gamePk))]
         print("Need to post:", [m.gamePk for m in metas])
 
-    # страховка от дублей в пределах одного запуска
-    seen_run:set[int]=set()
     new_posts=0
     for meta in metas:
-        if meta.gamePk in seen_run: 
-            continue
-        seen_run.add(meta.gamePk)
-
         evs=fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
         sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
         merged=merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
