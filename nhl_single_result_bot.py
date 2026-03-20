@@ -163,6 +163,7 @@ class ScoringEvent:
     scorer: str
     assists: List[str] = field(default_factory=list)
     is_shootout_winner: bool = False
+    is_shootout_scored: bool = False
 
 @dataclass
 class SRUGoal:
@@ -335,7 +336,7 @@ def resolve_game_by_query(q: str) -> Optional[GameMeta]:
     print(f"[DBG] Unable to resolve GAME_PK for {q}")
     return None
 
-_SO_TYPES_GOAL = {"GOAL","SHOT"}
+_SO_TYPES = {"GOAL","SHOT"}
 _ASSIST_KEYS = (
     "assist1PlayerName","assist2PlayerName","assist3PlayerName",
     "assist1","assist2","assist3",
@@ -357,18 +358,14 @@ def _normalize_period_type(t: str) -> str:
         return "SHOOTOUT"
     return t
 
-def _is_shootout_goal(type_key: str, details: dict, period_type: str) -> bool:
-    if period_type != "SHOOTOUT":
-        return False
-    if type_key not in _SO_TYPES_GOAL:
-        return False
-    for k in ("wasGoal","shotWasGoal","isGoal","isScored","scored"):
-        v = details.get(k)
-        if isinstance(v, bool) and v:
-            return True
-        if isinstance(v, str) and v.strip().lower() in ("1","true","yes"):
-            return True
-    return type_key == "GOAL"
+def _truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y")
+    return False
 
 def _players_fallback_names(p: dict) -> Tuple[str, List[str]]:
     scorer = ""
@@ -395,23 +392,29 @@ def _is_deciding_shootout_goal(play: dict, details: dict) -> bool:
         "gameWinningGoal",
         "decidingGoal",
     ):
-        val = details.get(key)
-        if isinstance(val, bool) and val:
+        if _truthy(details.get(key)):
             return True
-        if isinstance(val, str) and val.strip().lower() in ("1", "true", "yes"):
-            return True
-
-    desc = str(play.get("typeDescKey") or "").upper()
-    if desc in ("SHOOTOUT_COMPLETE",):
-        return False
-
     return False
+
+def _extract_shootout_scorer(play: dict, details: dict) -> str:
+    for k in _SCORER_KEYS:
+        nm = _extract_name(details.get(k))
+        if nm:
+            return _clean_person_name(nm)
+    for k in ("scoringPlayerName","scorerName","shootingPlayerName"):
+        v = play.get(k)
+        if isinstance(v, str) and v.strip():
+            return _clean_person_name(v)
+    sfb, _ = _players_fallback_names(play)
+    return _clean_person_name(sfb)
 
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
     data = http_get_json(PBP_FMT.format(gamePk=gamePk))
     plays = data.get("plays",[]) or []
     events: List[ScoringEvent] = []
+
     prev_h = prev_a = 0
+    prev_so_h = prev_so_a = 0
 
     for p in plays:
         type_key = _upper_str(p.get("typeDescKey"))
@@ -421,7 +424,52 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
         det = p.get("details",{}) or {}
         t = str(p.get("timeInPeriod") or "00:00").replace(":", ".")
 
-        is_goal = (type_key == "GOAL") or _is_shootout_goal(type_key, det, ptype)
+        if ptype == "SHOOTOUT":
+            if type_key not in _SO_TYPES:
+                continue
+
+            scorer = _extract_shootout_scorer(p, det)
+            if not scorer:
+                continue
+
+            h = det.get("homeScore")
+            a = det.get("awayScore")
+            if not (isinstance(h, int) and isinstance(a, int)):
+                sc = p.get("score", {}) or {}
+                h = sc.get("home", prev_so_h)
+                a = sc.get("away", prev_so_a)
+
+            h = _first_int(h, prev_so_h)
+            a = _first_int(a, prev_so_a)
+
+            scored = False
+            if type_key == "GOAL":
+                scored = True
+            if h > prev_so_h or a > prev_so_a:
+                scored = True
+            for k in ("wasGoal","shotWasGoal","isGoal","isScored","scored"):
+                if _truthy(det.get(k)):
+                    scored = True
+
+            team = home_tri if h > prev_so_h else (away_tri if a > prev_so_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
+
+            ev = ScoringEvent(
+                period=period,
+                period_type="SHOOTOUT",
+                time=t,
+                team_for=team,
+                home_goals=h,
+                away_goals=a,
+                scorer=scorer,
+                assists=[],
+                is_shootout_winner=_is_deciding_shootout_goal(p, det),
+                is_shootout_scored=scored,
+            )
+            events.append(ev)
+            prev_so_h, prev_so_a = h, a
+            continue
+
+        is_goal = (type_key == "GOAL")
         if not is_goal:
             continue
 
@@ -473,15 +521,10 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             scorer=_clean_person_name(scorer),
             assists=_clean_assists(assists),
             is_shootout_winner=False,
+            is_shootout_scored=False,
         )
-
-        if ptype == "SHOOTOUT":
-            ev.is_shootout_winner = _is_deciding_shootout_goal(p, det)
-
         events.append(ev)
-
-        if ptype != "SHOOTOUT":
-            prev_h, prev_a = _first_int(h), _first_int(a)
+        prev_h, prev_a = _first_int(h), _first_int(a)
 
     return events
 
@@ -581,22 +624,58 @@ def period_title_text(num: int, ptype: str, ot_index: Optional[int], ot_total: i
         return "Буллиты"
     return f"Период {num}"
 
-def line_goal(ev: ScoringEvent) -> str:
+def compute_player_marks(events: List[ScoringEvent]) -> Dict[str, str]:
+    goals: Dict[str, int] = {}
+    assists: Dict[str, int] = {}
+
+    for ev in events:
+        if ev.period_type == "SHOOTOUT":
+            continue
+
+        scorer = _clean_person_name(ev.scorer)
+        if scorer:
+            goals[scorer] = goals.get(scorer, 0) + 1
+
+        for a in _clean_assists(ev.assists):
+            assists[a] = assists.get(a, 0) + 1
+
+    names = set(goals) | set(assists)
+    marks: Dict[str, str] = {}
+    for n in names:
+        suffix = ""
+        if goals.get(n, 0) >= 2:
+            suffix += " 🔥"
+        if assists.get(n, 0) >= 3:
+            suffix += " 🏒"
+        marks[n] = suffix
+    return marks
+
+def decorate_name(name: str, marks: Dict[str, str]) -> str:
+    clean = _clean_person_name(name)
+    return f"{clean}{marks.get(clean, '')}" if clean else "—"
+
+def line_goal(ev: ScoringEvent, marks: Dict[str, str]) -> str:
     score = f"{ev.home_goals}:{ev.away_goals}"
-    who = _clean_person_name(ev.scorer) or "—"
-    assists = _clean_assists(ev.assists)
+    who = decorate_name(ev.scorer, marks)
+    assists = [decorate_name(a, marks) for a in _clean_assists(ev.assists)]
     assists_text = f" ({', '.join(assists)})" if assists else ""
     return f"{score} – {ev.time} {who}{assists_text}"
 
 def get_winning_shootout_event(events: List[ScoringEvent]) -> Optional[ScoringEvent]:
     shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
+
     for ev in shootout_events:
-        if ev.is_shootout_winner:
+        if ev.is_shootout_winner and ev.is_shootout_scored:
             return ev
 
-    scored = [ev for ev in shootout_events if _clean_person_name(ev.scorer)]
+    scored = [ev for ev in shootout_events if ev.is_shootout_scored and _clean_person_name(ev.scorer)]
     if scored:
         return scored[-1]
+
+    # запасной вариант: иногда API отдаёт scorer, но не отдаёт явный flag scored
+    named = [ev for ev in shootout_events if _clean_person_name(ev.scorer)]
+    if named:
+        return named[-1]
 
     return None
 
@@ -609,6 +688,7 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
     arec = standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
     head = f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
 
+    marks = compute_player_marks(events)
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
     winning_so = get_winning_shootout_event(events)
 
@@ -637,12 +717,12 @@ def build_single_match_text(meta: GameMeta, standings: Dict[str,TeamRecord], eve
             lines.append("Голов не было")
         else:
             for ev in per:
-                lines.append(line_goal(ev))
+                lines.append(line_goal(ev, marks))
 
     if winning_so:
         lines.append("")
         lines.append("Победный буллит")
-        lines.append(f"{meta.home_score}:{meta.away_score} – {_clean_person_name(winning_so.scorer) or '—'}")
+        lines.append(f"{meta.home_score}:{meta.away_score} – {decorate_name(winning_so.scorer, marks)}")
 
     return "\n".join(lines).strip()
 
@@ -766,7 +846,7 @@ def main():
         sru_home, sru_away, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
         merged = merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
         text = build_single_match_text(meta, standings, merged)
-        print("[DBG] Single match preview:\n" + text[:500].replace("\n","¶") + "…")
+        print("[DBG] Single match preview:\n" + text[:700].replace("\n","¶") + "…")
         send_telegram_text(text)
 
         if not manual_mode:
