@@ -1,8 +1,8 @@
-name: NHL single result (manual + auto every 3 min)
+name: NHL single results
 
 on:
   schedule:
-    - cron: "*/3 * * * *"    # автопост каждые 3 минуты
+    - cron: "*/5 * * * *"   # GitHub Actions надёжно поддерживает минимум 5 минут
   workflow_dispatch:
     inputs:
       gamePk:
@@ -14,39 +14,29 @@ on:
         required: false
         default: ""
       match:
-        description: "e.g. 'SEA - NYI' (HOME - AWAY) or 'SEA@NYI' (AWAY@HOME)"
+        description: "e.g. 'VGK - NSH' or 'NSH@VGK'"
         required: false
         default: ""
-      # Ниже параметры держим только для совместимости UI (не используются):
-      searchBack:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      searchFwd:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      requireFinal:
-        description: "UNUSED"
-        required: false
-        default: "1"
-      forcePost:
-        description: "UNUSED"
-        required: false
-        default: "1"
 
 permissions:
-  contents: write   # чтобы коммитить state/posted_games.json
+  contents: write
+
+concurrency:
+  group: nhl-single-results
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -55,54 +45,67 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Prepare inputs (build GAME_QUERY if needed)
+      - name: Prepare manual inputs
         if: github.event_name == 'workflow_dispatch'
         env:
-          INPUT_GAMEPK:  ${{ inputs.gamePk }}
-          INPUT_DATE:    ${{ inputs.gameDate }}
-          INPUT_MATCH:   ${{ inputs.match }}
+          INPUT_GAMEPK: ${{ inputs.gamePk }}
+          INPUT_DATE:   ${{ inputs.gameDate }}
+          INPUT_MATCH:  ${{ inputs.match }}
         run: |
           python - << 'PY'
           import os, re
-          gp  = (os.getenv("INPUT_GAMEPK") or "").strip()
-          dt  = (os.getenv("INPUT_DATE") or "").strip()
-          mt  = (os.getenv("INPUT_MATCH") or "").strip()
+
+          gp = (os.getenv("INPUT_GAMEPK") or "").strip()
+          dt = (os.getenv("INPUT_DATE") or "").strip()
+          mt = (os.getenv("INPUT_MATCH") or "").strip()
+
           q = ""
           if not gp and dt and mt:
-              def tri(s): return re.sub(r"\s+","", s).upper()
+              def tri(s):
+                  return re.sub(r"\s+", "", s).upper()
+
               home = away = ""
               if "@" in mt:
-                  away, home = [tri(x) for x in mt.split("@",1)]
+                  away, home = [tri(x) for x in mt.split("@", 1)]
               elif "-" in mt:
-                  left, right = [tri(x) for x in mt.split("-",1)]
+                  left, right = [tri(x) for x in mt.split("-", 1)]
                   home, away = left, right
+
               if home and away:
                   q = f"{dt} {home} - {away}"
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               fh.write(f"GAME_PK={gp}\n")
               fh.write(f"GAME_QUERY={q}\n")
+
+          print("GAME_PK:", gp or "(empty)")
           print("GAME_QUERY:", q or "(empty)")
           PY
 
-      - name: Post single result(s)
+      - name: Run single result bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.Telegram_bot_token || secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.Telegram_chat_id   || secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_VERBOSE:      "1"
-          # Для workflow_dispatch GAME_PK/GAME_QUERY подставятся из GITHUB_ENV предыдущего шага.
-          # Для schedule — авто-режим (ничего не передаём), бот сам найдёт и отправит новые FINAL.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_VERBOSE: "1"
         run: |
           python nhl_single_result_bot.py
 
-      - name: Commit posted state (if changed)
+      - name: Commit posted state if changed
         run: |
           set -e
-          if git status --porcelain | grep -E "^( M| M|M |A )\s+state/posted_games\.json" >/dev/null 2>&1; then
+
+          if git status --porcelain | grep -E "^( M|M |A )\s+state/posted_games\.json" >/dev/null 2>&1; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            BRANCH="${GITHUB_REF_NAME:-main}"
+
             git add state/posted_games.json
-            git commit -m "Update posted state"
-            git push
+            git commit -m "Update posted games state"
+
+            git fetch origin "$BRANCH" || true
+            git pull --rebase origin "$BRANCH" || true
+            git push origin "HEAD:$BRANCH"
           else
             echo "No state changes"
           fi
