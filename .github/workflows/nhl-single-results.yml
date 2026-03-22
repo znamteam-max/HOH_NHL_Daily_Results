@@ -23,7 +23,7 @@ permissions:
 
 concurrency:
   group: nhl-single-results
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -82,6 +82,12 @@ jobs:
           print("GAME_QUERY:", q or "(empty)")
           PY
 
+      - name: Ensure state file exists
+        run: |
+          mkdir -p state
+          [ -f state/posted_games.json ] || echo '{"posted":{}}' > state/posted_games.json
+          cat state/posted_games.json
+
       - name: Run single result bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -90,22 +96,29 @@ jobs:
         run: |
           python nhl_single_result_bot.py
 
+      - name: Show git status
+        run: |
+          git status --porcelain
+          echo "--- state file ---"
+          cat state/posted_games.json || true
+
       - name: Commit posted state if changed
         run: |
           set -e
 
-          if git status --porcelain | grep -E "^( M|M |A )\s+state/posted_games\.json" >/dev/null 2>&1; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            BRANCH="${GITHUB_REF_NAME:-main}"
-
-            git add state/posted_games.json
-            git commit -m "Update posted games state"
-
-            git fetch origin "$BRANCH" || true
-            git pull --rebase origin "$BRANCH" || true
-            git push origin "HEAD:$BRANCH"
-          else
+          if git diff --quiet -- state/posted_games.json && git diff --cached --quiet -- state/posted_games.json; then
             echo "No state changes"
+            exit 0
           fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+
+          git add -f state/posted_games.json
+          git commit -m "Update posted games state" || exit 0
+
+          git fetch origin "$BRANCH" || true
+          git pull --rebase origin "$BRANCH" || true
+          git push origin "HEAD:$BRANCH"
