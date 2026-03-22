@@ -962,12 +962,26 @@ def get_meta_by_gamepk_scan_schedule(gamePk: int) -> Optional[GameMeta]:
 
 
 def autopost_current_hockey_day() -> List[GameMeta]:
-    raw = _list_games_for_dates([_current_hockey_day_pt()])
+    base_day = datetime.fromisoformat(_current_hockey_day_pt()).date()
+    dates = [
+        (base_day - timedelta(days=1)).isoformat(),
+        base_day.isoformat(),
+        (base_day + timedelta(days=1)).isoformat(),
+    ]
+
+    raw = _list_games_for_dates(dates)
     metas = [_game_to_meta(g) for g in raw]
     metas = [m for m in metas if m]
     finals = [m for m in metas if _is_final_state(m.state)]
-    finals = sorted(finals, key=lambda m: m.gameDateUTC)
-    return finals
+
+    seen = set()
+    uniq: List[GameMeta] = []
+    for m in sorted(finals, key=lambda x: x.gameDateUTC):
+        if m.gamePk not in seen:
+            seen.add(m.gamePk)
+            uniq.append(m)
+
+    return uniq
 
 
 def pending_game_text(meta: GameMeta) -> str:
@@ -1010,6 +1024,7 @@ def main() -> None:
     else:
         metas = autopost_current_hockey_day()
         print("FINAL games:", [m.gamePk for m in metas])
+        print("FINAL games raw:", [(m.gamePk, m.away_tri, m.home_tri, m.state) for m in metas])
         metas = [m for m in metas if not posted.get(str(m.gamePk))]
         print("Need to post:", [m.gamePk for m in metas])
 
