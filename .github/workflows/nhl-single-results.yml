@@ -2,7 +2,7 @@ name: NHL single results
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub Actions надёжно поддерживает минимум 5 минут
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       gamePk:
