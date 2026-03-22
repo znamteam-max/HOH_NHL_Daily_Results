@@ -979,6 +979,7 @@ def autopost_current_hockey_day() -> List[GameMeta]:
         (base_day + timedelta(days=1)).isoformat(),
     ]
 
+    print("TARGET_DATE:", TARGET_DATE or "(empty)")
     print("Autopost base date:", base_day.isoformat())
     print("Autopost schedule dates:", dates)
 
@@ -1015,7 +1016,6 @@ def main() -> None:
     posted: Dict[str, bool] = state.get("posted", {}) or {}
 
     dbg("already posted:", sorted(posted.keys())[:20], "total=", len(posted))
-    print("TARGET_DATE:", TARGET_DATE or "(empty)")
 
     metas: List[GameMeta] = []
     manual_mode = False
