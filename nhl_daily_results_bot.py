@@ -445,6 +445,36 @@ def _extract_shootout_scorer(play: dict, details: dict) -> str:
     return _clean_person_name(sfb)
 
 
+def _looks_like_valid_player_name(name: Optional[str]) -> bool:
+    s = _clean_person_name(name or "")
+    if not s:
+        return False
+    if len(s) > 40:
+        return False
+
+    banned_substrings = (
+        "НХЛ",
+        "Серия буллитов",
+        "буллит",
+        "–",
+        "—",
+        ":",
+        ".202",
+        ".20",
+    )
+    for bad in banned_substrings:
+        if bad in s:
+            return False
+
+    if re.search(r"\d", s):
+        return False
+
+    if "http" in s.lower() or "/" in s:
+        return False
+
+    return True
+
+
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
     data = http_get_json(PBP_FMT.format(gamePk=gamePk))
     plays = data.get("plays", []) or []
@@ -782,7 +812,10 @@ def get_winning_shootout_name(
 
     shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
 
-    flagged = [ev for ev in shootout_events if ev.is_shootout_winner and _clean_person_name(ev.scorer)]
+    flagged = [
+        ev for ev in shootout_events
+        if ev.is_shootout_winner and _looks_like_valid_player_name(ev.scorer)
+    ]
     if flagged:
         return _clean_person_name(flagged[-1].scorer)
 
@@ -790,14 +823,14 @@ def get_winning_shootout_name(
     prev_h = prev_a = 0
     for ev in shootout_events:
         if ev.home_goals > prev_h or ev.away_goals > prev_a or ev.is_shootout_scored:
-            if _clean_person_name(ev.scorer):
+            if _looks_like_valid_player_name(ev.scorer):
                 successful.append(ev)
         prev_h, prev_a = ev.home_goals, ev.away_goals
 
     if successful:
         return _clean_person_name(successful[-1].scorer)
 
-    named = [ev for ev in shootout_events if _clean_person_name(ev.scorer)]
+    named = [ev for ev in shootout_events if _looks_like_valid_player_name(ev.scorer)]
     if named:
         return _clean_person_name(named[-1].scorer)
 
@@ -820,7 +853,7 @@ def build_single_match_text(
 
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
     winning_so_name = get_winning_shootout_name(events, meta, sportsru_winner)
-    has_shootout = game_went_to_shootout(events, meta)
+    has_shootout = game_went_to_shootout(events, meta) and _looks_like_valid_player_name(winning_so_name)
 
     marks = compute_player_marks(events)
     last_mentions = find_last_mentions(regular_and_ot, winning_so_name)
