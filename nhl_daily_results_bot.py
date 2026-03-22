@@ -585,27 +585,6 @@ def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
 
 
 def parse_sportsru_shootout_winner_html(html: str) -> Optional[SRUShootoutWinner]:
-    if not HAS_BS:
-        return None
-
-    soup = BS(html, "lxml" if "lxml" in globals() else "html.parser")
-    containers = soup.select(
-        "ul.match-summary__goals-list--home, "
-        "ul.match-summary__goals-list--away, "
-        "ul.match-summary__goals-list.match-summary__goals-list--home, "
-        "ul.match-summary__goals-list.match-summary__goals-list--away"
-    )
-
-    for ul in containers:
-        for li in ul.find_all("li", recursive=False):
-            raw = li.get_text(" ", strip=True)
-            if "Серия буллитов" not in raw:
-                continue
-            anchors = [a.get_text(strip=True) for a in li.find_all("a")]
-            if anchors:
-                name = _clean_person_name(anchors[0])
-                if name and len(name) < 40:
-                    return SRUShootoutWinner(scorer_ru=name)
     return None
 
 
@@ -708,7 +687,15 @@ def game_went_to_shootout(events: List[ScoringEvent], meta: GameMeta) -> bool:
     if abs(meta.home_score - meta.away_score) != 1:
         return False
 
-    return True
+    prev_h = prev_a = 0
+    has_real_so_goal = False
+    for ev in shootout_events:
+        if ev.home_goals > prev_h or ev.away_goals > prev_a or ev.is_shootout_scored or ev.is_shootout_winner:
+            has_real_so_goal = True
+            break
+        prev_h, prev_a = ev.home_goals, ev.away_goals
+
+    return has_real_so_goal
 
 
 def compute_player_marks(events: List[ScoringEvent]) -> Dict[str, str]:
@@ -792,9 +779,6 @@ def get_winning_shootout_name(
 ) -> Optional[str]:
     if not game_went_to_shootout(events, meta):
         return None
-
-    if sportsru_winner and sportsru_winner.scorer_ru:
-        return _clean_person_name(sportsru_winner.scorer_ru)
 
     shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
 
