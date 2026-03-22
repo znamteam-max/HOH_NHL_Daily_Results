@@ -14,7 +14,7 @@ import textwrap
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 import requests
@@ -48,6 +48,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 DRY_RUN = _env_bool("DRY_RUN", False)
 DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", False)
 STATE_PATH = _env_str("STATE_PATH", "state/posted_games.json").strip() or "state/posted_games.json"
+TARGET_DATE = _env_str("TARGET_DATE", "").strip()
 
 TEAM_RU = {
     "ANA": "Анахайм", "ARI": "Аризона", "BOS": "Бостон", "BUF": "Баффало", "CGY": "Калгари", "CAR": "Каролина",
@@ -269,6 +270,15 @@ def _current_hockey_day_pt() -> str:
     now_pt = datetime.now(PT_TZ)
     hockey_day = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
     return hockey_day.isoformat()
+
+
+def _target_base_date() -> date:
+    if TARGET_DATE:
+        try:
+            return datetime.strptime(TARGET_DATE, "%Y-%m-%d").date()
+        except Exception:
+            print(f"[ERR] bad TARGET_DATE: {TARGET_DATE}, expected YYYY-MM-DD")
+    return datetime.fromisoformat(_current_hockey_day_pt()).date()
 
 
 def fetch_standings_map() -> Dict[str, TeamRecord]:
@@ -962,12 +972,15 @@ def get_meta_by_gamepk_scan_schedule(gamePk: int) -> Optional[GameMeta]:
 
 
 def autopost_current_hockey_day() -> List[GameMeta]:
-    base_day = datetime.fromisoformat(_current_hockey_day_pt()).date()
+    base_day = _target_base_date()
     dates = [
         (base_day - timedelta(days=1)).isoformat(),
         base_day.isoformat(),
         (base_day + timedelta(days=1)).isoformat(),
     ]
+
+    print("Autopost base date:", base_day.isoformat())
+    print("Autopost schedule dates:", dates)
 
     raw = _list_games_for_dates(dates)
     metas = [_game_to_meta(g) for g in raw]
@@ -1002,6 +1015,7 @@ def main() -> None:
     posted: Dict[str, bool] = state.get("posted", {}) or {}
 
     dbg("already posted:", sorted(posted.keys())[:20], "total=", len(posted))
+    print("TARGET_DATE:", TARGET_DATE or "(empty)")
 
     metas: List[GameMeta] = []
     manual_mode = False
