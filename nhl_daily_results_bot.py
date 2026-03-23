@@ -455,36 +455,6 @@ def _extract_shootout_scorer(play: dict, details: dict) -> str:
     return _clean_person_name(sfb)
 
 
-def _looks_like_valid_player_name(name: Optional[str]) -> bool:
-    s = _clean_person_name(name or "")
-    if not s:
-        return False
-    if len(s) > 40:
-        return False
-
-    banned_substrings = (
-        "НХЛ",
-        "Серия буллитов",
-        "буллит",
-        "–",
-        "—",
-        ":",
-        ".202",
-        ".20",
-    )
-    for bad in banned_substrings:
-        if bad in s:
-            return False
-
-    if re.search(r"\d", s):
-        return False
-
-    if "http" in s.lower() or "/" in s:
-        return False
-
-    return True
-
-
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
     data = http_get_json(PBP_FMT.format(gamePk=gamePk))
     plays = data.get("plays", []) or []
@@ -521,7 +491,11 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
                 if _truthy(det.get(k)):
                     scored = True
 
-            team = home_tri if h > prev_so_h else (away_tri if a > prev_so_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
+            team = home_tri if h > prev_so_h else (
+                away_tri if a > prev_so_a else _upper_str(
+                    det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")
+                )
+            )
 
             if scorer or scored:
                 events.append(
@@ -554,7 +528,11 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             else:
                 h, a = prev_h, prev_a
 
-        team = home_tri if h > prev_h else (away_tri if a > prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
+        team = home_tri if h > prev_h else (
+            away_tri if a > prev_a else _upper_str(
+                det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")
+            )
+        )
 
         scorer = ""
         for k in _SCORER_KEYS:
@@ -610,21 +588,50 @@ def _extract_time(text: str) -> Optional[str]:
 
 def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
     res: List[SRUGoal] = []
-    if HAS_BS:
-        soup = BS(html, "lxml" if "lxml" in globals() else "html.parser")
-        ul = soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(f"ul.match-summary__goals-list.match-summary__goals-list--{side}")
-        if ul:
-            for li in ul.find_all("li", recursive=False):
-                anchors = [a.get_text(strip=True) for a in li.find_all("a")]
-                scorer_ru = anchors[0] if anchors else None
-                assists_ru = anchors[1:] if len(anchors) > 1 else []
-                raw = li.get_text(" ", strip=True)
-                time_ru = _extract_time(raw)
-                res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
+    if not HAS_BS:
+        return res
+
+    soup = BS(html, "html.parser")
+    ul = soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(
+        f"ul.match-summary__goals-list.match-summary__goals-list--{side}"
+    )
+    if not ul:
+        return res
+
+    for li in ul.find_all("li", recursive=False):
+        raw = li.get_text(" ", strip=True)
+        if "Серия буллитов" in raw:
+            continue
+        anchors = [a.get_text(strip=True) for a in li.find_all("a")]
+        scorer_ru = anchors[0] if anchors else None
+        assists_ru = anchors[1:] if len(anchors) > 1 else []
+        time_ru = _extract_time(raw)
+        res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
     return res
 
 
 def parse_sportsru_shootout_winner_html(html: str) -> Optional[SRUShootoutWinner]:
+    if not HAS_BS:
+        return None
+
+    soup = BS(html, "html.parser")
+    containers = soup.select(
+        "ul.match-summary__goals-list--home, "
+        "ul.match-summary__goals-list--away, "
+        "ul.match-summary__goals-list.match-summary__goals-list--home, "
+        "ul.match-summary__goals-list.match-summary__goals-list--away"
+    )
+
+    for ul in containers:
+        for li in ul.find_all("li", recursive=False):
+            raw = li.get_text(" ", strip=True)
+            if "Серия буллитов" not in raw:
+                continue
+            anchors = [a.get_text(strip=True) for a in li.find_all("a")]
+            if anchors:
+                name = _clean_person_name(anchors[0])
+                if name:
+                    return SRUShootoutWinner(scorer_ru=name)
     return None
 
 
@@ -712,10 +719,6 @@ def period_title_text(num: int, ptype: str, ot_index: Optional[int], ot_total: i
 
 
 def game_went_to_shootout(events: List[ScoringEvent], meta: GameMeta) -> bool:
-    shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
-    if not shootout_events:
-        return False
-
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
     if not regular_and_ot:
         return False
@@ -727,15 +730,7 @@ def game_went_to_shootout(events: List[ScoringEvent], meta: GameMeta) -> bool:
     if abs(meta.home_score - meta.away_score) != 1:
         return False
 
-    prev_h = prev_a = 0
-    has_real_so_goal = False
-    for ev in shootout_events:
-        if ev.home_goals > prev_h or ev.away_goals > prev_a or ev.is_shootout_scored or ev.is_shootout_winner:
-            has_real_so_goal = True
-            break
-        prev_h, prev_a = ev.home_goals, ev.away_goals
-
-    return has_real_so_goal
+    return True
 
 
 def compute_player_marks(events: List[ScoringEvent]) -> Dict[str, str]:
@@ -819,31 +814,8 @@ def get_winning_shootout_name(
 ) -> Optional[str]:
     if not game_went_to_shootout(events, meta):
         return None
-
-    shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
-
-    flagged = [
-        ev for ev in shootout_events
-        if ev.is_shootout_winner and _looks_like_valid_player_name(ev.scorer)
-    ]
-    if flagged:
-        return _clean_person_name(flagged[-1].scorer)
-
-    successful: List[ScoringEvent] = []
-    prev_h = prev_a = 0
-    for ev in shootout_events:
-        if ev.home_goals > prev_h or ev.away_goals > prev_a or ev.is_shootout_scored:
-            if _looks_like_valid_player_name(ev.scorer):
-                successful.append(ev)
-        prev_h, prev_a = ev.home_goals, ev.away_goals
-
-    if successful:
-        return _clean_person_name(successful[-1].scorer)
-
-    named = [ev for ev in shootout_events if _looks_like_valid_player_name(ev.scorer)]
-    if named:
-        return _clean_person_name(named[-1].scorer)
-
+    if sportsru_winner and sportsru_winner.scorer_ru:
+        return _clean_person_name(sportsru_winner.scorer_ru)
     return None
 
 
@@ -863,7 +835,7 @@ def build_single_match_text(
 
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
     winning_so_name = get_winning_shootout_name(events, meta, sportsru_winner)
-    has_shootout = game_went_to_shootout(events, meta) and _looks_like_valid_player_name(winning_so_name)
+    has_shootout = bool(winning_so_name) and game_went_to_shootout(events, meta)
 
     marks = compute_player_marks(events)
     last_mentions = find_last_mentions(regular_and_ot, winning_so_name)
@@ -897,7 +869,7 @@ def build_single_match_text(
             for ev in per:
                 lines.append(line_goal(ev, marks, last_mentions, idx_ref))
 
-    if has_shootout and winning_so_name:
+    if has_shootout:
         lines.append("")
         lines.append("Победный буллит")
         so_name = decorate_name(winning_so_name, marks, last_mentions, idx_ref[0])
