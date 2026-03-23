@@ -834,11 +834,9 @@ def build_single_match_text(
     head = f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
 
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
-    winning_so_name = get_winning_shootout_name(events, meta, sportsru_winner)
-    has_shootout = bool(winning_so_name) and game_went_to_shootout(events, meta)
 
     marks = compute_player_marks(events)
-    last_mentions = find_last_mentions(regular_and_ot, winning_so_name)
+    last_mentions = find_last_mentions(regular_and_ot, None)
 
     groups: Dict[Tuple[int, str], List[ScoringEvent]] = {}
     for ev in regular_and_ot:
@@ -869,14 +867,8 @@ def build_single_match_text(
             for ev in per:
                 lines.append(line_goal(ev, marks, last_mentions, idx_ref))
 
-    if has_shootout:
-        lines.append("")
-        lines.append("Победный буллит")
-        so_name = decorate_name(winning_so_name, marks, last_mentions, idx_ref[0])
-        lines.append(f"{meta.home_score}:{meta.away_score} – {so_name}")
-
     return "\n".join(lines).strip()
-
+    
 
 def load_state(path: str) -> Dict[str, Any]:
     p = pathlib.Path(path)
