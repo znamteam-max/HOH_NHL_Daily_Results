@@ -14,7 +14,7 @@ import textwrap
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 import requests
@@ -48,6 +48,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 DRY_RUN = _env_bool("DRY_RUN", False)
 DEBUG_VERBOSE = _env_bool("DEBUG_VERBOSE", False)
 STATE_PATH = _env_str("STATE_PATH", "state/posted_games.json").strip() or "state/posted_games.json"
+TARGET_DATE = _env_str("TARGET_DATE", "").strip()
 
 TEAM_RU = {
     "ANA": "Анахайм", "ARI": "Аризона", "BOS": "Бостон", "BUF": "Баффало", "CGY": "Калгари", "CAR": "Каролина",
@@ -106,6 +107,11 @@ UA_HEADERS = {
 }
 
 
+def dbg(*args: Any) -> None:
+    if DEBUG_VERBOSE:
+        print("[DBG]", *args, flush=True)
+
+
 def _get_with_retries(url: str, timeout: int = 30, tries: int = 3, backoff: float = 0.75, as_text: bool = False):
     last = None
     for attempt in range(1, tries + 1):
@@ -120,8 +126,7 @@ def _get_with_retries(url: str, timeout: int = 30, tries: int = 3, backoff: floa
             last = e
             if attempt < tries:
                 sleep_s = backoff * (2 ** (attempt - 1))
-                if DEBUG_VERBOSE:
-                    print(f"[DBG] retry {attempt}/{tries} for {url} after {sleep_s:.2f}s: {repr(e)}")
+                dbg(f"retry {attempt}/{tries} for {url} after {sleep_s:.2f}s: {repr(e)}")
                 time.sleep(sleep_s)
             else:
                 raise
@@ -249,6 +254,21 @@ def _clean_assists(items: List[str]) -> List[str]:
     return out
 
 
+def _is_valid_player_name(s: str) -> bool:
+    s = _clean_person_name(s)
+    if not s:
+        return False
+    if len(s) > 40:
+        return False
+    if "НХЛ." in s or "Серия буллитов" in s:
+        return False
+    if re.search(r"\d{1,2}\.\d{1,2}\.\d{4}", s):
+        return False
+    if re.search(r"\d", s):
+        return False
+    return True
+
+
 def _is_final_state(state: str) -> bool:
     return _upper_str(state) in ("FINAL", "OFF")
 
@@ -267,11 +287,20 @@ def _current_hockey_day_pt() -> str:
     return hockey_day.isoformat()
 
 
+def _target_base_date() -> date:
+    if TARGET_DATE:
+        try:
+            return datetime.strptime(TARGET_DATE, "%Y-%m-%d").date()
+        except Exception:
+            print(f"[ERR] bad TARGET_DATE: {TARGET_DATE}, expected YYYY-MM-DD")
+    return datetime.fromisoformat(_current_hockey_day_pt()).date()
+
+
 def fetch_standings_map() -> Dict[str, TeamRecord]:
     url = f"{NHLE_BASE}/standings/now"
     data = http_get_json(url)
     teams: Dict[str, TeamRecord] = {}
-    nodes = []
+    nodes: List[dict] = []
 
     if isinstance(data, dict):
         if isinstance(data.get("standings"), list):
@@ -309,7 +338,7 @@ def _iter_dates_around_today(num_back: int = 2, num_fwd: int = 2) -> List[str]:
 
 
 def _list_games_for_dates(dates: List[str]) -> List[dict]:
-    raw = []
+    raw: List[dict] = []
     for day in dates:
         js = http_get_json(SCHED_FMT.format(ymd=day))
         games = js.get("games")
@@ -326,6 +355,7 @@ def _game_to_meta(g: dict) -> Optional[GameMeta]:
     gid = _first_int(g.get("id"), g.get("gameId"), g.get("gamePk"))
     if gid == 0:
         return None
+
     state = _upper_str(g.get("gameState") or g.get("gameStatus"))
     gd = g.get("startTimeUTC") or g.get("gameDate") or ""
     try:
@@ -346,6 +376,7 @@ def resolve_game_by_query(q: str) -> Optional[GameMeta]:
     q = q.strip()
     if not q:
         return None
+
     try:
         date_part, rest = q.split(" ", 1)
         y, m, d = map(int, date_part.split("-"))
@@ -371,9 +402,9 @@ def resolve_game_by_query(q: str) -> Optional[GameMeta]:
     metas = [m for m in metas if m]
     for m in metas:
         if m.home_tri == home and m.away_tri == away:
-            if DEBUG_VERBOSE:
-                print(f"[DBG] Resolved GAME_PK={m.gamePk} for {q}")
+            dbg(f"Resolved GAME_PK={m.gamePk} for {q}")
             return m
+
     print(f"[DBG] Unable to resolve GAME_PK for {q}")
     return None
 
@@ -403,7 +434,7 @@ def _normalize_period_type(t: str) -> str:
 
 def _players_fallback_names(p: dict) -> Tuple[str, List[str]]:
     scorer = ""
-    assists = []
+    assists: List[str] = []
     try:
         for pl in p.get("players") or []:
             pt = (_upper_str(pl.get("playerType")) or _upper_str(pl.get("type"))).strip()
@@ -439,23 +470,26 @@ def _extract_shootout_scorer(play: dict, details: dict) -> str:
     return _clean_person_name(sfb)
 
 
-def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[ScoringEvent]:
+def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> Tuple[List[ScoringEvent], bool]:
     data = http_get_json(PBP_FMT.format(gamePk=gamePk))
     plays = data.get("plays", []) or []
     events: List[ScoringEvent] = []
 
+    official_has_shootout = False
     prev_h = prev_a = 0
     prev_so_h = prev_so_a = 0
 
     for p in plays:
-        type_key = _upper_str(p.get("typeDescKey"))
         pd = p.get("periodDescriptor", {}) or {}
         period = _first_int(pd.get("number") or p.get("period"))
         ptype = _normalize_period_type(pd.get("periodType") or "REG")
+        type_key = _upper_str(p.get("typeDescKey"))
         det = p.get("details", {}) or {}
         t = str(p.get("timeInPeriod") or "00:00").replace(":", ".")
 
         if ptype == "SHOOTOUT":
+            official_has_shootout = True
+
             scorer = _extract_shootout_scorer(p, det)
 
             h = det.get("homeScore")
@@ -475,7 +509,11 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
                 if _truthy(det.get(k)):
                     scored = True
 
-            team = home_tri if h > prev_so_h else (away_tri if a > prev_so_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
+            team = home_tri if h > prev_so_h else (
+                away_tri if a > prev_so_a else _upper_str(
+                    det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")
+                )
+            )
 
             if scorer or scored:
                 events.append(
@@ -508,7 +546,11 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             else:
                 h, a = prev_h, prev_a
 
-        team = home_tri if h > prev_h else (away_tri if a > prev_a else _upper_str(det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")))
+        team = home_tri if h > prev_h else (
+            away_tri if a > prev_a else _upper_str(
+                det.get("eventOwnerTeamAbbrev") or p.get("teamAbbrev") or det.get("teamAbbrev") or det.get("scoringTeamAbbrev")
+            )
+        )
 
         scorer = ""
         for k in _SCORER_KEYS:
@@ -527,7 +569,7 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
             if sfb:
                 scorer = sfb
 
-        assists = []
+        assists: List[str] = []
         for k in _ASSIST_KEYS:
             nm = _extract_name(det.get(k))
             if nm:
@@ -551,7 +593,7 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> List[Sc
         )
         prev_h, prev_a = _first_int(h), _first_int(a)
 
-    return events
+    return events, official_has_shootout
 
 
 TIME_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
@@ -564,17 +606,25 @@ def _extract_time(text: str) -> Optional[str]:
 
 def parse_sportsru_goals_html(html: str, side: str) -> List[SRUGoal]:
     res: List[SRUGoal] = []
-    if HAS_BS:
-        soup = BS(html, "lxml" if "lxml" in globals() else "html.parser")
-        ul = soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(f"ul.match-summary__goals-list.match-summary__goals-list--{side}")
-        if ul:
-            for li in ul.find_all("li", recursive=False):
-                anchors = [a.get_text(strip=True) for a in li.find_all("a")]
-                scorer_ru = anchors[0] if anchors else None
-                assists_ru = anchors[1:] if len(anchors) > 1 else []
-                raw = li.get_text(" ", strip=True)
-                time_ru = _extract_time(raw)
-                res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
+    if not HAS_BS:
+        return res
+
+    soup = BS(html, "html.parser")
+    ul = soup.select_one(f"ul.match-summary__goals-list--{side}") or soup.select_one(
+        f"ul.match-summary__goals-list.match-summary__goals-list--{side}"
+    )
+    if not ul:
+        return res
+
+    for li in ul.find_all("li", recursive=False):
+        raw = li.get_text(" ", strip=True)
+        if "Серия буллитов" in raw:
+            continue
+        anchors = [a.get_text(strip=True) for a in li.find_all("a")]
+        scorer_ru = anchors[0] if anchors else None
+        assists_ru = anchors[1:] if len(anchors) > 1 else []
+        time_ru = _extract_time(raw)
+        res.append(SRUGoal(time_ru, scorer_ru, assists_ru))
     return res
 
 
@@ -582,24 +632,27 @@ def parse_sportsru_shootout_winner_html(html: str) -> Optional[SRUShootoutWinner
     if not HAS_BS:
         return None
 
-    soup = BS(html, "lxml" if "lxml" in globals() else "html.parser")
+    soup = BS(html, "html.parser")
+    containers = soup.select(
+        "ul.match-summary__goals-list--home, "
+        "ul.match-summary__goals-list--away, "
+        "ul.match-summary__goals-list.match-summary__goals-list--home, "
+        "ul.match-summary__goals-list.match-summary__goals-list--away"
+    )
 
-    # Приоритет: элемент со строкой "Серия буллитов"
-    for li in soup.find_all("li"):
-        raw = li.get_text(" ", strip=True)
-        if "Серия буллитов" not in raw:
-            continue
-        anchors = [a.get_text(strip=True) for a in li.find_all("a")]
-        if anchors:
-            return SRUShootoutWinner(scorer_ru=anchors[0].strip())
+    for ul in containers:
+        for li in ul.find_all("li", recursive=False):
+            raw = li.get_text(" ", strip=True)
+            if "Серия буллитов" not in raw:
+                continue
 
-    # Fallback: имя в строке перед строкой с "Серия буллитов"
-    lines = [x.strip() for x in soup.get_text("\n", strip=True).splitlines() if x.strip()]
-    for i, line in enumerate(lines):
-        if "Серия буллитов" in line and i > 0:
-            prev = lines[i - 1].strip()
-            if prev and "logo" not in prev.lower():
-                return SRUShootoutWinner(scorer_ru=prev)
+            anchors = [a.get_text(strip=True) for a in li.find_all("a")]
+            if not anchors:
+                continue
+
+            name = _clean_person_name(anchors[0])
+            if _is_valid_player_name(name):
+                return SRUShootoutWinner(scorer_ru=name)
 
     return None
 
@@ -607,7 +660,7 @@ def parse_sportsru_shootout_winner_html(html: str) -> Optional[SRUShootoutWinner
 def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], List[SRUGoal], Optional[SRUShootoutWinner], str]:
     h_list = SPORTSRU_SLUGS.get(home_tri, [])
     a_list = SPORTSRU_SLUGS.get(away_tri, [])
-    tried = []
+    tried: List[str] = []
 
     for hslug in h_list:
         for aslug in a_list:
@@ -617,8 +670,7 @@ def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], L
                 try:
                     html = http_get_text(url, timeout=20)
                 except Exception as e:
-                    if DEBUG_VERBOSE:
-                        print(f"[DBG] sports.ru fetch fail {url}: {repr(e)}")
+                    dbg(f"sports.ru fetch fail {url}: {repr(e)}")
                     continue
 
                 left_is_home = left in h_list
@@ -630,12 +682,10 @@ def fetch_sportsru_goals(home_tri: str, away_tri: str) -> Tuple[List[SRUGoal], L
                 so = parse_sportsru_shootout_winner_html(html)
 
                 if h or a or so:
-                    if DEBUG_VERBOSE:
-                        print(f"[DBG] sports.ru ok for {url}: home={len(h)} away={len(a)} so={getattr(so, 'scorer_ru', None)}")
+                    dbg(f"sports.ru ok for {url}: home={len(h)} away={len(a)} so={getattr(so, 'scorer_ru', None)}")
                     return h, a, so, url
 
-    if DEBUG_VERBOSE and tried:
-        print("[DBG] sports.ru tried URLs (no data):", " | ".join(tried))
+    dbg("sports.ru tried URLs (no data):", " | ".join(tried))
     return [], [], None, ""
 
 
@@ -647,7 +697,7 @@ def merge_official_with_sportsru(
     away_tri: str,
 ) -> List[ScoringEvent]:
     h_i = a_i = 0
-    out = []
+    out: List[ScoringEvent] = []
 
     for ev in evs:
         if ev.period_type == "SHOOTOUT":
@@ -755,41 +805,41 @@ def line_goal(ev: ScoringEvent, marks: Dict[str, str], last_mentions: Dict[str, 
     who = decorate_name(ev.scorer, marks, last_mentions, idx_ref[0])
     idx_ref[0] += 1
 
-    assists_out = []
+    assists_out: List[str] = []
     for a in _clean_assists(ev.assists):
         assists_out.append(decorate_name(a, marks, last_mentions, idx_ref[0]))
         idx_ref[0] += 1
 
-    assists_text = f" ({', '.join(assists_out)})" if assists_out else ""
+    assists_text = ""
+    if len(assists_out) == 1:
+        assists_text = f" ({assists_out[0]})"
+    elif len(assists_out) >= 2:
+        assists_text = f" ({', '.join(assists_out)})"
+
     return f"{score} – {ev.time} {who}{assists_text}"
 
 
-def get_winning_shootout_name(events: List[ScoringEvent], sportsru_winner: Optional[SRUShootoutWinner]) -> Optional[str]:
-    # 1. Приоритет Sports.ru
-    if sportsru_winner and sportsru_winner.scorer_ru:
+def get_winning_shootout_name(
+    events: List[ScoringEvent],
+    official_has_shootout: bool,
+    sportsru_winner: Optional[SRUShootoutWinner],
+) -> Optional[str]:
+    if not official_has_shootout:
+        return None
+
+    for ev in events:
+        if ev.period_type == "SHOOTOUT" and ev.is_shootout_winner and _is_valid_player_name(ev.scorer):
+            return _clean_person_name(ev.scorer)
+
+    if sportsru_winner and sportsru_winner.scorer_ru and _is_valid_player_name(sportsru_winner.scorer_ru):
         return _clean_person_name(sportsru_winner.scorer_ru)
 
-    shootout_events = [ev for ev in events if ev.period_type == "SHOOTOUT"]
-
-    # 2. Явно помеченный победный
-    flagged = [ev for ev in shootout_events if ev.is_shootout_winner and _clean_person_name(ev.scorer)]
-    if flagged:
-        return _clean_person_name(flagged[-1].scorer)
-
-    # 3. Последний успешный по росту счёта
-    successful: List[ScoringEvent] = []
-    prev_h = prev_a = 0
-    for ev in shootout_events:
-        if ev.home_goals > prev_h or ev.away_goals > prev_a or ev.is_shootout_scored:
-            successful.append(ev)
-        prev_h, prev_a = ev.home_goals, ev.away_goals
-    if successful:
-        return _clean_person_name(successful[-1].scorer)
-
-    # 4. Последний named event
-    named = [ev for ev in shootout_events if _clean_person_name(ev.scorer)]
-    if named:
-        return _clean_person_name(named[-1].scorer)
+    scored_attempts = [
+        ev for ev in events
+        if ev.period_type == "SHOOTOUT" and ev.is_shootout_scored and _is_valid_player_name(ev.scorer)
+    ]
+    if scored_attempts:
+        return _clean_person_name(scored_attempts[-1].scorer)
 
     return None
 
@@ -798,6 +848,7 @@ def build_single_match_text(
     meta: GameMeta,
     standings: Dict[str, TeamRecord],
     events: List[ScoringEvent],
+    official_has_shootout: bool,
     sportsru_winner: Optional[SRUShootoutWinner] = None,
 ) -> str:
     he = TEAM_EMOJI.get(meta.home_tri, "")
@@ -806,10 +857,20 @@ def build_single_match_text(
     an = TEAM_RU.get(meta.away_tri, meta.away_tri)
     hrec = standings.get(meta.home_tri).as_str() if meta.home_tri in standings else "?"
     arec = standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
-    head = f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})\n{ae} <b>«{an}»: {meta.away_score}</b> ({arec})"
+
+    winning_so_name = get_winning_shootout_name(events, official_has_shootout, sportsru_winner)
+
+    head_lines = [
+        f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})",
+        f"{ae} <b>«{an}»: {meta.away_score}</b> ({arec})",
+    ]
+    if winning_so_name:
+        head_lines.append("")
+        head_lines.append(f"<b>Победный буллит — {winning_so_name}</b>")
+
+    head = "\n".join(head_lines)
 
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
-    winning_so_name = get_winning_shootout_name(events, sportsru_winner)
 
     marks = compute_player_marks(events)
     last_mentions = find_last_mentions(regular_and_ot, winning_so_name)
@@ -846,8 +907,7 @@ def build_single_match_text(
     if winning_so_name:
         lines.append("")
         lines.append("Победный буллит")
-        so_name = decorate_name(winning_so_name, marks, last_mentions, idx_ref[0])
-        lines.append(f"{meta.home_score}:{meta.away_score} – {so_name}")
+        lines.append(f"{meta.home_score}:{meta.away_score} – {winning_so_name}")
 
     return "\n".join(lines).strip()
 
@@ -903,8 +963,7 @@ def send_telegram_text(text: str) -> None:
     except Exception:
         data = {"ok": None, "raw": resp.text}
 
-    if DEBUG_VERBOSE:
-        print(f"[DBG] TG HTTP={resp.status_code} JSON={data}")
+    dbg(f"TG HTTP={resp.status_code} JSON={data}")
     if resp.status_code != 200 or not data.get("ok", False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
 
@@ -919,12 +978,30 @@ def get_meta_by_gamepk_scan_schedule(gamePk: int) -> Optional[GameMeta]:
 
 
 def autopost_current_hockey_day() -> List[GameMeta]:
-    raw = _list_games_for_dates([_current_hockey_day_pt()])
+    base_day = _target_base_date()
+    dates = [
+        (base_day - timedelta(days=1)).isoformat(),
+        base_day.isoformat(),
+        (base_day + timedelta(days=1)).isoformat(),
+    ]
+
+    print("TARGET_DATE:", TARGET_DATE or "(empty)")
+    print("Autopost base date:", base_day.isoformat())
+    print("Autopost schedule dates:", dates)
+
+    raw = _list_games_for_dates(dates)
     metas = [_game_to_meta(g) for g in raw]
     metas = [m for m in metas if m]
     finals = [m for m in metas if _is_final_state(m.state)]
-    finals = sorted(finals, key=lambda m: m.gameDateUTC)
-    return finals
+
+    seen = set()
+    uniq: List[GameMeta] = []
+    for m in sorted(finals, key=lambda x: x.gameDateUTC):
+        if m.gamePk not in seen:
+            seen.add(m.gamePk)
+            uniq.append(m)
+
+    return uniq
 
 
 def pending_game_text(meta: GameMeta) -> str:
@@ -936,13 +1013,15 @@ def pending_game_text(meta: GameMeta) -> str:
     return f"{matchup} статус: {meta.state}"
 
 
-def main():
+def main() -> None:
     game_pk = _env_str("GAME_PK", "").strip()
     game_query = _env_str("GAME_QUERY", "").strip()
 
     standings = fetch_standings_map()
     state = load_state(STATE_PATH)
     posted: Dict[str, bool] = state.get("posted", {}) or {}
+
+    dbg("already posted:", sorted(posted.keys())[:20], "total=", len(posted))
 
     metas: List[GameMeta] = []
     manual_mode = False
@@ -965,6 +1044,7 @@ def main():
     else:
         metas = autopost_current_hockey_day()
         print("FINAL games:", [m.gamePk for m in metas])
+        print("FINAL games raw:", [(m.gamePk, m.away_tri, m.home_tri, m.state) for m in metas])
         metas = [m for m in metas if not posted.get(str(m.gamePk))]
         print("Need to post:", [m.gamePk for m in metas])
 
@@ -973,24 +1053,31 @@ def main():
     for meta in metas:
         if manual_mode and not _is_final_state(meta.state):
             text = pending_game_text(meta)
-            if DEBUG_VERBOSE:
-                print("[DBG] Pending preview:\n" + text)
+            dbg("Pending preview:\n" + text)
             send_telegram_text(text)
             continue
 
-        evs = fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
+        evs, official_has_shootout = fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
         sru_home, sru_away, sru_so_winner, _ = fetch_sportsru_goals(meta.home_tri, meta.away_tri)
         merged = merge_official_with_sportsru(evs, sru_home, sru_away, meta.home_tri, meta.away_tri)
-        text = build_single_match_text(meta, standings, merged, sru_so_winner)
 
-        if DEBUG_VERBOSE:
-            print("[DBG] Single match preview:\n" + text[:900].replace("\n", "¶") + "…")
+        text = build_single_match_text(
+            meta=meta,
+            standings=standings,
+            events=merged,
+            official_has_shootout=official_has_shootout,
+            sportsru_winner=sru_so_winner,
+        )
 
+        dbg("official_has_shootout:", official_has_shootout)
+        dbg("sportsru_so_winner:", getattr(sru_so_winner, "scorer_ru", None))
+        dbg("Single match preview:\n" + text[:900].replace("\n", "¶") + "…")
         send_telegram_text(text)
 
         if not manual_mode:
             posted[str(meta.gamePk)] = True
             new_posts += 1
+            dbg(f"mark posted {meta.gamePk}")
 
     state["posted"] = posted
     save_state(STATE_PATH, state)
