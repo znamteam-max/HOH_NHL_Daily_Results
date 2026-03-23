@@ -1,42 +1,31 @@
-name: NHL single results
+name: NHL Single Result Bot
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
-      gamePk:
-        description: "Exact GAME_PK (optional)"
+      gamepk:
+        description: "Specific NHL gamePk"
         required: false
         default: ""
-      gameDate:
-        description: "YYYY-MM-DD (optional if using gamePk)"
+      date:
+        description: "Date in YYYY-MM-DD for autopost/search"
         required: false
         default: ""
       match:
-        description: "e.g. 'VGK - NSH' or 'NSH@VGK'"
+        description: "Matchup, e.g. PIT@WPG or WPG-PIT"
         required: false
         default: ""
-
-permissions:
-  contents: write
-
-concurrency:
-  group: nhl-single-results
-  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -45,12 +34,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Prepare manual inputs
-        if: github.event_name == 'workflow_dispatch'
+      - name: Build env vars
         env:
-          INPUT_GAMEPK: ${{ inputs.gamePk }}
-          INPUT_DATE:   ${{ inputs.gameDate }}
-          INPUT_MATCH:  ${{ inputs.match }}
+          INPUT_GAMEPK: ${{ github.event.inputs.gamepk }}
+          INPUT_DATE: ${{ github.event.inputs.date }}
+          INPUT_MATCH: ${{ github.event.inputs.match }}
         run: |
           python - << 'PY'
           import os, re
@@ -77,32 +65,37 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               fh.write(f"GAME_PK={gp}\n")
               fh.write(f"GAME_QUERY={q}\n")
+              fh.write(f"TARGET_DATE={dt}\n")
 
           print("GAME_PK:", gp or "(empty)")
           print("GAME_QUERY:", q or "(empty)")
+          print("TARGET_DATE:", dt or "(empty)")
           PY
 
-      - name: Ensure state file exists
+      - name: Init state
         run: |
           mkdir -p state
           [ -f state/posted_games.json ] || echo '{"posted":{}}' > state/posted_games.json
           cat state/posted_games.json
 
-      - name: Run single result bot
+      - name: Run bot
         env:
+          GAME_PK: ${{ env.GAME_PK }}
+          GAME_QUERY: ${{ env.GAME_QUERY }}
+          TARGET_DATE: ${{ env.TARGET_DATE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_VERBOSE: "1"
-        run: |
-          python nhl_single_result_bot.py
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          DEBUG_VERBOSE: 1
+        run: python nhl_single_result_bot.py
 
-      - name: Show git status
+      - name: Show state
         run: |
           git status --porcelain
           echo "--- state file ---"
           cat state/posted_games.json || true
 
-      - name: Commit posted state if changed
+      - name: Commit state
         run: |
           set -e
 
