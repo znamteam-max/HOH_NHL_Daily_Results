@@ -976,13 +976,15 @@ def get_meta_by_gamepk_scan_schedule(gamePk: int) -> Optional[GameMeta]:
             return _game_to_meta(g)
     return None
 
-
 def autopost_current_hockey_day() -> List[GameMeta]:
     base_day = _target_base_date()
+
     dates = [
+        (base_day - timedelta(days=2)).isoformat(),
         (base_day - timedelta(days=1)).isoformat(),
         base_day.isoformat(),
         (base_day + timedelta(days=1)).isoformat(),
+        (base_day + timedelta(days=2)).isoformat(),
     ]
 
     print("TARGET_DATE:", TARGET_DATE or "(empty)")
@@ -992,6 +994,9 @@ def autopost_current_hockey_day() -> List[GameMeta]:
     raw = _list_games_for_dates(dates)
     metas = [_game_to_meta(g) for g in raw]
     metas = [m for m in metas if m]
+
+    print("ALL games raw:", [(m.gamePk, m.away_tri, m.home_tri, m.state) for m in metas])
+
     finals = [m for m in metas if _is_final_state(m.state)]
 
     seen = set()
@@ -1003,7 +1008,6 @@ def autopost_current_hockey_day() -> List[GameMeta]:
 
     return uniq
 
-
 def pending_game_text(meta: GameMeta) -> str:
     matchup = f"{meta.away_tri} - {meta.home_tri}"
     if _is_not_started_state(meta.state):
@@ -1011,7 +1015,6 @@ def pending_game_text(meta: GameMeta) -> str:
     if _is_liveish_state(meta.state):
         return f"{matchup} ещё не завершилась"
     return f"{matchup} статус: {meta.state}"
-
 
 def main() -> None:
     game_pk = _env_str("GAME_PK", "").strip()
