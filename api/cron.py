@@ -21,6 +21,14 @@ def handle_cron_request(auth_header: str) -> tuple[int, dict]:
     if not cron_secret or auth_header != f"Bearer {cron_secret}":
         return 401, {"ok": False, "error": "unauthorized"}
 
+    state_token = _state_token()
+    if not state_token:
+        return 500, {
+            "ok": False,
+            "error": "missing GITHUB_STATE_TOKEN",
+            "hint": "Set GITHUB_STATE_TOKEN in Vercel with Contents read/write access, then redeploy.",
+        }
+
     stdout = io.StringIO()
     stderr = io.StringIO()
 
@@ -28,7 +36,7 @@ def handle_cron_request(auth_header: str) -> tuple[int, dict]:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             import nhl_single_result_bot
 
-            _patch_github_state(nhl_single_result_bot)
+            _patch_github_state(nhl_single_result_bot, state_token)
             nhl_single_result_bot.main()
         return 200, {
             "ok": True,
@@ -49,11 +57,11 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def _patch_github_state(bot) -> None:
-    token = _env("GITHUB_STATE_TOKEN") or _env("GH_STATE_TOKEN") or _env("GITHUB_TOKEN")
-    if not token:
-        return
+def _state_token() -> str:
+    return _env("GITHUB_STATE_TOKEN") or _env("GH_STATE_TOKEN") or _env("GITHUB_TOKEN")
 
+
+def _patch_github_state(bot, token: str) -> None:
     repo = _env("GITHUB_STATE_REPO", "znamteam-max/HOH_NHL_Daily_Results")
     branch = _env("GITHUB_STATE_BRANCH", "main") or "main"
     requests = bot.requests
@@ -78,6 +86,10 @@ def _patch_github_state(bot) -> None:
         )
         if response.status_code == 404:
             return {"posted": {}}, None
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"GitHub state fetch failed: HTTP {response.status_code} {response.text[:500]}"
+            )
         response.raise_for_status()
         payload = response.json()
         raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
@@ -114,6 +126,10 @@ def _patch_github_state(bot) -> None:
             if response.status_code == 409 and attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
                 continue
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"GitHub state save failed: HTTP {response.status_code} {response.text[:500]}"
+                )
             response.raise_for_status()
 
     bot.load_state = load_state
