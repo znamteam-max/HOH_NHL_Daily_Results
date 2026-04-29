@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import requests
 from fastapi import FastAPI, Header, Request
@@ -11,6 +12,9 @@ try:
 except ImportError:
     from cron import handle_cron_request, run_bot_once
 
+
+DEFAULT_WEBHOOK_SECRET = "hook-123"
+DEFAULT_MENU_CHAT = "@hoh_nhl_records"
 
 app = FastAPI()
 
@@ -27,14 +31,62 @@ def cron(authorization: str = Header(default="")):
     return JSONResponse(content=payload, status_code=status)
 
 
+@app.api_route("/api/setup-webhook", methods=["GET", "POST"])
+@app.api_route("/setup-webhook", methods=["GET", "POST"])
+async def setup_webhook(request: Request, authorization: str = Header(default="")):
+    if not _is_management_authorized(request, authorization):
+        return JSONResponse(content={"ok": False, "error": "unauthorized"}, status_code=401)
+
+    webhook_url = f"{_public_base_url(request)}/api/telegram"
+    result = _telegram_request(
+        "setWebhook",
+        {
+            "url": webhook_url,
+            "secret_token": _webhook_secret(),
+            "allowed_updates": ["message", "callback_query"],
+        },
+    )
+
+    send_menu = _query_bool(request, "send_menu", True)
+    menu_result: dict[str, Any] | None = None
+    if send_menu and result.get("ok"):
+        menu_result = _send_menu(_menu_chat_id())
+
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse(
+        content={
+            "ok": bool(result.get("ok")),
+            "webhook_url": webhook_url,
+            "webhook_secret": "configured",
+            "telegram": result,
+            "menu": menu_result,
+        },
+        status_code=status_code,
+    )
+
+
+@app.api_route("/api/menu", methods=["GET", "POST"])
+@app.api_route("/menu", methods=["GET", "POST"])
+async def send_menu(request: Request, authorization: str = Header(default="")):
+    if not _is_management_authorized(request, authorization):
+        return JSONResponse(content={"ok": False, "error": "unauthorized"}, status_code=401)
+
+    chat_id = (request.query_params.get("chat") or _menu_chat_id()).strip()
+    if not chat_id:
+        return JSONResponse(content={"ok": False, "error": "missing chat"}, status_code=500)
+
+    result = _send_menu(chat_id)
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse(content={"ok": bool(result.get("ok")), "chat_id": chat_id, "telegram": result}, status_code=status_code)
+
+
 @app.post("/api/telegram")
 @app.post("/telegram")
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str = Header(default=""),
 ):
-    expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+    if x_telegram_bot_api_secret_token != _webhook_secret():
         return JSONResponse(content={"ok": False, "error": "unauthorized"}, status_code=401)
 
     update = await request.json()
@@ -50,6 +102,51 @@ async def telegram_webhook(
         _send_menu(chat_id)
 
     return {"ok": True}
+
+
+def _webhook_secret() -> str:
+    return os.getenv("TELEGRAM_WEBHOOK_SECRET", DEFAULT_WEBHOOK_SECRET).strip() or DEFAULT_WEBHOOK_SECRET
+
+
+def _management_secret() -> str:
+    return os.getenv("WEBHOOK_SETUP_SECRET", _webhook_secret()).strip() or _webhook_secret()
+
+
+def _menu_chat_id() -> str:
+    return (
+        os.getenv("TELEGRAM_MENU_CHAT_ID", "").strip()
+        or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        or DEFAULT_MENU_CHAT
+    )
+
+
+def _is_management_authorized(request: Request, authorization: str) -> bool:
+    expected = _management_secret()
+    provided = (request.query_params.get("secret") or "").strip()
+    return provided == expected or authorization == f"Bearer {expected}"
+
+
+def _query_bool(request: Request, name: str, default: bool) -> bool:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _public_base_url(request: Request) -> str:
+    env_url = (
+        os.getenv("PUBLIC_BASE_URL", "").strip()
+        or os.getenv("VERCEL_PROJECT_PRODUCTION_URL", "").strip()
+        or os.getenv("VERCEL_URL", "").strip()
+    )
+    if env_url:
+        if not env_url.startswith(("http://", "https://")):
+            env_url = f"https://{env_url}"
+        return env_url.rstrip("/")
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
 
 
 def _is_menu_command(text: str) -> bool:
@@ -83,8 +180,8 @@ def _handle_callback(callback: dict) -> JSONResponse:
     return JSONResponse(content={"ok": False, "error": "unknown callback"}, status_code=400)
 
 
-def _send_menu(chat_id) -> None:
-    _send_text(
+def _send_menu(chat_id) -> dict[str, Any]:
+    return _send_text(
         chat_id,
         "Меню HOH NHL Results",
         reply_markup={
@@ -100,29 +197,48 @@ def _send_menu(chat_id) -> None:
     )
 
 
-def _send_text(chat_id, text: str, reply_markup=None) -> None:
-    payload = {
+def _send_text(chat_id, text: str, reply_markup=None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
     }
+    thread = os.getenv("TELEGRAM_THREAD_ID", "").strip()
+    if thread:
+        try:
+            payload["message_thread_id"] = int(thread)
+        except ValueError:
+            pass
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    _telegram_request("sendMessage", payload)
+    return _telegram_request("sendMessage", payload)
 
 
-def _answer_callback(callback_id: str | None, text: str) -> None:
+def _answer_callback(callback_id: str | None, text: str) -> dict[str, Any] | None:
     if not callback_id:
-        return
-    _telegram_request("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+        return None
+    return _telegram_request("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
 
-def _telegram_request(method: str, payload: dict) -> None:
+def _telegram_request(method: str, payload: dict) -> dict[str, Any]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        return
-    requests.post(
-        f"https://api.telegram.org/bot{token}/{method}",
-        json=payload,
-        timeout=20,
-    )
+        return {"ok": False, "error": "missing TELEGRAM_BOT_TOKEN"}
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            json=payload,
+            timeout=30,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"ok": False, "raw": response.text}
+        return {
+            "ok": response.status_code == 200 and bool(data.get("ok")),
+            "status_code": response.status_code,
+            "response": data,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
