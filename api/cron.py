@@ -76,7 +76,7 @@ def _state_token() -> str:
 
 def _patch_github_state(bot, token: str) -> None:
     repo = _env("GITHUB_STATE_REPO", "znamteam-max/HOH_NHL_Daily_Results")
-    branch = _env("GITHUB_STATE_BRANCH", "main") or "main"
+    branch = _env("GITHUB_STATE_BRANCH", "bot-state") or "bot-state"
     requests = bot.requests
 
     def headers() -> dict:
