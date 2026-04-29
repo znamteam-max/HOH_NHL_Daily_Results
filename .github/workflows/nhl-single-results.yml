@@ -15,9 +15,6 @@ on:
         description: "Matchup, e.g. PIT@WPG or WPG-PIT"
         required: false
         default: ""
-  schedule:
-    - cron: "2/5 * * * *"
-
 permissions:
   contents: write
 
