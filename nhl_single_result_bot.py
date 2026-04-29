@@ -161,6 +161,9 @@ class GameMeta:
     away_tri: str
     home_score: int
     away_score: int
+    series_game: Optional[int] = None
+    home_series_wins: Optional[int] = None
+    away_series_wins: Optional[int] = None
 
 
 @dataclass
@@ -252,6 +255,28 @@ def _clean_assists(items: List[str]) -> List[str]:
             seen.add(aa)
             out.append(aa)
     return out
+
+
+def _roster_name_map(data: dict) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    for spot in data.get("rosterSpots") or []:
+        pid = _first_int(spot.get("playerId"))
+        if not pid:
+            continue
+        first = _extract_name(spot.get("firstName")) or ""
+        last = _extract_name(spot.get("lastName")) or ""
+        full = _clean_person_name(f"{first} {last}")
+        if full:
+            out[pid] = full
+    return out
+
+
+def _player_name_from_id(details: dict, roster_names: Dict[int, str], *keys: str) -> str:
+    for key in keys:
+        pid = _first_int(details.get(key))
+        if pid and pid in roster_names:
+            return roster_names[pid]
+    return ""
 
 
 def _is_valid_player_name(s: str) -> bool:
@@ -369,7 +394,39 @@ def _game_to_meta(g: dict) -> Optional[GameMeta]:
     atri = _upper_str(away.get("abbrev") or away.get("triCode") or away.get("teamAbbrev"))
     hscore = _first_int(home.get("score"))
     ascore = _first_int(away.get("score"))
-    return GameMeta(gid, gdt, state, htri, atri, hscore, ascore)
+
+    series_game: Optional[int] = None
+    home_series_wins: Optional[int] = None
+    away_series_wins: Optional[int] = None
+    series = g.get("seriesStatus") or {}
+    if isinstance(series, dict) and series:
+        game_no = _first_int(series.get("gameNumberOfSeries"))
+        series_game = game_no or None
+        top = _upper_str(series.get("topSeedTeamAbbrev"))
+        bottom = _upper_str(series.get("bottomSeedTeamAbbrev"))
+        top_wins = _first_int(series.get("topSeedWins"))
+        bottom_wins = _first_int(series.get("bottomSeedWins"))
+        if htri == top:
+            home_series_wins = top_wins
+        elif htri == bottom:
+            home_series_wins = bottom_wins
+        if atri == top:
+            away_series_wins = top_wins
+        elif atri == bottom:
+            away_series_wins = bottom_wins
+
+    return GameMeta(
+        gid,
+        gdt,
+        state,
+        htri,
+        atri,
+        hscore,
+        ascore,
+        series_game,
+        home_series_wins,
+        away_series_wins,
+    )
 
 
 def resolve_game_by_query(q: str) -> Optional[GameMeta]:
@@ -457,11 +514,14 @@ def _is_deciding_shootout_goal(details: dict) -> bool:
     return False
 
 
-def _extract_shootout_scorer(play: dict, details: dict) -> str:
+def _extract_shootout_scorer(play: dict, details: dict, roster_names: Dict[int, str]) -> str:
     for k in _SCORER_KEYS:
         nm = _extract_name(details.get(k))
         if nm:
             return _clean_person_name(nm)
+    nm = _player_name_from_id(details, roster_names, "scoringPlayerId", "shootingPlayerId", "playerId")
+    if nm:
+        return _clean_person_name(nm)
     for k in ("scoringPlayerName", "scorerName", "shootingPlayerName"):
         v = play.get(k)
         if isinstance(v, str) and v.strip():
@@ -473,6 +533,7 @@ def _extract_shootout_scorer(play: dict, details: dict) -> str:
 def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> Tuple[List[ScoringEvent], bool]:
     data = http_get_json(PBP_FMT.format(gamePk=gamePk))
     plays = data.get("plays", []) or []
+    roster_names = _roster_name_map(data)
     events: List[ScoringEvent] = []
 
     official_has_shootout = False
@@ -490,7 +551,7 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> Tuple[L
         if ptype == "SHOOTOUT":
             official_has_shootout = True
 
-            scorer = _extract_shootout_scorer(p, det)
+            scorer = _extract_shootout_scorer(p, det, roster_names)
 
             h = det.get("homeScore")
             a = det.get("awayScore")
@@ -559,6 +620,8 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> Tuple[L
                 scorer = nm
                 break
         if not scorer:
+            scorer = _player_name_from_id(det, roster_names, "scoringPlayerId", "shootingPlayerId", "playerId")
+        if not scorer:
             for k in ("scoringPlayerName", "scorerName", "shootingPlayerName"):
                 v = p.get(k)
                 if isinstance(v, str) and v.strip():
@@ -572,6 +635,10 @@ def fetch_scoring_official(gamePk: int, home_tri: str, away_tri: str) -> Tuple[L
         assists: List[str] = []
         for k in _ASSIST_KEYS:
             nm = _extract_name(det.get(k))
+            if nm:
+                assists.append(nm)
+        for k in ("assist1PlayerId", "assist2PlayerId", "assist3PlayerId"):
+            nm = _player_name_from_id(det, roster_names, k)
             if nm:
                 assists.append(nm)
         if not assists:
@@ -857,13 +924,18 @@ def build_single_match_text(
     an = TEAM_RU.get(meta.away_tri, meta.away_tri)
     hrec = standings.get(meta.home_tri).as_str() if meta.home_tri in standings else "?"
     arec = standings.get(meta.away_tri).as_str() if meta.away_tri in standings else "?"
+    hmark = str(meta.home_series_wins) if meta.home_series_wins is not None else hrec
+    amark = str(meta.away_series_wins) if meta.away_series_wins is not None else arec
 
     winning_so_name = get_winning_shootout_name(events, official_has_shootout, sportsru_winner)
 
-    head_lines = [
-        f"{he} <b>«{hn}»: {meta.home_score}</b> ({hrec})",
-        f"{ae} <b>«{an}»: {meta.away_score}</b> ({arec})",
-    ]
+    head_lines = []
+    if meta.series_game:
+        head_lines.append(f"<i>Матч №{meta.series_game}</i>")
+    head_lines.extend([
+        f"{he} <b>«{hn}»: {meta.home_score}</b> ({hmark})",
+        f"{ae} <b>«{an}»: {meta.away_score}</b> ({amark})",
+    ])
     if winning_so_name:
         head_lines.append("")
         head_lines.append(f"<b>Победный буллит — {winning_so_name}</b>")
@@ -1019,6 +1091,7 @@ def pending_game_text(meta: GameMeta) -> str:
 def main() -> None:
     game_pk = _env_str("GAME_PK", "").strip()
     game_query = _env_str("GAME_QUERY", "").strip()
+    resend_last_day = _env_bool("RESEND_LAST_DAY", False)
 
     standings = fetch_standings_map()
     state = load_state(STATE_PATH)
@@ -1048,7 +1121,10 @@ def main() -> None:
         metas = autopost_current_hockey_day()
         print("FINAL games:", [m.gamePk for m in metas])
         print("FINAL games raw:", [(m.gamePk, m.away_tri, m.home_tri, m.state) for m in metas])
-        metas = [m for m in metas if not posted.get(str(m.gamePk))]
+        if resend_last_day:
+            print("RESEND_LAST_DAY enabled: reposting the latest hockey day")
+        else:
+            metas = [m for m in metas if not posted.get(str(m.gamePk))]
         print("Need to post:", [m.gamePk for m in metas])
 
     new_posts = 0
@@ -1077,10 +1153,12 @@ def main() -> None:
         dbg("Single match preview:\n" + text[:900].replace("\n", "¶") + "…")
         send_telegram_text(text)
 
-        if not manual_mode:
+        if not manual_mode and not resend_last_day:
             posted[str(meta.gamePk)] = True
             new_posts += 1
             dbg(f"mark posted {meta.gamePk}")
+        else:
+            new_posts += 1
 
     state["posted"] = posted
     save_state(STATE_PATH, state)

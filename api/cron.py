@@ -21,6 +21,10 @@ def handle_cron_request(auth_header: str) -> tuple[int, dict]:
     if not cron_secret or auth_header != f"Bearer {cron_secret}":
         return 401, {"ok": False, "error": "unauthorized"}
 
+    return run_bot_once()
+
+
+def run_bot_once(resend_last_day: bool = False) -> tuple[int, dict]:
     state_token = _state_token()
     if not state_token:
         return 500, {
@@ -37,9 +41,18 @@ def handle_cron_request(auth_header: str) -> tuple[int, dict]:
             import nhl_single_result_bot
 
             _patch_github_state(nhl_single_result_bot, state_token)
-            nhl_single_result_bot.main()
+            previous_resend = os.environ.get("RESEND_LAST_DAY")
+            os.environ["RESEND_LAST_DAY"] = "1" if resend_last_day else "0"
+            try:
+                nhl_single_result_bot.main()
+            finally:
+                if previous_resend is None:
+                    os.environ.pop("RESEND_LAST_DAY", None)
+                else:
+                    os.environ["RESEND_LAST_DAY"] = previous_resend
         return 200, {
             "ok": True,
+            "resend_last_day": resend_last_day,
             "stdout": stdout.getvalue()[-12000:],
             "stderr": stderr.getvalue()[-12000:],
         }
