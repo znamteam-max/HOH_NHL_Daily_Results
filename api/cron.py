@@ -77,6 +77,7 @@ def _state_token() -> str:
 def _patch_github_state(bot, token: str) -> None:
     repo = _env("GITHUB_STATE_REPO", "znamteam-max/HOH_NHL_Daily_Results")
     branch = _env("GITHUB_STATE_BRANCH", "bot-state") or "bot-state"
+    fallback_branch = _env("GITHUB_STATE_FALLBACK_BRANCH", "main") or "main"
     requests = bot.requests
 
     def headers() -> dict:
@@ -90,11 +91,11 @@ def _patch_github_state(bot, token: str) -> None:
         clean_path = path.replace("\\", "/").lstrip("/")
         return f"https://api.github.com/repos/{repo}/contents/{clean_path}"
 
-    def fetch(path: str) -> tuple[dict, str | None]:
+    def fetch(path: str, ref: str | None = None) -> tuple[dict, str | None]:
         response = requests.get(
             url_for(path),
             headers=headers(),
-            params={"ref": branch},
+            params={"ref": ref or branch},
             timeout=30,
         )
         if response.status_code == 404:
@@ -116,12 +117,18 @@ def _patch_github_state(bot, token: str) -> None:
         return merged
 
     def load_state(path: str) -> dict:
-        data, _ = fetch(path)
+        data, _ = fetch(path, branch)
+        if fallback_branch and fallback_branch != branch:
+            fallback, _ = fetch(path, fallback_branch)
+            data = merge_state(fallback, data)
         return data
 
     def save_state(path: str, data: dict) -> None:
         for attempt in range(3):
-            latest, sha = fetch(path)
+            latest, sha = fetch(path, branch)
+            if fallback_branch and fallback_branch != branch:
+                fallback, _ = fetch(path, fallback_branch)
+                latest = merge_state(fallback, latest)
             merged = merge_state(latest, data)
             body = {
                 "message": "Update posted games state",
