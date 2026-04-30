@@ -1103,8 +1103,10 @@ def main() -> None:
     standings = fetch_standings_map()
     state = load_state(STATE_PATH)
     posted: Dict[str, bool] = state.get("posted", {}) or {}
+    force_repost: Dict[str, bool] = state.get("force_repost", {}) or {}
 
     dbg("already posted:", sorted(posted.keys())[:20], "total=", len(posted))
+    dbg("force repost:", sorted(force_repost.keys()))
 
     metas: List[GameMeta] = []
     manual_mode = False
@@ -1131,7 +1133,10 @@ def main() -> None:
         if resend_last_day:
             print("RESEND_LAST_DAY enabled: reposting the latest hockey day")
         else:
-            metas = [m for m in metas if not posted.get(str(m.gamePk))]
+            metas = [
+                m for m in metas
+                if force_repost.get(str(m.gamePk)) or not posted.get(str(m.gamePk))
+            ]
         print("Need to post:", [m.gamePk for m in metas])
 
     new_posts = 0
@@ -1168,6 +1173,7 @@ def main() -> None:
             print(f"[ERR] not marking posted because Telegram send failed: {meta.gamePk}")
             continue
 
+        force_repost.pop(str(meta.gamePk), None)
         if not manual_mode and not resend_last_day:
             posted[str(meta.gamePk)] = True
             new_posts += 1
@@ -1176,6 +1182,7 @@ def main() -> None:
             new_posts += 1
 
     state["posted"] = posted
+    state["force_repost"] = force_repost
     save_state(STATE_PATH, state)
     print(f"OK (posted {new_posts}, failed {failed_posts})")
 

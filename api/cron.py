@@ -113,6 +113,12 @@ def _patch_github_state(bot, token: str) -> None:
         posted = dict((base or {}).get("posted", {}) or {})
         posted.update((current or {}).get("posted", {}) or {})
         merged["posted"] = posted
+        if "force_repost" in (current or {}):
+            force_repost = dict((current or {}).get("force_repost", {}) or {})
+            if force_repost:
+                merged["force_repost"] = force_repost
+            else:
+                merged.pop("force_repost", None)
         return merged
 
     def load_state(path: str) -> dict:
@@ -123,6 +129,8 @@ def _patch_github_state(bot, token: str) -> None:
         for attempt in range(3):
             latest, sha = fetch(path)
             merged = merge_state(latest, data)
+            if sha and merged == latest:
+                return
             body = {
                 "message": "Update posted games state",
                 "content": base64.b64encode(
