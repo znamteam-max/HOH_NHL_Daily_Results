@@ -1001,14 +1001,14 @@ def save_state(path: str, data: Dict[str, Any]) -> None:
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
-def send_telegram_text(text: str) -> None:
+def send_telegram_text(text: str) -> bool:
     token = _env_str("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = _env_str("TELEGRAM_CHAT_ID", "").strip()
     thread = _env_str("TELEGRAM_THREAD_ID", "").strip()
 
     if not token or not chat_id:
         print("[ERR] Telegram token/chat_id not set")
-        return
+        return False
 
     url = f"{TG_API}/bot{token}/sendMessage"
     headers = {"Content-Type": "application/json"}
@@ -1027,9 +1027,14 @@ def send_telegram_text(text: str) -> None:
 
     if DRY_RUN:
         print("[DRY RUN] " + textwrap.shorten(text, 200, placeholder="…"))
-        return
+        return False
 
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+    try:
+        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+    except Exception as exc:
+        print(f"[ERR] sendMessage failed: {exc}")
+        return False
+
     try:
         data = resp.json()
     except Exception:
@@ -1038,6 +1043,8 @@ def send_telegram_text(text: str) -> None:
     dbg(f"TG HTTP={resp.status_code} JSON={data}")
     if resp.status_code != 200 or not data.get("ok", False):
         print(f"[ERR] sendMessage failed: {data.get('error_code')} {data.get('description')}")
+        return False
+    return True
 
 
 def get_meta_by_gamepk_scan_schedule(gamePk: int) -> Optional[GameMeta]:
@@ -1128,12 +1135,16 @@ def main() -> None:
         print("Need to post:", [m.gamePk for m in metas])
 
     new_posts = 0
+    failed_posts = 0
 
     for meta in metas:
         if manual_mode and not _is_final_state(meta.state):
             text = pending_game_text(meta)
             dbg("Pending preview:\n" + text)
-            send_telegram_text(text)
+            if send_telegram_text(text):
+                new_posts += 1
+            else:
+                failed_posts += 1
             continue
 
         evs, official_has_shootout = fetch_scoring_official(meta.gamePk, meta.home_tri, meta.away_tri)
@@ -1151,7 +1162,11 @@ def main() -> None:
         dbg("official_has_shootout:", official_has_shootout)
         dbg("sportsru_so_winner:", getattr(sru_so_winner, "scorer_ru", None))
         dbg("Single match preview:\n" + text[:900].replace("\n", "¶") + "…")
-        send_telegram_text(text)
+        sent_ok = send_telegram_text(text)
+        if not sent_ok:
+            failed_posts += 1
+            print(f"[ERR] not marking posted because Telegram send failed: {meta.gamePk}")
+            continue
 
         if not manual_mode and not resend_last_day:
             posted[str(meta.gamePk)] = True
@@ -1162,7 +1177,7 @@ def main() -> None:
 
     state["posted"] = posted
     save_state(STATE_PATH, state)
-    print(f"OK (posted {new_posts})")
+    print(f"OK (posted {new_posts}, failed {failed_posts})")
 
 
 if __name__ == "__main__":
