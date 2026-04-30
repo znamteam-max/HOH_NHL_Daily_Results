@@ -415,6 +415,19 @@ def _game_to_meta(g: dict) -> Optional[GameMeta]:
         elif atri == bottom:
             away_series_wins = bottom_wins
 
+    if (
+        series_game
+        and _is_final_state(state)
+        and home_series_wins is not None
+        and away_series_wins is not None
+        and hscore != ascore
+        and home_series_wins + away_series_wins == series_game - 1
+    ):
+        if hscore > ascore:
+            home_series_wins += 1
+        else:
+            away_series_wins += 1
+
     return GameMeta(
         gid,
         gdt,
@@ -857,6 +870,52 @@ def find_last_mentions(events: List[ScoringEvent], winning_so_name: Optional[str
     return last_idx
 
 
+def _event_time_sort_value(ev: ScoringEvent) -> int:
+    try:
+        mm, ss = str(ev.time or "00.00").replace(":", ".").split(".", 1)
+        return int(mm) * 60 + int(ss)
+    except Exception:
+        return 0
+
+
+def find_winning_goal_event(meta: GameMeta, events: List[ScoringEvent]) -> Optional[ScoringEvent]:
+    if meta.home_score == meta.away_score:
+        return None
+
+    winner = meta.home_tri if meta.home_score > meta.away_score else meta.away_tri
+    candidates = [
+        ev for ev in events
+        if ev.period_type != "SHOOTOUT"
+        and ev.team_for == winner
+        and ev.home_goals == meta.home_score
+        and ev.away_goals == meta.away_score
+        and _is_valid_player_name(ev.scorer)
+    ]
+    if candidates:
+        return sorted(candidates, key=lambda ev: (ev.period, _event_time_sort_value(ev)))[-1]
+
+    fallback = [
+        ev for ev in events
+        if ev.period_type != "SHOOTOUT"
+        and ev.team_for == winner
+        and _is_valid_player_name(ev.scorer)
+    ]
+    if fallback:
+        return sorted(fallback, key=lambda ev: (ev.period, _event_time_sort_value(ev)))[-1]
+    return None
+
+
+def overtime_winner_line(meta: GameMeta, events: List[ScoringEvent]) -> Optional[str]:
+    ev = find_winning_goal_event(meta, events)
+    if not ev or ev.period_type != "OVERTIME":
+        return None
+
+    ot_index = max(1, ev.period - 3)
+    prep = "во" if ot_index == 2 else "в"
+    scorer = _clean_person_name(ev.scorer)
+    return f"<b>Победный гол {prep} {ot_index}-м ОТ — {scorer}</b>"
+
+
 def decorate_name(name: str, marks: Dict[str, str], last_mentions: Dict[str, int], current_idx: int) -> str:
     clean = _clean_person_name(name)
     if not clean:
@@ -940,12 +999,16 @@ def build_single_match_text(
         head_lines.append("")
         head_lines.append(f"<b>Победный буллит — {winning_so_name}</b>")
 
-    head = "\n".join(head_lines)
-
     regular_and_ot = [ev for ev in events if ev.period_type != "SHOOTOUT"]
 
     marks = compute_player_marks(events)
     last_mentions = find_last_mentions(regular_and_ot, winning_so_name)
+    winning_ot_line = overtime_winner_line(meta, regular_and_ot)
+    if winning_ot_line:
+        head_lines.append("")
+        head_lines.append(winning_ot_line)
+
+    head = "\n".join(head_lines)
 
     groups: Dict[Tuple[int, str], List[ScoringEvent]] = {}
     for ev in regular_and_ot:
@@ -954,6 +1017,13 @@ def build_single_match_text(
     for pnum in (1, 2, 3):
         if (pnum, "REGULAR") not in groups:
             groups[(pnum, "REGULAR")] = []
+
+    max_ot_period = max(
+        [k[0] for k in groups if (k[1] or "").upper() == "OVERTIME"],
+        default=3,
+    )
+    for pnum in range(4, max_ot_period + 1):
+        groups.setdefault((pnum, "OVERTIME"), [])
 
     ot_keys = sorted([k for k in groups if (k[1] or "").upper() == "OVERTIME"], key=lambda x: x[0])
     ot_total = len(ot_keys)
