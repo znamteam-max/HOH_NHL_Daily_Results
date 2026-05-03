@@ -15,12 +15,19 @@ on:
         description: "Matchup, e.g. PIT@WPG or WPG-PIT"
         required: false
         default: ""
+      resend_last_day:
+        description: "Set to true to resend the latest final hockey day"
+        required: false
+        default: "false"
   schedule:
     - cron: "*/15 * * * *"
 
 concurrency:
   group: nhl-single-results-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  BOT_STATE_PATH: state/github_actions_posted_games.json
 
 permissions:
   contents: write
@@ -48,6 +55,7 @@ jobs:
           INPUT_GAMEPK: ${{ github.event.inputs.gamepk }}
           INPUT_DATE: ${{ github.event.inputs.date }}
           INPUT_MATCH: ${{ github.event.inputs.match }}
+          INPUT_RESEND_LAST_DAY: ${{ github.event.inputs.resend_last_day }}
         run: |
           python - << 'PY'
           import os, re
@@ -55,6 +63,7 @@ jobs:
           gp = (os.getenv("INPUT_GAMEPK") or "").strip()
           dt = (os.getenv("INPUT_DATE") or "").strip()
           mt = (os.getenv("INPUT_MATCH") or "").strip()
+          resend = (os.getenv("INPUT_RESEND_LAST_DAY") or "").strip()
 
           q = ""
           if not gp and dt and mt:
@@ -75,23 +84,27 @@ jobs:
               fh.write(f"GAME_PK={gp}\n")
               fh.write(f"GAME_QUERY={q}\n")
               fh.write(f"TARGET_DATE={dt}\n")
+              fh.write(f"RESEND_LAST_DAY={resend}\n")
 
           print("GAME_PK:", gp or "(empty)")
           print("GAME_QUERY:", q or "(empty)")
           print("TARGET_DATE:", dt or "(empty)")
+          print("RESEND_LAST_DAY:", resend or "(empty)")
           PY
 
       - name: Init state
         run: |
           mkdir -p state
-          [ -f state/posted_games.json ] || echo '{"posted":{}}' > state/posted_games.json
-          cat state/posted_games.json
+          [ -f "$BOT_STATE_PATH" ] || echo '{"posted":{}}' > "$BOT_STATE_PATH"
+          cat "$BOT_STATE_PATH"
 
       - name: Run bot
         env:
           GAME_PK: ${{ env.GAME_PK }}
           GAME_QUERY: ${{ env.GAME_QUERY }}
           TARGET_DATE: ${{ env.TARGET_DATE }}
+          RESEND_LAST_DAY: ${{ env.RESEND_LAST_DAY }}
+          STATE_PATH: ${{ env.BOT_STATE_PATH }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
@@ -102,13 +115,13 @@ jobs:
         run: |
           git status --porcelain
           echo "--- state file ---"
-          cat state/posted_games.json || true
+          cat "$BOT_STATE_PATH" || true
 
       - name: Commit state
         run: |
           set -e
 
-          if ! git status --porcelain -- state/posted_games.json | grep . >/dev/null; then
+          if ! git status --porcelain -- "$BOT_STATE_PATH" | grep . >/dev/null; then
             echo "No state changes"
             exit 0
           fi
@@ -118,7 +131,7 @@ jobs:
 
           BRANCH="${GITHUB_REF_NAME:-main}"
 
-          git add -f state/posted_games.json
+          git add -f "$BOT_STATE_PATH"
           git commit -m "Update posted games state" || exit 0
 
           git fetch origin "$BRANCH" || true
