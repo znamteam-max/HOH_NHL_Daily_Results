@@ -1157,6 +1157,47 @@ def autopost_current_hockey_day() -> List[GameMeta]:
 
     return uniq
 
+
+def _meta_hockey_day_pt(meta: GameMeta) -> date:
+    return meta.gameDateUTC.astimezone(PT_TZ).date()
+
+
+def latest_final_hockey_day() -> List[GameMeta]:
+    base_day = _target_base_date()
+    dates = [(base_day - timedelta(days=off)).isoformat() for off in range(0, 8)]
+
+    print("TARGET_DATE:", TARGET_DATE or "(empty)")
+    print("Latest final hockey day base date:", base_day.isoformat())
+    print("Latest final hockey day scan dates:", dates)
+
+    raw = _list_games_for_dates(dates)
+    metas = [_game_to_meta(g) for g in raw]
+    metas = [m for m in metas if m and _is_final_state(m.state)]
+
+    seen = set()
+    uniq: List[GameMeta] = []
+    for m in sorted(metas, key=lambda x: x.gameDateUTC):
+        if m.gamePk not in seen:
+            seen.add(m.gamePk)
+            uniq.append(m)
+
+    by_day: Dict[date, List[GameMeta]] = {}
+    for m in uniq:
+        day = _meta_hockey_day_pt(m)
+        if day <= base_day:
+            by_day.setdefault(day, []).append(m)
+
+    if not by_day:
+        print("Latest final hockey day: no final games found")
+        return []
+
+    latest_day = max(by_day.keys())
+    result = sorted(by_day[latest_day], key=lambda x: x.gameDateUTC)
+    print("Latest final hockey day:", latest_day.isoformat())
+    print("Latest final games:", [m.gamePk for m in result])
+    return result
+
+
 def pending_game_text(meta: GameMeta) -> str:
     matchup = f"{meta.away_tri} - {meta.home_tri}"
     if _is_not_started_state(meta.state):
@@ -1197,12 +1238,14 @@ def main() -> None:
         metas = [meta]
         manual_mode = True
     else:
-        metas = autopost_current_hockey_day()
+        if resend_last_day:
+            print("RESEND_LAST_DAY enabled: reposting the latest final hockey day")
+            metas = latest_final_hockey_day()
+        else:
+            metas = autopost_current_hockey_day()
         print("FINAL games:", [m.gamePk for m in metas])
         print("FINAL games raw:", [(m.gamePk, m.away_tri, m.home_tri, m.state) for m in metas])
-        if resend_last_day:
-            print("RESEND_LAST_DAY enabled: reposting the latest hockey day")
-        else:
+        if not resend_last_day:
             metas = [
                 m for m in metas
                 if force_repost.get(str(m.gamePk)) or not posted.get(str(m.gamePk))

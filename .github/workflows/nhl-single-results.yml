@@ -15,6 +15,13 @@ on:
         description: "Matchup, e.g. PIT@WPG or WPG-PIT"
         required: false
         default: ""
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: nhl-single-results-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
