@@ -24,7 +24,7 @@ def handle_cron_request(auth_header: str) -> tuple[int, dict]:
     return run_bot_once()
 
 
-def run_bot_once(resend_last_day: bool = False) -> tuple[int, dict]:
+def run_bot_once(resend_last_day: bool = False, target_chat_id: str | None = None) -> tuple[int, dict]:
     state_token = _state_token()
     if not state_token:
         return 500, {
@@ -42,7 +42,10 @@ def run_bot_once(resend_last_day: bool = False) -> tuple[int, dict]:
 
             _patch_github_state(nhl_single_result_bot, state_token)
             previous_resend = os.environ.get("RESEND_LAST_DAY")
+            previous_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
             os.environ["RESEND_LAST_DAY"] = "1" if resend_last_day else "0"
+            if target_chat_id:
+                os.environ["TELEGRAM_CHAT_ID"] = str(target_chat_id)
             try:
                 nhl_single_result_bot.main()
             finally:
@@ -50,9 +53,15 @@ def run_bot_once(resend_last_day: bool = False) -> tuple[int, dict]:
                     os.environ.pop("RESEND_LAST_DAY", None)
                 else:
                     os.environ["RESEND_LAST_DAY"] = previous_resend
+                if target_chat_id:
+                    if previous_chat_id is None:
+                        os.environ.pop("TELEGRAM_CHAT_ID", None)
+                    else:
+                        os.environ["TELEGRAM_CHAT_ID"] = previous_chat_id
         return 200, {
             "ok": True,
             "resend_last_day": resend_last_day,
+            "target_chat_id": target_chat_id,
             "stdout": stdout.getvalue()[-12000:],
             "stderr": stderr.getvalue()[-12000:],
         }

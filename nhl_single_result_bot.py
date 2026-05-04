@@ -26,6 +26,7 @@ except Exception:
     HAS_BS = False
 
 TG_API = "https://api.telegram.org"
+DEFAULT_TELEGRAM_CHAT_ID = "-1003167239288"
 NHLE_BASE = "https://api-web.nhle.com/v1"
 PBP_FMT = NHLE_BASE + "/gamecenter/{gamePk}/play-by-play"
 SCHED_FMT = NHLE_BASE + "/schedule/{ymd}"
@@ -1073,7 +1074,7 @@ def save_state(path: str, data: Dict[str, Any]) -> None:
 
 def send_telegram_text(text: str) -> bool:
     token = _env_str("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = _env_str("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = _env_str("TELEGRAM_CHAT_ID", DEFAULT_TELEGRAM_CHAT_ID).strip()
     thread = _env_str("TELEGRAM_THREAD_ID", "").strip()
 
     if not token or not chat_id:

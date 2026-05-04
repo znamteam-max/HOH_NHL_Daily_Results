@@ -15,7 +15,8 @@ except ImportError:
 
 
 DEFAULT_WEBHOOK_SECRET = "hook-123"
-DEFAULT_MENU_CHAT = "@hoh_nhl_records"
+DEFAULT_TARGET_CHAT = "-1003167239288"
+DEFAULT_MENU_CHAT = DEFAULT_TARGET_CHAT
 
 app = FastAPI()
 
@@ -109,7 +110,7 @@ async def telegram_webhook(
             _send_text(chat_id, _schedule_overview_text())
         elif command in ("/reload", "/resend"):
             _send_text(chat_id, "Запускаю повторную отправку последнего игрового дня.")
-            status, payload = run_bot_once(resend_last_day=True)
+            status, payload = run_bot_once(resend_last_day=True, target_chat_id=_menu_chat_id())
             if status == 200:
                 _send_text(chat_id, "Готово: последний игровой день отправлен повторно.")
             else:
@@ -191,7 +192,7 @@ def _handle_callback(callback: dict) -> JSONResponse:
         _answer_callback(callback_id, "Запускаю повторную отправку...")
         if chat_id:
             _send_text(chat_id, "Запускаю повторную отправку последнего игрового дня.")
-        status, payload = run_bot_once(resend_last_day=True)
+        status, payload = run_bot_once(resend_last_day=True, target_chat_id=_menu_chat_id())
         if chat_id:
             if status == 200:
                 _send_text(chat_id, "Готово: последний игровой день отправлен повторно.")
