@@ -23,9 +23,6 @@ on:
         description: "Set to true to resend the latest final hockey day"
         required: false
         default: "false"
-  schedule:
-    - cron: "*/15 * * * *"
-
 concurrency:
   group: nhl-single-results-${{ github.ref }}
   cancel-in-progress: false
