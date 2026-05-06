@@ -1,6 +1,10 @@
 name: NHL Single Result Bot
 
 on:
+  repository_dispatch:
+    types:
+      - nhl_poll
+      - resend_last_day
   workflow_dispatch:
     inputs:
       gamepk:
@@ -52,10 +56,10 @@ jobs:
 
       - name: Build env vars
         env:
-          INPUT_GAMEPK: ${{ github.event.inputs.gamepk }}
-          INPUT_DATE: ${{ github.event.inputs.date }}
-          INPUT_MATCH: ${{ github.event.inputs.match }}
-          INPUT_RESEND_LAST_DAY: ${{ github.event.inputs.resend_last_day }}
+          INPUT_GAMEPK: ${{ github.event.inputs.gamepk || github.event.client_payload.gamepk }}
+          INPUT_DATE: ${{ github.event.inputs.date || github.event.client_payload.date }}
+          INPUT_MATCH: ${{ github.event.inputs.match || github.event.client_payload.match }}
+          INPUT_RESEND_LAST_DAY: ${{ github.event.inputs.resend_last_day || github.event.client_payload.resend_last_day }}
         run: |
           python - << 'PY'
           import os, re

@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hoh-nhl-daily-results",
+  "main": "cloudflare-worker/src/index.js",
+  "compatibility_date": "2026-05-06",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "vars": {
+    "TELEGRAM_WEBHOOK_SECRET": "hook-123",
+    "WEBHOOK_SETUP_SECRET": "hook-123",
+    "TELEGRAM_MENU_CHAT_ID": "-1003167239288",
+    "GITHUB_REPOSITORY": "znamteam-max/HOH_NHL_Daily_Results",
+    "GITHUB_REF": "main",
+    "GITHUB_DISPATCH_EVENT_POLL": "nhl_poll",
+    "GITHUB_DISPATCH_EVENT_RESEND": "resend_last_day",
+    "CLOUDFLARE_CRON_ENABLED": "0"
+  }
+}
