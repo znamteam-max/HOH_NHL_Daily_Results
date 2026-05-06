@@ -7,7 +7,7 @@
     "enabled": true
   },
   "triggers": {
-    "crons": ["*/15 * * * *"]
+    "crons": ["*/5 * * * *"]
   },
   "vars": {
     "TELEGRAM_WEBHOOK_SECRET": "hook-123",
