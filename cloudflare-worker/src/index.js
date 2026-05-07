@@ -113,6 +113,10 @@ async function handleRequest(request, env) {
     return sendMenuRoute(request, env);
   }
 
+  if (["/api/setup-commands", "/setup-commands"].includes(path)) {
+    return setupCommandsRoute(request, env);
+  }
+
   if (["/api/telegram", "/telegram"].includes(path)) {
     return telegramWebhook(request, env);
   }
@@ -134,8 +138,9 @@ async function setupWebhook(request, env) {
   const telegram = await telegramRequest(env, "setWebhook", {
     url: webhookUrl,
     secret_token: webhookSecret(env),
-    allowed_updates: ["message", "callback_query"],
+    allowed_updates: ["message", "channel_post", "callback_query"],
   });
+  const commands = await setBotCommands(env);
 
   let menu = null;
   if (queryBool(url, "send_menu", true) && telegram.ok) {
@@ -148,6 +153,7 @@ async function setupWebhook(request, env) {
       webhook_url: webhookUrl,
       webhook_secret: "configured",
       telegram,
+      commands,
       menu,
     },
     telegram.ok ? 200 : 500,
@@ -167,6 +173,27 @@ async function sendMenuRoute(request, env) {
 
   const telegram = await sendMenu(env, chatId);
   return jsonResponse({ ok: telegram.ok, chat_id: chatId, telegram }, telegram.ok ? 200 : 500);
+}
+
+async function setupCommandsRoute(request, env) {
+  if (!isManagementAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const commands = await setBotCommands(env);
+  return jsonResponse({ ok: commands.ok, commands }, commands.ok ? 200 : 500);
+}
+
+async function setBotCommands(env) {
+  return telegramRequest(env, "setMyCommands", {
+    commands: [
+      { command: "menu", description: "Показать меню" },
+      { command: "latest", description: "Показать последние матчи" },
+      { command: "schedule", description: "Расписание по дням" },
+      { command: "reload", description: "Загрузить заново последний игровой день" },
+      { command: "resend", description: "Повторить отправку последнего игрового дня" },
+    ],
+  });
 }
 
 async function telegramWebhook(request, env) {
